@@ -1,0 +1,19 @@
+# 复制成 sdkconfig.local 并填上你自己的值（sdkconfig.local 已被 gitignore，不会进版本库）
+#
+# ⚠️ 改了这里的值之后【必须重新 configure 才会生效】——
+#    IDF 的 SDKCONFIG_DEFAULTS 只对"还没被赋值的符号"起作用。
+#    工程里已经处理好了（CMakeLists.txt 会跑 tools/sync_sdkconfig.py 强制覆盖），
+#    直接 idf.py build 即可。
+#
+# 也可以留空不配：设备起来后用网页控制台或屏幕菜单配置，存在 NVS 里，优先级更高。
+
+# ---- WiFi（只支持 2.4GHz）----
+CONFIG_APP_WIFI_SSID=""
+CONFIG_APP_WIFI_PASSWORD=""
+
+# ---- Navidrome ----
+CONFIG_APP_NAV_HOST="http://192.168.1.100:4533"
+CONFIG_APP_NAV_USER=""
+CONFIG_APP_NAV_PASS=""
+CONFIG_APP_NAV_TRANSCODE="mp3"
+CONFIG_APP_NAV_MAX_KBPS=192

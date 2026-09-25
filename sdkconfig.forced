@@ -1,0 +1,97 @@
+# ESP-Music 强制配置（非敏感）
+#
+# 这个文件和 sdkconfig.local 走同一条路：configure 之前由 tools/sync_sdkconfig.py
+# 覆盖进 sdkconfig。放这里的理由：**改 sdkconfig.defaults 对已生成的 sdkconfig
+# 是无效的**（IDF 只在符号还没被赋值时才用 defaults），而这些开关又必须真的生效。
+# 详见 sdkconfig.defaults 顶部与 tools/sync_sdkconfig.py 的说明。
+#
+# 与 sdkconfig.local 的分工：local 只放敏感值（密码/账号），本文件放开关。
+
+# ===== M7 蓝牙遥控：把 BLE 的内存开销从内部 SRAM 挪走 =====
+#
+# 动机（2026-09-25 实测）：内部 SRAM 是这块板唯一紧的资源。
+#   开机未播放          剩 50 KB
+#   一播放就掉到        10~15 KB
+#   （libaudio_engine 占 10 KB、JPEG 解码器 6.5 KB、解码器状态等，
+#     都是运行时从内部堆拿的 —— 见 [[esp-music-m6-persistence]]）
+# NimBLE + HID 大约要 40 KB 量级，出厂默认配置（内存全在内部）根本放不下。
+#
+# ⚠️ 下面两条是"能不能做成"的关键，不是调优。
+
+# 1) NimBLE 主机的堆走 PSRAM（默认 INTERNAL）。
+#    NimBLE 自己那套内存池（mbuf、属性表、连接上下文）是大头，占内部 SRAM 的话
+#    起播后立刻见底。PSRAM 还有 6 MB 空着，主机侧访问不在 ISR 里，安全。
+#    （控制器那部分不能这么办：它在 ISR/硬件路径上，必须留在内部 RAM。）
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# 2) 控制器只保留最少活动。每个 BLE "活动"（广播 / 扫描 / 连接）都要控制器 RAM。
+#    我们的用途只是被手机/PC 连上做 HID 外设：1 条连接 + 1 个广播 = 2 够用。
+#    出厂默认 6（同时还能当主设备去扫别人），这里用不上，白占内存。
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+
+# 3) 我们是外设、从不主动扫描，去重过滤缓存 100 条纯属浪费（默认值）。
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=10
+
+# 4) 只做外设：广播 + 被连。不做 central/observer（sdkconfig.defaults 里已关，
+#    但 default 对已生成的 sdkconfig 无效，这里再钉一遍）。
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# ===== 给蓝牙腾内部 SRAM（2026-09-25 实测：加 BLE 后内部 SRAM 掉到 0KB）=====
+#
+# 症状（加了 BLE 之后）：内部 SRAM 0KB / DMA 可用 0KB，连带三件事一起坏 ——
+#   HTTP_CLIENT: Connection failed, sock < 0   （socket 分配不出来）
+#   封面下载失败、流打不开
+#   ui: lv_timer 最坏 0ms | 5 秒内刷新 0 次     （屏幕不刷新）
+# 所以下面两条不是"调优"，是"能不能用"。
+
+# 5) WiFi / LwIP 的缓冲优先放 PSRAM（放不下才退回内部 RAM）。
+#    这是最大的一笔：WiFi RX/TX 缓冲 + LwIP 的 pbuf/PCB 加起来几十 KB，
+#    全在内部 RAM 的话蓝牙一来就没了。官方选项，失败会自动退回内部。
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# 6) ⚠️ 顺手修一个【潜伏的 bug】：lwIP 的 socket 上限是全局的，httpd 要
+#    max_open_sockets+3 个（我们配 6 → 9），再加音频流 1 个 + 元数据 1 个 = 11。
+#    sdkconfig.defaults 里早就写了 16，但**实际生效的是 10** ——
+#    又是"defaults 对已生成的 sdkconfig 无效"那个坑（见 [[esp-music-sdkconfig-local-trap]]）。
+#    症状就是上面那条 `sock < 0`，以及之前查到过的周期性 1 秒 TCP 重传尖峰。
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# 7) ⚠️ TCP 窗口/SND 缓冲是【每条连接】的，这是 WiFi 连上后吃掉 86KB 内部
+#    SRAM 的主因（音频流 + 元数据 + 网页轮询同时开着）。16KB 是从 5.7KB 提上来的
+#    （当时那个网络 RTT 66~164ms，小窗口要 11 个来回），但现在 RSSI -23、
+#    局域网近在咫尺，8KB 够用。省下来的差不多是每连接 8KB。
+CONFIG_LWIP_TCP_WND_DEFAULT=8192
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
+
+# 8) WiFi 的【静态】RX 缓冲必须是内部 RAM（DMA），8 个约 13KB。
+#    降到 4 个：动态 RX 池（走 PSRAM）还在，突发时能兜住。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+
+# 9) WiFi 的 IRAM 代码挪回 flash（换取内部 SRAM）
+#
+#    `libpp.a` / `libnet80211.a` 里有大约 15KB 是常驻 IRAM 的收包快路径代码。
+#    关掉这两个选项让它们从 flash 跑（XIP，走 cache）—— 内部 SRAM 多出这一截，
+#    代价只是 WiFi 收包略慢。对这个用途完全够：音频流只有 192kbps ≈ 24KB/s，
+#    即使全走 cache miss 也富余得多。
+#    ⚠️ 这是"最后一截余量"：加 BLE 后实测只剩 4KB，WiFi 扫描/歌词/网页这些
+#    临时分配一旦碰到不够就是 abort 重启（lwIP 的信号量都分不出来）。
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# ===== M8：LVGL 控件不该占内部 RAM =====
+#
+# 症状（2026-09-25 加搜索页后）：新页面有 ~67 个 LVGL 控件（字母格一个字母一个标签），
+# 每个约 200~250 字节，于是内部 SRAM 又被吃光：
+#   E BLE_INIT: Malloc failed
+#   E httpd_accept_conn: error in accept (113)
+#
+# 根因是这条：**小于 4KB 的 malloc 一律放内部 RAM**。LVGL 控件树完全不需要内部 RAM
+# （它不是 DMA 目标 —— 真正要 DMA 的是画布，那两个缓冲是显式 MALLOC_CAP_DMA|INTERNAL
+# 申请的，不受这条影响）。
+#
+# 降到 512：只有很小的分配还留在内部，控件/样式/小结构体都进 PSRAM（还剩 6MB）。
+# 代价是 LVGL 遍历控件树时多走外部 RAM，但实测 lv_timer 最坏 7~16ms，有余量。
+# ⚠️ 这条不是"调优"：不降的话 BLE 直接起不来。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512

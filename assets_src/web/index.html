@@ -1,0 +1,2147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#FFFFFF">
+<meta name="color-scheme" content="light">
+<title>ESP-Music 控制台</title>
+<style>
+/* ============================================================
+   调色板（与设备 LCD 同一体系）
+   页面底 #FFFFFF / 卡片 #F7F7F5 / 描边 #E8E6E2
+   强调 #1A73E8 / 强调底 #E8F0FE / 主文字 #1C1C1E
+   次要文字 #6E6E73 / 图标灰 #969698 / 收藏星 #FACC15
+   ⚠️ 全文不使用冷灰（带蓝的灰）
+   ============================================================ */
+:root{
+  --bg:#FFFFFF;
+  --card:#F7F7F5;
+  --line:#E8E6E2;
+  --accent:#1A73E8;
+  --accent-d:#1667CF;
+  --accent-bg:#E8F0FE;
+  --text:#1C1C1E;
+  --muted:#6E6E73;
+  --icon:#969698;
+  --star:#FACC15;
+  --press:#EFEDE9;      /* 按下态：暖中性灰 */
+  --warn-bg:#FFF4E5;    /* 失联横幅：暖橙 */
+  --warn-line:#F3D9AE;
+  --warn-text:#8A4B00;
+  --ok:#0F7B3E;
+  --err:#C0392B;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+[hidden]{display:none !important;}
+html,body{
+  margin:0;padding:0;background:var(--bg);color:var(--text);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+  -webkit-text-size-adjust:100%;
+  overscroll-behavior-y:none;
+}
+/* 底部固定栏（tab 栏 + 迷你播放条）是浮在内容上的，内容要给它们留位置。
+   每条都写两遍：不支持 env() 的老浏览器吃第一行，支持的吃第二行。 */
+.wrap{max-width:720px;margin:0 auto;padding:12px 12px 96px;padding-bottom:calc(96px + env(safe-area-inset-bottom));}
+.wrap.mini-on{padding-bottom:154px;padding-bottom:calc(154px + env(safe-area-inset-bottom));}
+h1,p{margin:0;}
+button{
+  font:inherit;color:inherit;background:none;border:0;padding:0;margin:0;
+  cursor:pointer;touch-action:manipulation;
+  -webkit-user-select:none;user-select:none;
+}
+svg{display:block;}
+
+/* ---------- 顶部标题 ---------- */
+.top{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 2px 10px;}
+.top h1{font-size:18px;letter-spacing:.2px;}
+.sub{font-size:12px;color:var(--muted);margin-top:2px;}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--icon);flex:none;}
+.dot.ok{background:#34A853;}
+.dot.bad{background:#E8A33D;}
+
+/* ---------- 失联横幅 ---------- */
+.offline{
+  position:sticky;top:0;z-index:50;
+  background:var(--warn-bg);border-bottom:1px solid var(--warn-line);
+  color:var(--warn-text);font-size:13px;padding:10px 12px;text-align:center;
+  overflow:hidden;max-height:88px;
+  transition:opacity .2s ease,max-height .2s ease,padding-top .2s ease,padding-bottom .2s ease;
+}
+.offline.in{animation:bannerIn .2s ease-out;}
+.offline.out{opacity:0;max-height:0;padding-top:0;padding-bottom:0;border-bottom-width:0;}
+
+/* ---------- 卡片 ---------- */
+.card{
+  background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:12px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.03);
+}
+.card.acc-card{padding:0;overflow:hidden;}
+
+/* ---------- 播放页 ---------- */
+.bigwrap{display:flex;justify-content:center;padding:0 0 10px;}
+.bigcover{
+  width:116px;height:116px;flex:none;border-radius:12px;overflow:hidden;
+  background:var(--press);border:1px solid var(--line);
+  display:flex;align-items:center;justify-content:center;color:var(--icon);
+}
+.bigcover img{width:100%;height:100%;object-fit:cover;display:block;}
+.bigcover .ph svg{width:40px;height:40px;}
+.pmeta{text-align:center;padding:0 2px;}
+.ptitle{font-size:17px;font-weight:600;line-height:1.3;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}
+.partist{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;}
+.palbum{font-size:12px;color:var(--icon);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.prow2{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:6px;min-height:38px;}
+.pill{font-size:11px;line-height:18px;padding:0 8px;border-radius:9px;background:var(--accent-bg);color:var(--accent);white-space:nowrap;flex:none;}
+.pill.gray{background:var(--press);color:var(--muted);}
+.srcname{font-size:11px;color:var(--icon);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:62%;}
+
+.iconbtn{
+  width:44px;height:44px;flex:none;border-radius:10px;color:var(--text);
+  display:inline-flex;align-items:center;justify-content:center;
+}
+.iconbtn:active{background:var(--press);}
+.iconbtn svg{width:22px;height:22px;}
+.iconbtn.sm{width:40px;height:40px;}
+.iconbtn.sm svg{width:20px;height:20px;}
+.iconbtn.star{color:var(--icon);}
+.iconbtn.star.on{color:var(--star);}
+.iconbtn.star.on svg{filter:drop-shadow(0 1px 1px rgba(180,140,0,.25));}
+
+/* 进度条：视觉 6px，触摸区 40px */
+.prog{height:40px;display:flex;align-items:center;touch-action:none;cursor:pointer;margin-top:2px;}
+.track{position:relative;width:100%;height:6px;border-radius:3px;background:var(--line);}
+.fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:3px;background:var(--accent);}
+.knob{
+  position:absolute;top:50%;left:0;width:14px;height:14px;margin:-7px 0 0 -7px;
+  border-radius:50%;background:#fff;border:2px solid var(--accent);
+  box-shadow:0 1px 3px rgba(0,0,0,.18);transition:transform .1s;
+}
+.prog.drag .knob{transform:scale(1.2);}
+.times{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;margin-top:-6px;}
+
+.ctrl{display:flex;align-items:center;justify-content:center;gap:18px;margin:8px 0 4px;}
+.playbtn{
+  width:58px;height:58px;border-radius:50%;background:var(--accent);color:#fff;
+  display:inline-flex;align-items:center;justify-content:center;flex:none;
+  transition:transform .12s ease,background-color .12s ease;
+}
+.playbtn:active{background:var(--accent-d);transform:scale(.94);}
+.playbtn svg{width:26px;height:26px;}
+
+.volrow{display:flex;align-items:center;gap:8px;min-height:40px;}
+.volnum{font-size:12px;color:var(--muted);min-width:26px;text-align:right;font-variant-numeric:tabular-nums;}
+input[type=range]{
+  -webkit-appearance:none;appearance:none;background:transparent;
+  flex:1;height:40px;margin:0;min-width:0;
+}
+input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:var(--line);}
+input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;appearance:none;width:20px;height:20px;margin-top:-7px;
+  border-radius:50%;background:#fff;border:2px solid var(--accent);
+  box-shadow:0 1px 3px rgba(0,0,0,.18);
+}
+input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(--line);}
+input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#fff;border:2px solid var(--accent);}
+
+/* ---------- 歌词面板（播放页，控制区下方） ---------- */
+.lyr{
+  margin-top:10px;
+  height:236px;                    /* 老浏览器兜底（不认下面的 min()） */
+  height:min(38vh,260px);
+  position:relative;               /* ★ 必须：否则行的 offsetTop 是相对 body 算的，居中会错位 */
+  overflow-y:auto;-webkit-overflow-scrolling:touch;
+  overscroll-behavior:contain;     /* 滚到头别把整页带着滚 */
+  background:#fff;border:1px solid var(--line);border-radius:12px;
+  padding:10px 12px;
+}
+.lyr.empty{display:flex;align-items:center;justify-content:center;}
+.lyr.empty .lyr-in{width:100%;}
+.lyr-line{
+  font-size:14px;line-height:1.5;color:var(--muted);
+  padding:9px 8px;border-radius:8px;margin:0 -8px;      /* 行高 ≥40px：手指点得准 */
+  cursor:pointer;
+  transition:color .18s ease,font-size .18s ease,background-color .18s ease;
+}
+.lyr-line.on{color:var(--accent);font-size:16px;font-weight:600;}
+.lyr-in.flat .lyr-line{color:var(--text);cursor:default;}
+.lyr-none{color:var(--icon);font-size:13px;text-align:center;line-height:1.7;padding:0 4px;}
+
+/* ---------- 按钮 ---------- */
+/* ---------- 按钮 ---------- */
+.btn{
+  min-height:44px;padding:0 14px;border-radius:10px;
+  background:#fff;border:1px solid var(--line);
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  font-size:15px;
+}
+.btn:active{background:var(--press);}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;}
+.btn.primary:active{background:var(--accent-d);}
+.btn.block{width:100%;}
+.btn svg{width:20px;height:20px;}
+.btn[disabled]{opacity:.5;pointer-events:none;}
+.hint{font-size:12px;color:var(--icon);line-height:1.5;margin-top:8px;word-break:break-all;}
+
+/* ---------- 来源选项卡 ---------- */
+.tabs{
+  display:flex;gap:6px;background:#fff;border:1px solid var(--line);
+  border-radius:10px;padding:4px;margin-bottom:10px;
+}
+.tab{
+  flex:1;min-height:40px;border-radius:8px;font-size:14px;color:var(--muted);
+  display:flex;align-items:center;justify-content:center;padding:0 4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.tab.on{background:var(--accent-bg);color:var(--accent);font-weight:600;}
+
+/* ---------- 列表 ---------- */
+.listhead{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted);margin-bottom:4px;}
+.lhright{display:flex;align-items:center;gap:4px;}
+.list{
+  max-height:min(58vh,520px);overflow-y:auto;-webkit-overflow-scrolling:touch;
+  position:relative;   /* 同上：行内 offsetTop 要相对本容器算 */
+  background:#fff;border:1px solid var(--line);border-radius:10px;
+}
+.list.plain{max-height:min(40vh,320px);margin-top:10px;}
+.row{
+  display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:8px;
+  min-height:52px;padding:8px 12px;border-bottom:1px solid var(--line);
+  cursor:pointer;touch-action:manipulation;
+  -webkit-user-select:none;user-select:none;
+}
+.row:last-child{border-bottom:0;}
+.row:active{background:var(--press);}
+.row.on{background:var(--accent-bg);}
+.row.on .rtitle{color:var(--accent);font-weight:600;}
+.rmain{min-width:0;display:flex;flex-direction:column;gap:1px;}
+.rtitle{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.rsub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.rdur{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;}
+.rstar{width:16px;height:16px;color:var(--star);}
+.rstar svg{width:16px;height:16px;}
+.empty{padding:22px 12px;text-align:center;color:var(--icon);font-size:13px;}
+.more{display:block;width:100%;min-height:48px;font-size:14px;color:var(--accent);background:#fff;}
+.more:active{background:var(--press);}
+
+/* ---------- 搜索 ---------- */
+.search{
+  display:flex;align-items:center;gap:8px;height:44px;padding:0 10px;
+  background:#fff;border:1px solid var(--line);border-radius:10px;
+}
+.search svg{width:18px;height:18px;color:var(--icon);flex:none;}
+.search input{
+  flex:1;height:100%;min-width:0;border:0;outline:0;background:transparent;
+  font-size:16px;color:var(--text);
+  -webkit-appearance:none;appearance:none;
+}
+
+/* ---------- 设置 ---------- */
+.acc{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:52px;padding:0 12px;font-size:16px;font-weight:600;}
+.acc:active{background:var(--press);}
+.acc .chev svg{width:20px;height:20px;color:var(--icon);transition:transform .18s;}
+.acc.open .chev svg{transform:rotate(180deg);}
+.panel{
+  border-top:1px solid var(--line);padding:12px;overflow:hidden;
+  transition:max-height .22s ease,padding-top .22s ease,padding-bottom .22s ease;
+}
+.f{display:block;margin-bottom:8px;}
+.f>span{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;}
+.f input{
+  width:100%;height:44px;padding:0 12px;border-radius:10px;
+  border:1px solid var(--line);background:#fff;color:var(--text);
+  font-size:16px;outline:none;-webkit-appearance:none;appearance:none;
+}
+.f input:focus{border-color:var(--accent);}
+.row2{display:flex;gap:8px;margin-top:10px;}
+.row2 .btn{flex:1;}
+.row-between{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:44px;font-size:15px;}
+.msg{font-size:13px;color:var(--muted);margin-top:10px;min-height:18px;word-break:break-all;line-height:1.4;}
+.msg.ok{color:var(--ok);}
+.msg.err{color:var(--err);}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:13px;}
+.kv .k{color:var(--muted);}
+.kv .v{text-align:right;font-variant-numeric:tabular-nums;word-break:break-all;}
+.rssi{display:inline-flex;align-items:center;gap:5px;justify-content:flex-end;}
+
+/* 开关 */
+input.sw{
+  -webkit-appearance:none;appearance:none;flex:none;
+  width:46px;height:28px;border-radius:14px;background:var(--line);
+  position:relative;transition:background .18s;cursor:pointer;margin:0;
+}
+input.sw::after{
+  content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;
+  border-radius:50%;background:#fff;transition:transform .18s;
+  box-shadow:0 1px 2px rgba(0,0,0,.18);
+}
+input.sw:checked{background:var(--accent);}
+input.sw:checked::after{transform:translateX(18px);}
+
+/* ---------- 迷你播放条 + 底部 tab 栏 ---------- */
+.mini{
+  position:fixed;left:0;right:0;z-index:30;background:#fff;
+  border-top:1px solid var(--line);box-shadow:0 -1px 3px rgba(0,0,0,.04);
+  bottom:56px;bottom:calc(56px + env(safe-area-inset-bottom));
+}
+.miniin{max-width:720px;margin:0 auto;display:flex;align-items:center;gap:10px;padding:8px 12px;min-height:56px;}
+.mcover{
+  width:40px;height:40px;flex:none;border-radius:8px;overflow:hidden;
+  background:var(--press);border:1px solid var(--line);
+  display:flex;align-items:center;justify-content:center;color:var(--icon);
+}
+.mcover img{width:100%;height:100%;object-fit:cover;display:block;}
+.mcover .ph svg{width:18px;height:18px;}
+.mmain{flex:1;min-width:0;}
+.mtitle{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.msub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tabbar{
+  position:fixed;left:0;right:0;bottom:0;z-index:31;background:#fff;
+  border-top:1px solid var(--line);
+  padding-bottom:env(safe-area-inset-bottom);
+}
+.tbin{max-width:720px;margin:0 auto;display:flex;}
+.tb{
+  flex:1;min-height:56px;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:2px;font-size:11px;color:var(--muted);
+}
+.tb svg{width:23px;height:23px;}
+.tb.on{color:var(--accent);}
+
+/* ---------- 提示条 ---------- */
+.toast{
+  position:fixed;left:50%;z-index:60;max-width:88vw;
+  bottom:96px;bottom:calc(96px + env(safe-area-inset-bottom));
+  transform:translate(-50%,12px);opacity:0;pointer-events:none;
+  background:#1C1C1E;color:#fff;font-size:13px;padding:10px 16px;
+  border-radius:10px;text-align:center;transition:opacity .18s,transform .18s;
+}
+.toast.show{opacity:.95;transform:translate(-50%,0);}
+.toast.err{background:#B3261E;}
+
+.foot{font-size:11px;color:var(--icon);text-align:center;padding:6px 4px 0;line-height:1.7;word-break:break-all;}
+
+/* ---------- 动画（克制：只做淡入 / 轻微位移，全部 CSS 驱动，JS 只切 class） ----------
+   ⚠️ 进度条（.fill / .knob 的 left / width）绝不能加 transition，
+   否则每秒一次的插值刷新会一跳一跳的。 */
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
+@keyframes coverIn{from{opacity:0;transform:scale(.96);}to{opacity:1;transform:scale(1);}}
+@keyframes bannerIn{from{opacity:0;max-height:0;padding-top:0;padding-bottom:0;}to{opacity:1;}}
+/* ⚠️ 都不加 fill-mode：动画的终态与常态一致，
+   加了 forwards/both 反而会让动画里的 max-height 一直压着，
+   收起时的 transition 就不生效了。 */
+.pg.anim{animation:fadeUp .15s ease-out;}
+.bigcover img.anim,.mcover img.anim{animation:coverIn .2s ease-out;}
+
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms !important;
+    animation-delay:0s !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+    transition-delay:0s !important;
+    scroll-behavior:auto !important;
+  }
+}
+</style>
+</head>
+<body>
+
+<div id="offline" class="offline" hidden>⚠️ 与设备失联，正在重连…</div>
+
+<div class="wrap" id="wrap">
+  <header class="top">
+    <div style="min-width:0">
+      <h1>ESP-Music</h1>
+      <p class="sub" id="hdr-sub">正在连接设备…</p>
+    </div>
+    <span class="dot" id="hdr-dot"></span>
+  </header>
+
+  <!-- ================= Tab 1：播放 ================= -->
+  <section id="pg-play" class="pg">
+    <div class="card">
+      <div class="bigwrap">
+        <div class="bigcover">
+          <img id="cover-img" alt="专辑封面" hidden>
+          <div class="ph" id="cover-ph"></div>
+        </div>
+      </div>
+      <div class="pmeta">
+        <div class="ptitle" id="song-title">未在播放</div>
+        <div class="partist" id="song-artist">—</div>
+        <div class="palbum" id="song-album"></div>
+      </div>
+      <div class="prow2">
+        <span class="pill" id="state-pill">空闲</span>
+        <span class="srcname" id="song-src"></span>
+        <button class="iconbtn star" id="btn-star" aria-label="收藏当前歌曲"></button>
+      </div>
+
+      <div class="prog" id="prog">
+        <div class="track">
+          <div class="fill" id="prog-fill"></div>
+          <div class="knob" id="prog-knob"></div>
+        </div>
+      </div>
+      <div class="times"><span id="t-cur">0:00</span><span id="t-dur">0:00</span></div>
+
+      <div class="ctrl">
+        <button class="iconbtn" id="btn-prev" aria-label="上一首"></button>
+        <button class="playbtn" id="btn-play" aria-label="播放或暂停"></button>
+        <button class="iconbtn" id="btn-next" aria-label="下一首"></button>
+      </div>
+
+      <div class="volrow">
+        <button class="iconbtn sm" id="btn-mute" aria-label="静音开关"></button>
+        <input type="range" id="vol" min="0" max="100" step="1" value="40" aria-label="音量">
+        <span class="volnum" id="vol-num">40</span>
+      </div>
+
+      <!-- 歌词（同步歌词自动高亮并居中滚动；点某句跳到那句） -->
+      <div class="lyr empty" id="lyr" aria-live="off">
+        <div class="lyr-in" id="lyr-in"><div class="lyr-none">暂无歌词</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= Tab 2：歌曲 ================= -->
+  <section id="pg-songs" class="pg" hidden>
+    <div class="card">
+      <div class="tabs" id="tabs"></div>
+      <div class="search">
+        <span id="search-ico"></span>
+        <input id="q" type="search" placeholder="搜索曲库（歌名 / 歌手）" enterkeyhint="search"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+      </div>
+      <div class="msg" id="s-msg"></div>
+      <div class="listhead">
+        <span id="list-title">列表</span>
+        <span class="lhright">
+          <span id="list-count"></span>
+          <button class="iconbtn sm" id="list-refresh" aria-label="刷新列表"></button>
+        </span>
+      </div>
+      <div class="list" id="list"><div class="empty">正在加载…</div></div>
+    </div>
+  </section>
+
+  <!-- ================= Tab 3：设置 ================= -->
+  <section id="pg-set" class="pg" hidden>
+
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-nav"><span>Navidrome 服务器</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-nav" hidden>
+        <label class="f"><span>服务器地址</span>
+          <input id="cfg-host" placeholder="http://192.168.0.110:4533" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></label>
+        <label class="f"><span>账号</span>
+          <input id="cfg-user" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></label>
+        <label class="f"><span>密码</span>
+          <input id="cfg-pass" type="password" autocomplete="new-password"></label>
+        <div class="row2">
+          <button class="btn" id="cfg-test">测试连接</button>
+          <button class="btn primary" id="cfg-save">保存</button>
+        </div>
+        <div class="msg" id="cfg-msg"></div>
+        <div class="hint">设备不回显账号，保存时请一起填上（留空会把账号存成空）。</div>
+      </div>
+    </div>
+
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-wifi"><span>WiFi 网络</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-wifi" hidden>
+        <div class="kv" id="wifi-info"></div>
+        <button class="btn block" id="wifi-scan" style="margin-top:10px">扫描附近网络</button>
+        <div class="list plain" id="scan-list" hidden></div>
+        <label class="f" style="margin-top:10px"><span>网络名称（SSID）</span>
+          <input id="wifi-ssid" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></label>
+        <label class="f"><span>密码</span>
+          <input id="wifi-pass" type="password" autocomplete="new-password"></label>
+        <button class="btn primary block" id="wifi-join">连接</button>
+        <div class="msg" id="wifi-msg"></div>
+        <div class="hint">切换网络时设备会立刻重连，WiFi 会断几秒，音乐尽量不中断。若本页因此失联，请连上设备热点后重新打开本页（本页地址：<span id="here1"></span>）。</div>
+      </div>
+    </div>
+
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-ap"><span>设备热点</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-ap" hidden>
+        <label class="row-between"><span>开启热点</span>
+          <input type="checkbox" class="sw" id="ap-on"></label>
+        <label class="f" style="margin-top:10px"><span>热点名称（SSID）</span>
+          <input id="ap-ssid" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></label>
+        <label class="f"><span>热点密码</span>
+          <input id="ap-pass" type="password" autocomplete="new-password" placeholder="留空表示不修改"></label>
+        <button class="btn block" id="ap-apply">应用热点设置</button>
+        <div class="msg" id="ap-msg"></div>
+        <div class="hint">没有 WiFi 时，手机连上这个热点也能打开本控制台。</div>
+      </div>
+    </div>
+
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-bright"><span>屏幕亮度</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-bright" hidden>
+        <div class="volrow">
+          <input type="range" id="bright" min="5" max="100" step="1" value="80" aria-label="屏幕亮度">
+          <span class="volnum" id="bright-num">80</span>
+        </div>
+        <div class="hint">拖动即生效（5 ~ 100）。滑条会跟着设备当前值走，屏幕上的按键改了这边也会变。</div>
+      </div>
+    </div>
+
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-dbg"><span>设备信息</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-dbg" hidden>
+        <div class="row-between"><span style="font-size:13px;color:var(--muted)">实时诊断</span>
+          <button class="iconbtn sm" id="dbg-refresh" aria-label="刷新设备信息"></button></div>
+        <div class="kv" id="dbg"></div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="foot">
+    本页地址：<span id="here2"></span><br>
+    ESP-Music · 单文件离线控制台（无外部依赖）
+  </footer>
+</div>
+
+<!-- 迷你播放条（歌曲 / 设置两个 Tab 常驻） -->
+<div id="mini" class="mini" hidden>
+  <div class="miniin">
+    <div class="mcover"><img id="mini-img" alt="" hidden><div class="ph" id="mini-ph"></div></div>
+    <div class="mmain" id="mini-meta">
+      <div class="mtitle" id="mini-title">未在播放</div>
+      <div class="msub" id="mini-sub">—</div>
+    </div>
+    <button class="iconbtn sm" id="mini-play" aria-label="播放或暂停"></button>
+  </div>
+</div>
+
+<!-- 底部 Tab 栏 -->
+<nav class="tabbar" id="tabbar"><div class="tbin" id="tbin"></div></nav>
+
+<div id="toast" class="toast"></div>
+<noscript><div style="padding:16px;text-align:center">本控制台需要启用 JavaScript。</div></noscript>
+
+<script>
+"use strict";
+/* ============================================================
+   0. 基础工具
+   ============================================================ */
+var $ = function(id){ return document.getElementById(id); };
+
+function esc(s){
+  return String(s === undefined || s === null ? '' : s).replace(/[&<>"']/g, function(c){
+    return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+  });
+}
+function fmtTime(ms){
+  if(!isFinite(ms) || ms <= 0) return '0:00';
+  var s = Math.floor(ms / 1000);
+  var h = Math.floor(s / 3600); s -= h * 3600;
+  var m = Math.floor(s / 60); s -= m * 60;
+  var ss = (s < 10 ? '0' : '') + s;
+  if(h > 0) return h + ':' + (m < 10 ? '0' : '') + m + ':' + ss;
+  return m + ':' + ss;
+}
+function fmtSec(sec){ return fmtTime((sec || 0) * 1000); }
+function fmtUptime(sec){
+  sec = Math.max(0, Math.floor(sec || 0));
+  var d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
+      m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  if(d) return d + ' 天 ' + h + ' 小时';
+  if(h) return h + ' 小时 ' + m + ' 分';
+  if(m) return m + ' 分 ' + s + ' 秒';
+  return s + ' 秒';
+}
+function rssiText(r){
+  if(typeof r !== 'number') return '—';
+  if(r >= -55) return '极佳';
+  if(r >= -65) return '良好';
+  if(r >= -75) return '一般';
+  return '较弱';
+}
+function toast(msg, kind){
+  var el = $('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (kind === 'err' ? ' err' : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(function(){ el.className = 'toast'; }, 2600);
+}
+function setMsg(id, text, kind){
+  var el = $(id);
+  el.textContent = text || '';
+  el.className = 'msg' + (kind ? ' ' + kind : '');
+}
+function busy(btn, on, label){
+  if(on){ btn.setAttribute('disabled', '1'); btn._txt = btn.textContent; btn.textContent = label || '处理中…'; }
+  else { btn.removeAttribute('disabled'); if(btn._txt) btn.textContent = btn._txt; }
+}
+/* UTF-8 字节数（设备的请求体上限是按字节算的，中文一个字 3 字节） */
+function byteLen(s){
+  var n = 0;
+  for(var i = 0; i < s.length; i++){
+    var c = s.charCodeAt(i);
+    if(c < 0x80) n += 1;
+    else if(c < 0x800) n += 2;
+    else if(c >= 0xD800 && c <= 0xDBFF){ n += 4; i++; }
+    else n += 3;
+  }
+  return n;
+}
+/* 往上找最近的匹配节点（不依赖 Element.closest，老浏览器也能用） */
+function upId(el, id){
+  while(el && el.nodeType === 1){
+    if(el.id === id) return el;
+    el = el.parentNode;
+  }
+  return null;
+}
+
+/* ============================================================
+   0b. 动画助手
+   ⚠️ 动画一律由 CSS 负责，JS 只做「切 class」这一件事，
+      绝不每帧改 style（设备端 status 只有 1 秒一拍，JS 驱动会卡）。
+   ============================================================ */
+function reduceMotion(){
+  return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+/* 重播一次 CSS 动画：摘掉 class → 强制回流 → 戴回去 */
+function replay(el, cls){
+  if(!el || !el.classList || reduceMotion()) return;
+  el.classList.remove(cls);
+  if(el.offsetWidth === 0) return;   /* 不可见：不播，也别留个半透明的元素 */
+  el.classList.add(cls);
+}
+
+/* ============================================================
+   1. 内联 SVG 图标（全部在 JS 里拼，绝不引外部文件）
+   ============================================================ */
+var ICON = {
+  prev:'<path d="M7.2 5.5h2.1v13H7.2z" fill="currentColor"/><path d="M18.4 6.2v11.6L9.6 12z" fill="currentColor"/>',
+  next:'<path d="M14.7 5.5h2.1v13h-2.1z" fill="currentColor"/><path d="M5.6 6.2v11.6L14.4 12z" fill="currentColor"/>',
+  play:'<path d="M8.2 5.2v13.6L19 12z" fill="currentColor"/>',
+  pause:'<path d="M8 5.4h3.1v13.2H8z" fill="currentColor"/><path d="M12.9 5.4H16v13.2h-3.1z" fill="currentColor"/>',
+  vol:'<path d="M4.2 9.4h3.1L11.8 5.6v12.8L7.3 14.6H4.2z" fill="currentColor"/><path d="M14.7 8.9a4.4 4.4 0 010 6.2M17 6.5a7.7 7.7 0 010 11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+  mute:'<path d="M4.2 9.4h3.1L11.8 5.6v12.8L7.3 14.6H4.2z" fill="currentColor"/><path d="M15.2 9.6l5 5.4M20.2 9.6l-5 5.4" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>',
+  starOn:'<path d="M12 2l3.09 6.26L22 9.27l-5 4.87L18.18 21 12 17.77 5.82 21 7 14.14 2 9.27l6.91-1.01z" fill="currentColor"/>',
+  starOff:'<path d="M12 2l3.09 6.26L22 9.27l-5 4.87L18.18 21 12 17.77 5.82 21 7 14.14 2 9.27l6.91-1.01z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
+  note:'<circle cx="8.4" cy="16.6" r="2.9" fill="currentColor"/><circle cx="17.4" cy="14.6" r="2.9" fill="currentColor"/><rect x="10.4" y="4.2" width="1.8" height="12.4" rx=".9" fill="currentColor"/><rect x="19.4" y="4.2" width="1.8" height="10.4" rx=".9" fill="currentColor"/><rect x="10.4" y="4.2" width="10.8" height="1.9" rx=".95" fill="currentColor"/>',
+  search:'<circle cx="11" cy="11" r="6.3" fill="none" stroke="currentColor" stroke-width="1.9"/><path d="M15.7 15.7L20.2 20.2" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>',
+  chev:'<path d="M6 9.5l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+  refresh:'<path d="M20 12a8 8 0 11-2.4-5.7" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><path d="M20.2 4.6v5h-5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>',
+  wifi:'<path d="M12 16.9a1.5 1.5 0 100 3 1.5 1.5 0 000-3z" fill="currentColor"/><path d="M7.7 13.2a6.1 6.1 0 018.6 0M4.5 9.9a10.6 10.6 0 0115 0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+  list:'<path d="M4 6.6h16M4 12h16M4 17.4h10" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>',
+  sliders:'<path d="M4 7.5h9.6M18.6 7.5H20M4 16.5h3.4M12.4 16.5H20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><circle cx="16" cy="7.5" r="2.3" fill="none" stroke="currentColor" stroke-width="1.9"/><circle cx="9.9" cy="16.5" r="2.3" fill="none" stroke="currentColor" stroke-width="1.9"/>'
+};
+function svg(name){
+  return '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">' + (ICON[name] || '') + '</svg>';
+}
+function bars(rssi){
+  var n = 1;
+  if(typeof rssi === 'number'){
+    if(rssi >= -55) n = 4; else if(rssi >= -65) n = 3; else if(rssi >= -75) n = 2;
+  }
+  var s = '<svg viewBox="0 0 24 22" width="16" height="15" aria-hidden="true">';
+  for(var i = 0; i < 4; i++){
+    var h = 6 + i * 4.5;
+    s += '<rect x="' + (3 + i * 5) + '" y="' + (20 - h) + '" width="3.4" height="' + h +
+         '" rx="1.2" fill="currentColor" opacity="' + (i < n ? 1 : .25) + '"/>';
+  }
+  return s + '</svg>';
+}
+
+/* ============================================================
+   2. 网络层 —— ⚠️ 设备端 httpd 只有 3 个 socket（lru_purge），
+      浏览器默认同域 6 并发会把设备挤爆，所有请求都变慢。
+      所以这里自己排队：最多 2 个同时在飞，其余排队；
+      单个请求超时用 Promise.race 兜底（不依赖 AbortController，
+      保证卡死的请求一定会归还额度，队列不会永久堵死）。
+   ============================================================ */
+var REQ = { max:2, n:0, q:[] };
+
+function doFetch(path, opts, tmo){
+  var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+  var o = { method: opts.method || 'GET', cache:'no-store' };
+  if(opts.headers) o.headers = opts.headers;
+  if(opts.body !== undefined) o.body = opts.body;
+  if(ctl) o.signal = ctl.signal;
+
+  var p = fetch(path, o).then(function(res){
+    return res.text().then(function(txt){
+      var d = null;
+      if(txt){ try{ d = JSON.parse(txt); }catch(e){ d = null; } }
+      if(!res.ok){
+        var m = (d && d.error) ? d.error : ('请求失败（HTTP ' + res.status + '）');
+        throw new Error(m);
+      }
+      return d;
+    });
+  }, function(e){
+    throw (e instanceof Error ? e : new Error('网络错误'));
+  });
+
+  return new Promise(function(ok, no){
+    var done = false;
+    var t = setTimeout(function(){
+      if(done) return;
+      done = true;
+      if(ctl){ try{ ctl.abort(); }catch(e){} }
+      no(new Error('请求超时'));
+    }, tmo);
+    p.then(function(v){ if(!done){ done = true; clearTimeout(t); ok(v); } },
+           function(e){ if(!done){ done = true; clearTimeout(t); no(e); } });
+  });
+}
+function pump(){
+  while(REQ.n < REQ.max && REQ.q.length){
+    (function(job){
+      REQ.n++;
+      doFetch(job.path, job.opts, job.tmo).then(function(v){
+        REQ.n--; try{ job.ok(v); }catch(e){} pump();
+      }, function(e){
+        REQ.n--; try{ job.no(e); }catch(e2){} pump();
+      });
+    })(REQ.q.shift());
+  }
+}
+/* ⚠️ /api/config 和 /api/config/test 在设备端是**同步阻塞**的（要真去连一次
+ * Navidrome，最长 4~6 秒）。这几秒里 httpd 不处理别的请求，status 轮询会超时，
+ * 于是"连续 3 次失败"会把"与设备失联"横幅弹出来 —— 用户刚点完保存就看到它，
+ * 很吓人而且不对。所以在这一层统一计数，配置请求在飞时轮询失败不计入。 */
+function isCfgPath(p){ return p.indexOf('/api/config') === 0; }
+
+function api(path, opts, tmo){
+  return new Promise(function(ok, no){
+    var cfg = isCfgPath(path);
+    if(cfg) S.cfgBusy = (S.cfgBusy || 0) + 1;
+    function done(fn, arg){ if(cfg) S.cfgBusy--; fn(arg); }
+    REQ.q.push({ path:path, opts:opts || {}, tmo:tmo || 9000,
+                 ok:function(a){ done(ok, a); }, no:function(e){ done(no, e); } });
+    pump();
+  });
+}
+function post(path, body, timeoutMs){
+  return api(path, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body || {})
+  }, timeoutMs || 15000);
+}
+
+/* ============================================================
+   3. 全局状态
+   ============================================================ */
+var PAGE  = 60;                 /* 单次最多渲染多少行 */
+var PAGE_N = 60;                /* 一次向设备要多少条（设备上限 64） */
+var SRC_NAME = { recent:'最近播放', starred:'我的收藏', random:'随机 30 首' };
+var RANDOM_NAME = '随机 30 首';  /* 必须与设备 player_src_name(PLAYER_SRC_RANDOM) 一致 */
+
+function newList(){
+  return { kind:'', srcKey:'', items:[], total:0, shown:PAGE, els:null, loading:false, err:'' };
+}
+var S = {
+  status:null,
+  gen:null,
+  posBase:0, posT0:0, dragging:false, dragRatio:0, seekHold:0,
+  volHold:0, volTimer:null, brightHold:0, brightTimer:null,
+  fails:0, stBusy:false, offT:null,
+  tab:'play',                  /* play | songs | set */
+  src:'recent',                /* recent | starred | random */
+  mode:'src',                  /* src | search */
+  L:newList(), SR:newList(),
+  starOv:{},                   /* 收藏乐观覆盖 */
+  /* M6：收藏现在是"设备上的镜像立刻返回 + 后台跟 Navidrome 对账"。
+   * starGen 是镜像的变化计数 —— 变了说明后台对完了，正在看收藏页就重拉一次。 */
+  starGen:null, starNote:'',
+  optKey:null, optKeyT:0, optSong:null, optPrev:null,
+  waitQ:null, waitCb:null,
+  setLoaded:false, dbgLoaded:false, wifiTimer:null,
+  qseq:0
+};
+
+/* 列表项唯一键：优先用 id，退回「标题+歌手」 */
+function keyOf(it){
+  if(it && it.id) return 'id:' + it.id;
+  return 'k:' + (it && it.title ? it.title : '') + '|' + (it && it.artist ? it.artist : '');
+}
+function isStarred(it){
+  if(!it) return false;
+  if(it.id && S.starOv['id:' + it.id] !== undefined) return S.starOv['id:' + it.id];
+  var k = keyOf(it);
+  if(S.starOv[k] !== undefined && !it.id) return S.starOv[k];
+  return it.starred === true;
+}
+function setStarOv(it, on){
+  if(!it) return;
+  if(it.id) S.starOv['id:' + it.id] = on;
+  S.starOv['k:' + (it.title || '') + '|' + (it.artist || '')] = on;
+}
+
+/* 哪一行在播放：status 每秒都新鲜，列表可能是几分钟前拉的，
+   所以只要 status 里有歌就以 status 为准（按 id → 标题+歌手 两级匹配）。
+   ⚠️ 不用列表里的 i / playing 字段：队列一换它们就是陈旧的，会点亮两行。 */
+function isCurrent(it){
+  if(!it) return false;
+  if(S.optKey && keyOf(it) === S.optKey) return true;
+  var st = S.status, song = st && st.song;
+  if(song && (song.title || song.id)){
+    if(it.id && song.id && it.id === song.id) return true;
+    return it.title === song.title && (it.artist || '') === (song.artist || '');
+  }
+  return false;
+}
+function curL(){ return S.mode === 'search' ? S.SR : S.L; }
+
+/* ============================================================
+   4. 播放器的渲染（只改文本 / class，不重建 DOM）
+   ============================================================ */
+var STATE_TXT = {PLAYING:'播放中',PAUSED:'已暂停',BUFFERING:'缓冲中',FINISHED:'已结束',IDLE:'空闲',ERROR:'出错'};
+
+var coverKey = null;
+function renderCover(song, gen){
+  song = song || {};
+  var cid = song.cover ? String(song.cover) : '';
+  var mini = (S.tab !== 'play');
+  var key = cid + '#' + (gen || 0) + '#' + (mini ? 'm' : 'b');
+  if(key === coverKey) return;
+  coverKey = key;
+
+  var img = $(mini ? 'mini-img' : 'cover-img');
+  var ph  = $(mini ? 'mini-ph'  : 'cover-ph');
+  var img2 = $(mini ? 'cover-img' : 'mini-img');
+  var ph2  = $(mini ? 'cover-ph'  : 'mini-ph');
+  /* 只让"当前可见"的那个元素去请求封面：同一张图发两次请求可能占掉两条
+     连接（设备只有 3 个 socket）。切 Tab 时另一个再取，走浏览器缓存。 */
+  if(img2){ img2.hidden = true; img2.removeAttribute('src'); }
+  if(ph2) ph2.hidden = false;
+
+  if(!cid){
+    img.hidden = true; img.removeAttribute('src'); ph.hidden = false;
+    return;
+  }
+  img.onload  = function(){ img.hidden = false; ph.hidden = true; replay(img, 'anim'); };
+  img.onerror = function(){ img.hidden = true;  ph.hidden = false; };
+  ph.hidden = true;
+  img.src = '/api/cover?id=' + encodeURIComponent(cid) + '&size=144';
+  img.hidden = false;
+}
+function renderPlayBtn(){
+  var st = S.status;
+  var playing = !!(st && st.playing && !st.paused);
+  var ico = svg(playing ? 'pause' : 'play');
+  $('btn-play').innerHTML = ico;
+  $('mini-play').innerHTML = ico;
+  $('btn-play').setAttribute('aria-label', playing ? '暂停' : '播放');
+}
+function renderStar(){
+  var st = S.status, song = st && st.song;
+  var b = $('btn-star');
+  var on = song ? isStarred(song) : false;
+  b.innerHTML = svg(on ? 'starOn' : 'starOff');
+  b.className = 'iconbtn star' + (on ? ' on' : '');
+  b.disabled = !(song && song.id);
+  b.style.color = on ? 'var(--star)' : (song && song.id ? 'var(--icon)' : 'var(--line)');
+}
+function renderVolume(st){
+  var v = (st && typeof st.vol === 'number') ? st.vol : 0;
+  var muted = !!(st && st.muted) || v === 0;
+  $('btn-mute').innerHTML = svg(muted ? 'mute' : 'vol');
+  $('btn-mute').style.color = muted ? 'var(--icon)' : 'var(--text)';
+  if(!(S.volHold && performance.now() - S.volHold < 1500)){
+    if(Number($('vol').value) !== v) $('vol').value = v;
+    $('vol-num').textContent = v;
+  }
+}
+/* 亮度：设备把真值放在 status.bright 里，用户没在拖就跟着走 */
+function renderBright(st){
+  if(!st || typeof st.bright !== 'number') return;
+  if(S.brightHold && performance.now() - S.brightHold < 1500) return;
+  var b = $('bright');
+  if(b && Number(b.value) !== st.bright){
+    b.value = st.bright;
+    $('bright-num').textContent = st.bright;
+  }
+}
+function renderSong(){
+  var st = S.status, song = (st && st.song) || {};
+  var title = song.title || '未在播放';
+  $('song-title').textContent = title;
+  $('song-artist').textContent = song.artist || '—';
+  $('song-album').textContent = (song.album && song.album !== song.artist) ? song.album : '';
+  $('mini-title').textContent = title;
+  $('mini-sub').textContent = song.artist || song.album || '—';
+
+  var stateTxt = st ? (STATE_TXT[st.state] || (st.playing ? '播放中' : '已停止')) : '空闲';
+  var pill = $('state-pill');
+  pill.textContent = stateTxt;
+  pill.className = 'pill' + (st && st.state === 'PLAYING' ? '' : ' gray');
+  if(st && st.state === 'ERROR'){ pill.style.background = '#FBE9E7'; pill.style.color = 'var(--err)'; }
+  else if(pill.style.cssText) pill.style.cssText = '';
+
+  var q = (st && st.queue) || {};
+  var idx = (typeof q.index === 'number') ? q.index : -1;
+  $('song-src').textContent = q.source
+    ? (q.source + (idx >= 0 ? ' · 第 ' + (idx + 1) + '/' + (q.count || '?') + ' 首' : ' · 不在当前列表'))
+    : '';
+  renderCover(song, st ? st.gen : 0);
+  renderStar();
+  lyricsFollow();       /* 歌变了才动歌词面板（内部比 id，廉价） */
+}
+
+/* ============================================================
+   5. 列表（分页 + 事件委托 + 只改 class 的高亮）
+   ============================================================ */
+function renderList(keepScroll){
+  var L = curL(), el = $('list');
+  var arr = L.items.slice(0, L.shown);
+  var html = '', onIdx = -1;
+
+  if(!arr.length){
+    html = '<div class="empty">' + (L.loading ? '正在加载…'
+         : esc(L.err ? ('加载失败：' + L.err)
+         : (S.mode === 'search' ? '没有找到匹配的歌曲' : '这里还没有歌'))) + '</div>';
+  }else{
+    for(var n = 0; n < arr.length; n++){
+      var it = arr[n];
+      var on = isCurrent(it);
+      if(on && onIdx < 0) onIdx = n;
+      var dur = (typeof it.dur_s === 'number' && it.dur_s > 0) ? fmtSec(it.dur_s) : '';
+      html += '<div class="row' + (on ? ' on' : '') + '" role="button" tabindex="0" data-n="' + n + '">' +
+                '<span class="rmain">' +
+                  '<span class="rtitle">' + esc(it.title || '未知曲目') + '</span>' +
+                  '<span class="rsub">' + esc(it.artist || it.album || '') + '</span>' +
+                '</span>' +
+                (isStarred(it) ? '<span class="rstar">' + svg('starOn') + '</span>' : '<span></span>') +
+                '<span class="rdur">' + dur + '</span>' +
+              '</div>';
+    }
+    if(arr.length < L.total){
+      html += '<button class="more" data-more="1">加载更多（已显示 ' + arr.length + ' / ' + L.total + '）</button>';
+    }
+  }
+  var st = typeof el.scrollTop === 'number' ? el.scrollTop : 0;
+  el.innerHTML = html;
+  L.els = el.querySelectorAll ? el.querySelectorAll('.row') : null;
+  if(keepScroll){ el.scrollTop = st; }
+  else if(onIdx >= 0 && L.els && L.els[onIdx] && typeof L.els[onIdx].offsetTop === 'number'){
+    /* 在播的那行滚进可视区（只滚列表容器，不滚整页） */
+    var top = L.els[onIdx].offsetTop, h = L.els[onIdx].offsetHeight || 52;
+    if(top < el.scrollTop || top + h > el.scrollTop + el.clientHeight){
+      el.scrollTop = Math.max(0, top - el.clientHeight / 2);
+    }
+  }
+  syncHead();
+}
+/* 换歌只动受影响的两行 class —— 不重建列表 */
+function paintRows(){
+  var L = curL();
+  if(!L.els) return;
+  for(var i = 0; i < L.els.length; i++){
+    var row = L.els[i], it = L.items[i];
+    if(!row || !it) continue;
+    var on = isCurrent(it);
+    if(on === !!row._on) continue;
+    row._on = on;
+    if(on && row.classList) row.classList.add('on');
+    else if(row.classList) row.classList.remove('on');
+  }
+}
+function syncHead(){
+  var L = curL(), q = (S.status && S.status.queue) || {};
+  var nm = (S.mode === 'search') ? '搜索结果' : (SRC_NAME[S.src] || '列表');
+  if(S.mode === 'src' && S.src === 'random' && q.source && q.source !== RANDOM_NAME) nm += '（设备当前：' + q.source + '）';
+  $('list-title').textContent = nm;
+  $('list-count').textContent = L.items.length
+    ? (L.items.length + (L.items.length < L.total ? ' / ' + L.total : '') + ' 首') : '';
+  /* 收藏页额外标一句同步状态（镜像没跟服务器对上时用户要能看出来） */
+  if(S.mode === 'src' && S.src === 'starred' && S.starNote){
+    $('list-count').textContent += ' · ' + S.starNote;
+  }
+  $('list-refresh').hidden = (S.mode === 'search');
+}
+
+/* 分页取队列：mode = reset（重来）| more（追加）| refresh（保持长度重取） */
+function loadQueuePage(L, mode){
+  if(L.loading) return;
+  var from = 0, n = PAGE_N;
+  if(mode === 'more') from = L.items.length;
+  if(mode === 'refresh') n = Math.min(64, Math.max(PAGE_N, L.items.length));
+  L.loading = true;
+  if(mode === 'reset'){ L.items = []; L.total = 0; L.shown = PAGE; L.err = ''; }
+  api('/api/queue?from=' + from + '&n=' + n, {}, 9000).then(function(d){
+    L.loading = false;
+    if(mode !== 'more') L.items = [];
+    L.items = L.items.concat((d && d.items) || []);
+    L.total = (d && typeof d.total === 'number') ? d.total : L.items.length;
+    L.kind = 'queue'; L.srcKey = 'random'; L.err = '';
+    renderList(mode !== 'reset');
+  }, function(e){
+    L.loading = false; L.err = e.message;
+    renderList(mode !== 'reset');
+    toast('列表加载失败：' + e.message, 'err');
+  });
+}
+function loadMore(){
+  var L = curL();
+  L.shown += PAGE;
+  if(L.kind === 'queue' && L.items.length < L.total && L.items.length < L.shown){
+    loadQueuePage(L, 'more');
+  }else{
+    renderList(true);
+  }
+}
+/* 等设备真的把来源换过来（换来源要联网，几百毫秒），靠每秒的 status 判断，不额外打请求。
+   判据 = 来源名对上 且 队列内容 gen 变了（换成同一批歌 gen 也会变）。 */
+function waitSrc(name, cb){
+  var g0 = (S.status && S.status.queue) ? S.status.queue.gen : null;
+  var t0 = performance.now();
+  S.waitQ = function(st){
+    if(performance.now() - t0 > 15000) return true;
+    var q = st.queue || {};
+    if(q.source !== name) return false;
+    return (g0 === null || q.gen !== g0);
+  };
+  S.waitCb = cb;
+}
+/* 来源列表：最近播放 / 我的收藏 是"只看不换台"，随机 30 首是设备上真换来源 + 起播。
+   force  = 不管当前是不是随机，都让设备重新抽 30 首（播放页那个按钮就是这个语义）
+   silent = 静默重拉（收藏镜像在后台变了时用）：**不清空列表**，只把行换成新的 ——
+            否则用户每点一次心形，整个列表会闪一下"正在加载…" */
+function fetchSrc(k, force, silent){
+  var L = S.L;
+  if(L.loading) return;
+  if(k === 'random'){
+    if(!force && S.status && S.status.queue && S.status.queue.source === RANDOM_NAME){
+      loadQueuePage(L, 'reset');
+      return;
+    }
+    /* 先把旧列表清掉，免得"我的收藏"的行挂在"随机 30 首"下面 */
+    L.loading = true; L.items = []; L.total = 0; L.shown = PAGE; L.err = '';
+    L.kind = 'queue'; L.srcKey = 'random';
+    renderList(false);
+    waitSrc(RANDOM_NAME, function(){
+      L.loading = false;
+      /* 等设备的这几百毫秒里用户可能已经点了别的来源，那就去补那个列表，
+         否则会一直卡在"正在加载…"上 */
+      if(S.src === 'random' && S.mode === 'src') loadQueuePage(L, 'reset');
+      else if(S.src !== 'random') fetchSrc(S.src);
+    });
+    post('/api/source', {i:2, autoplay:true}, 20000).then(function(){
+      refreshStatus();          /* 早点让 status 反映新来源，waitQ 靠它判断 */
+    }, function(e){
+      S.waitQ = null; S.waitCb = null;
+      L.loading = false; L.err = e.message;
+      renderList(false);
+      toast('切换失败：' + e.message, 'err');
+    });
+    return;
+  }
+  if(!silent){
+    L.loading = true; L.items = []; L.total = 0; L.shown = PAGE; L.err = '';
+    L.kind = k; L.srcKey = k;
+    renderList(false);
+  }
+  api(k === 'starred' ? '/api/starred' : '/api/recent', {}, 15000).then(function(d){
+    L.loading = false;
+    L.items = (d && d.items) || [];
+    L.total = (d && typeof d.total === 'number') ? d.total : L.items.length;
+    if(k === 'starred' && !d.synced){
+      /* 设备上这份是本地镜像：synced=false = 还没跟服务器对上（没网 / 有操作没发出去）。
+         提示文案由 applyStatus 统一维护，这里只是让它早点出现 */
+      S.starNote = d.pending ? '待同步 ' + d.pending + ' 条' : '未与服务器同步';
+    }
+    renderList(false);
+  }, function(e){
+    L.loading = false; L.items = []; L.total = 0; L.err = e.message;
+    renderList(false);
+  });
+}
+function renderSrcTabs(){
+  var ks = ['recent','starred','random'], html = '';
+  for(var i = 0; i < ks.length; i++){
+    html += '<button type="button" class="tab' + (S.src === ks[i] ? ' on' : '') +
+            '" data-src="' + ks[i] + '">' + SRC_NAME[ks[i]] + '</button>';
+  }
+  $('tabs').innerHTML = html;
+}
+function pickSrc(k){
+  if(!SRC_NAME[k]) return;
+  var changed = (S.src !== k);
+  S.src = k;
+  S.mode = 'src';
+  clearSearch();
+  renderSrcTabs();
+  if(changed || !S.L.items.length) fetchSrc(k);
+  else renderList(false);
+}
+
+/* ============================================================
+   6. 状态轮询 / 应用
+   ============================================================ */
+/* 失联横幅：出现用 CSS 动画、消失用 max-height/opacity 过渡
+   （直接切 hidden 就不好看了；收起那 220ms 里 element 还在，只是透明且高度为 0） */
+function showOffline(){
+  var b = $('offline');
+  clearTimeout(S.offT);
+  if(!b.hidden && b.className.indexOf('out') < 0) { $('hdr-dot').className = 'dot bad'; return; }
+  b.hidden = false;
+  b.className = 'offline';
+  replay(b, 'in');
+  $('hdr-dot').className = 'dot bad';
+}
+function hideOffline(){
+  var b = $('offline');
+  if(b.hidden) return;
+  b.className = 'offline out';
+  clearTimeout(S.offT);
+  S.offT = setTimeout(function(){ b.hidden = true; b.className = 'offline'; }, 220);
+}
+
+/* ⚠️ 保存/校验 Navidrome 配置时，设备端的 httpd 处理器是**同步阻塞**的
+ * （要真的去连一次那台服务器），最长约 4~6 秒。这段时间里 status 轮询会超时，
+ * 于是"连续 3 次失败"会把失联横幅弹出来 —— 用户刚点完保存就看到"与设备失联"，
+ * 很吓人而且不对。所以配置请求在飞的时候，轮询失败不计入。 */
+S.cfgBusy = 0;
+
+function refreshStatus(){
+  if(S.cfgBusy > 0) return Promise.resolve();
+  return api('/api/status', {}, 6000).then(function(st){
+    S.fails = 0;
+    hideOffline();
+    applyStatus(st);
+  }, function(){
+    if(S.cfgBusy > 0) return;          /* 配置请求在飞：这次失败不算 */
+    S.fails++;
+    if(S.fails >= 3) showOffline();
+  });
+}
+function applyStatus(st){
+  if(!st || typeof st !== 'object') return;
+  var genChanged = (typeof st.gen === 'number') && st.gen !== S.gen;
+  if(typeof st.gen === 'number') S.gen = st.gen;
+
+  var held = S.dragging || (S.seekHold && performance.now() - S.seekHold < 1200);
+  if(genChanged || !held){
+    S.posBase = (typeof st.pos_ms === 'number') ? st.pos_ms : 0;
+    S.posT0 = performance.now();
+  }
+  /* 乐观保持：刚点播的歌，设备那边还没切过来时别把界面拽回旧歌
+     （POST 在后台飞，这期间的 status 还是旧的） */
+  var opt = S.optSong;
+  if(opt){
+    if(performance.now() - S.optKeyT > 4500){ S.optKey = null; S.optSong = null; }
+    else{
+      var cur = st.song || {};
+      var same = opt.id ? (cur.id === opt.id) : (cur.title === opt.title && (cur.artist || '') === (opt.artist || ''));
+      if(same){ S.optKey = null; S.optSong = null; }
+      else{
+        st.song = opt;
+        st.state = 'BUFFERING';
+        st.playing = false; st.paused = false;
+        st.dur_ms = (opt.dur_s || 0) * 1000;
+      }
+    }
+  }
+  S.status = st;
+
+  var q = st.queue || {};
+  $('hdr-sub').textContent = (STATE_TXT[st.state] || '空闲') + (q.source ? ' · ' + q.source : '');
+  $('hdr-dot').className = 'dot ok';
+
+  renderSong();
+  renderPlayBtn();
+  renderVolume(st);
+  renderBright(st);
+  drawProgress();
+  lyrTick();            /* 每秒用校正过的位置再对一次歌词高亮 */
+  paintRows();          /* gen 变了也只动 class，不重拉列表 */
+
+  /* M6：收藏镜像的 gen 变了 = 设备刚跟 Navidrome 对完账（或别处收藏了）。
+     正在看"我的收藏"就静默重拉一次，用户不用手动刷。 */
+  var sst = st.starred;
+  if(sst && typeof sst.gen === 'number'){
+    if(S.starGen !== null && sst.gen !== S.starGen && S.src === 'starred' && S.mode === 'src'){
+      fetchSrc('starred', true, true);
+    }
+    S.starGen = sst.gen;
+    S.starNote = sst.synced ? ''
+               : (sst.pending ? '待同步 ' + sst.pending + ' 条' : '未与服务器同步');
+    syncHead();          /* 状态里的同步提示要立刻反映到列表标题上 */
+  }
+
+  if(S.waitQ && S.waitQ(st)){
+    var cb = S.waitCb;
+    S.waitCb = null;
+    if(cb) cb();
+  }
+}
+
+/* ============================================================
+   7. 播放控制（全部乐观更新：点下去立刻有反应）
+   ============================================================ */
+/* 只改界面，不发请求；顺带存一份回滚快照 */
+function optimistic(it){
+  var song = { id: it.id || '', title: it.title || '', artist: it.artist || '',
+               album: it.album || '', cover: it.cover || '',
+               starred: isStarred(it), dur_s: (typeof it.dur_s === 'number' ? it.dur_s : 0) };
+  S.optKey = keyOf(it);
+  S.optKeyT = performance.now();
+  S.optSong = song;
+  S.posBase = 0; S.posT0 = performance.now(); S.seekHold = 0;
+  if(S.status){
+    S.optPrev = { song:S.status.song, state:S.status.state, playing:S.status.playing,
+                  paused:S.status.paused, dur_ms:S.status.dur_ms,
+                  index:(S.status.queue ? S.status.queue.index : undefined) };
+    S.status.song = song;
+    S.status.state = 'BUFFERING';
+    S.status.playing = false; S.status.paused = false;
+    S.status.dur_ms = song.dur_s * 1000;
+    if(S.status.queue && typeof it.i === 'number') S.status.queue.index = it.i;
+  }
+  renderSong();
+  renderPlayBtn();
+  drawProgress();
+  paintRows();
+}
+function clearOpt(){
+  S.optKey = null; S.optSong = null;
+  paintRows();
+}
+/* POST 失败：把界面退回点之前的样子（不等下一次 status） */
+function rollback(){
+  S.optKey = null; S.optSong = null;
+  var p = S.optPrev;
+  S.optPrev = null;
+  if(p && S.status){
+    S.status.song = p.song; S.status.state = p.state;
+    S.status.playing = p.playing; S.status.paused = p.paused;
+    S.status.dur_ms = p.dur_ms;
+    if(S.status.queue && p.index !== undefined) S.status.queue.index = p.index;
+  }
+  renderSong();
+  renderPlayBtn();
+  drawProgress();
+  paintRows();
+}
+function playItem(it){
+  if(!it) return;
+  var body = null;
+  if(it.id){
+    /* ★ 把这一行已有的元数据一起带上：这个 id 不在设备队列里时，设备直接拿这些
+       字段建一条队列项就能起播，省掉一次回源 Navidrome 的往返（实测 200~800ms） */
+    body = { id: it.id };
+    if(it.title)  body.title  = it.title;
+    if(it.artist) body.artist = it.artist;
+    if(it.album)  body.album  = it.album;
+    if(it.cover)  body.cover  = it.cover;
+    if(typeof it.dur_s === 'number' && it.dur_s > 0) body.dur_s = it.dur_s;
+    if(isStarred(it)) body.starred = true;
+    /* 设备端请求体上限 1024 字节，超了直接 400。元数据太大就只发 id
+       （宁可多一次回源往返，也不能点下去报错） */
+    try{ if(byteLen(JSON.stringify(body)) > 700) body = { id: it.id }; }catch(e){}
+  }else if(typeof it.i === 'number' && it.i >= 0){
+    body = { i: it.i };
+  }
+  if(!body){ toast('这首歌没有可用的 id'); return; }
+
+  optimistic(it);                       /* ① 立刻高亮 + 缓冲中 + 迷你条换名 */
+  post('/api/play', body, 20000).then(function(){   /* ② 请求在后台飞 */
+    S.optPrev = null;
+    setTimeout(function(){ refreshStatus(); }, 300);
+  }, function(e){                        /* ③ 只有失败才回滚 */
+    toast('播放失败：' + e.message, 'err');
+    rollback();
+    refreshStatus();
+  });
+}
+function togglePlay(){
+  if(S.status){
+    var playing = !!(S.status.playing && !S.status.paused);
+    S.status.playing = !playing;
+    S.status.paused = playing;
+    S.status.state = playing ? 'PAUSED' : 'PLAYING';
+    S.posBase = curPos(); S.posT0 = performance.now();
+    renderPlayBtn();
+    renderSong();
+  }
+  post('/api/toggle').then(function(){
+    setTimeout(function(){ refreshStatus(); }, 200);
+  }, function(e){
+    toast('操作失败：' + e.message, 'err');
+    refreshStatus();
+  });
+}
+/* 下一首/上一首：队列里下一首是谁是知道的，先高亮过去，请求后台发 */
+function pickNext(dir){
+  var st = S.status;
+  if(!st || !st.queue || S.L.kind !== 'queue') return null;
+  var n = st.queue.count || 0, idx = st.queue.index;
+  if(n <= 0 || typeof idx !== 'number' || idx < 0) return null;
+  var t = idx + (dir > 0 ? 1 : -1);
+  if(t < 0) t = n - 1;
+  if(t >= n) t = 0;
+  for(var i = 0; i < S.L.items.length; i++){
+    if(S.L.items[i].i === t) return S.L.items[i];
+  }
+  return null;
+}
+function skip(dir){
+  var it = pickNext(dir);
+  if(it) optimistic(it); else clearOpt();
+  post(dir > 0 ? '/api/next' : '/api/prev').then(function(){
+    setTimeout(function(){ refreshStatus(); }, 250);
+  }, function(e){
+    toast('操作失败：' + e.message, 'err');
+    refreshStatus();
+  });
+}
+function toggleStar(){
+  var st = S.status, song = st && st.song;
+  if(!song || !song.id){ toast('当前没有可收藏的歌曲'); return; }
+  var was = isStarred(song);
+  setStarOv(song, !was);
+  for(var i = 0; i < S.L.items.length; i++){
+    if(keyOf(S.L.items[i]) === 'id:' + song.id) setStarOv(S.L.items[i], !was);
+  }
+  for(var j = 0; j < S.SR.items.length; j++){
+    if(S.SR.items[j].id === song.id) setStarOv(S.SR.items[j], !was);
+  }
+  renderStar();
+  renderList(true);
+  toast(was ? '已取消收藏' : '已加入收藏');
+  post('/api/star', {id: song.id, on: !was}).then(function(){
+    setTimeout(function(){ refreshStatus(); }, 200);
+  }, function(e){
+    setStarOv(song, was);
+    renderStar();
+    renderList(true);
+    toast('收藏失败：' + e.message, 'err');
+  });
+}
+function toggleMute(){
+  var st = S.status;
+  if(!st) return;
+  var on = !(st.muted === true);
+  st.muted = on;
+  renderVolume(st);
+  post('/api/mute', {on: on}).then(function(){
+    setTimeout(function(){ refreshStatus(); }, 150);
+  }, function(e){
+    st.muted = !on; renderVolume(st);
+    toast('静音切换失败：' + e.message, 'err');
+  });
+}
+/* 注：播放页原来那个全宽「随机 30 首」按钮按需求去掉了。
+   随机来源还在「歌曲」Tab 的来源选项卡里（pickSrc('random')）。 */
+
+/* ============================================================
+   8. 进度条：内插 + 拖动 / 点击
+   ============================================================ */
+function curPos(){
+  var st = S.status;
+  if(!st) return 0;
+  var dur = typeof st.dur_ms === 'number' ? st.dur_ms : 0;
+  var pos;
+  if(st.playing && !st.paused && !S.dragging) pos = S.posBase + (performance.now() - S.posT0);
+  else pos = S.posBase;
+  if(dur > 0 && pos > dur) pos = dur;
+  return pos < 0 ? 0 : pos;
+}
+function paintProgress(ratio, curMs, durMs){
+  var pct = Math.max(0, Math.min(100, ratio * 100));
+  $('prog-fill').style.width = pct.toFixed(2) + '%';
+  $('prog-knob').style.left = pct.toFixed(2) + '%';
+  var txt = fmtTime(curMs);
+  if(txt !== paintProgress._cur){ paintProgress._cur = txt; $('t-cur').textContent = txt; }
+  var dt = fmtTime(durMs);
+  if(dt !== paintProgress._dur){ paintProgress._dur = dt; $('t-dur').textContent = dt; }
+}
+function drawProgress(){
+  if(S.dragging) return;
+  var st = S.status;
+  var dur = st && typeof st.dur_ms === 'number' ? st.dur_ms : 0;
+  var pos = curPos();
+  paintProgress(dur > 0 ? pos / dur : 0, pos, dur);
+}
+function progRatio(clientX){
+  var r = $('prog').getBoundingClientRect();
+  if(!r.width) return 0;
+  var x = (clientX - r.left) / r.width;
+  return x < 0 ? 0 : (x > 1 ? 1 : x);
+}
+function dragPreview(ratio){
+  var st = S.status;
+  var dur = st && typeof st.dur_ms === 'number' ? st.dur_ms : 0;
+  paintProgress(ratio, dur * ratio, dur);
+}
+function commitSeek(ratio){
+  var st = S.status;
+  var dur = st && typeof st.dur_ms === 'number' ? st.dur_ms : 0;
+  if(!dur) return;
+  var pos = Math.round(ratio * dur);
+  S.posBase = pos;
+  S.posT0 = performance.now();
+  S.seekHold = performance.now();
+  drawProgress();
+  post('/api/seek', {pos_ms: pos}).then(function(){
+    setTimeout(function(){ refreshStatus(); }, 300);
+  }, function(e){
+    toast('跳转失败：' + e.message, 'err');
+    refreshStatus();
+  });
+}
+function bindProgress(){
+  var prog = $('prog');
+  prog.addEventListener('pointerdown', function(e){
+    var st = S.status;
+    if(!st || !st.dur_ms) return;
+    S.dragging = true;
+    prog.classList.add('drag');
+    e.preventDefault();
+    var r = progRatio(e.clientX);
+    S.dragRatio = r;
+    dragPreview(r);
+  });
+  window.addEventListener('pointermove', function(e){
+    if(!S.dragging) return;
+    S.dragRatio = progRatio(e.clientX);
+    dragPreview(S.dragRatio);
+    e.preventDefault();
+  }, {passive:false});
+  var end = function(){
+    if(!S.dragging) return;
+    S.dragging = false;
+    prog.classList.remove('drag');
+    commitSeek(S.dragRatio);
+  };
+  window.addEventListener('pointerup', end);
+  window.addEventListener('pointercancel', end);
+}
+
+/* ============================================================
+   8.5 歌词面板
+   ------------------------------------------------------------
+   接口：GET /api/lyrics?id=<歌曲id>
+     有同步歌词 {"synced":true,"total":43,"lines":[{"t":12000,"text":"…"}]}
+     没有歌词   {"synced":false,"total":0,"lines":[]}   ← HTTP 200，不是错误
+     取不到     HTTP 502 {"error":"…"}
+   t 是毫秒、从 0 递增。面板只做三件事：按歌缓存、跟着插值位置切高亮、点了跳句。
+   ⚠️ 绝不为歌词多发 status/position 之外的请求；行号没变就一行 DOM 都不碰。
+   ============================================================ */
+var LYR_MAX = 8;          /* 只缓存最近 8 首（ESP32 的 PSRAM 别替浏览器操心，这里是省请求） */
+var lyrCache = {};        /* id -> {synced:bool, lines:[{t,text}]} */
+var lyrOrder = [];        /* LRU 顺序，末尾 = 最近用过 */
+var LYR = {
+  id:'',                  /* 面板当前是哪首歌的歌词 */
+  title:'',
+  ready:false,            /* 已经为 LYR.id 定过内容（含"暂无歌词"） */
+  lines:null,             /* null = 没内容；[] = 空 */
+  synced:false,
+  cur:-1,                 /* 当前高亮行号，-1 = 还没点亮 */
+  pending:false           /* 不在播放页时欠了一次"滚到居中" */
+};
+
+function lyrCacheGet(id){
+  if(!lyrCache[id]) return null;
+  var i = lyrOrder.indexOf(id);
+  if(i >= 0){ lyrOrder.splice(i, 1); lyrOrder.push(id); }
+  return lyrCache[id];
+}
+function lyrCachePut(id, v){
+  if(!lyrCache[id]) lyrOrder.push(id);
+  lyrCache[id] = v;
+  while(lyrOrder.length > LYR_MAX){
+    var k = lyrOrder.shift();
+    if(k !== id && lyrCache[k]) delete lyrCache[k];
+  }
+}
+/* "此歌曲为没有填词的纯音乐，请您欣赏" 这种占位 */
+function lyrInstText(t){
+  return t.indexOf('纯音乐') >= 0 || t.indexOf('没有填词') >= 0 || t.indexOf('没有歌词') >= 0;
+}
+/* 归一化：丢空行、丢纯音乐占位、丢首行 LRC 元数据（形如「歌名 - 歌手」） */
+function lyrNormalize(d, title){
+  var src = (d && d.lines && d.lines.length) ? d.lines : [];
+  var lines = [], i, t, txt;
+  for(i = 0; i < src.length; i++){
+    t = src[i] ? src[i].t : 0;
+    txt = src[i] ? src[i].text : '';
+    if(typeof t !== 'number' || !isFinite(t) || t < 0) t = 0;
+    txt = String(txt === undefined || txt === null ? '' : txt);
+    if(txt.trim) txt = txt.trim();
+    if(!txt) continue;
+    lines.push({ t:t, text:txt });
+  }
+  if(lines.length > 0 && lines.length <= 1 && lyrInstText(lines[0].text)) lines = [];
+  /* 第一行常是 LRC 元数据「歌名 - 歌手」：以当前歌名开头就不显示。
+     只从显示里去掉，时间轴（后面的 t）一点都不动。 */
+  if(lines.length && title && lines[0].text.indexOf(title) === 0) lines.shift();
+  return { synced: !!(d && d.synced) && lines.length > 0, lines: lines };
+}
+
+function lyrEl(){ return $('lyr'); }
+function lyrIn(){ return $('lyr-in'); }
+
+function lyrShowNone(txt){
+  var box = lyrEl(), inner = lyrIn();
+  LYR.lines = null; LYR.synced = false; LYR.cur = -1; LYR.pending = false;
+  if(box && box.classList) box.classList.add('empty');
+  if(box) box.scrollTop = 0;
+  if(!inner) return;
+  inner.className = 'lyr-in';
+  inner.innerHTML = '<div class="lyr-none">' + esc(txt) + '</div>';
+}
+function lyrApply(v){
+  var box = lyrEl(), inner = lyrIn();
+  LYR.lines = v.lines; LYR.synced = v.synced; LYR.cur = -1;
+  if(!v.lines.length){ lyrShowNone('暂无歌词'); return; }
+  var html = '', i;
+  for(i = 0; i < v.lines.length; i++){
+    html += '<div class="lyr-line" data-l="' + i + '">' + esc(v.lines[i].text) + '</div>';
+  }
+  if(box && box.classList) box.classList.remove('empty');
+  if(box) box.scrollTop = 0;
+  if(!inner) return;
+  inner.className = 'lyr-in' + (v.synced ? '' : ' flat');
+  inner.innerHTML = html;
+  lyrTick(true);          /* 先把当前行点亮（命中缓存时立刻就有高亮） */
+}
+/* 歌变了才动面板。缓存命中就同步渲染，不额外发请求。 */
+function lyricsFollow(){
+  var st = S.status, song = (st && st.song) || {};
+  var id = song.id ? String(song.id) : '';
+  if(LYR.ready && id === LYR.id) return;
+  LYR.id = id; LYR.ready = true; LYR.title = song.title || '';
+  LYR.lines = null; LYR.synced = false; LYR.cur = -1;
+  if(!id){ lyrShowNone('暂无歌词'); return; }        /* 没有 id 就没法查 */
+  var c = lyrCacheGet(id);
+  if(c){ lyrApply(c); return; }                      /* 命中缓存：0 请求 */
+  lyrShowNone('正在加载歌词…');
+  var want = id;
+  api('/api/lyrics?id=' + encodeURIComponent(id), {}, 9000).then(function(d){
+    if(LYR.id !== want) return;      /* ★ 已经换歌了：这份回复作废，别串词 */
+    var v = lyrNormalize(d, LYR.title);
+    lyrCachePut(want, v);
+    if(LYR.id !== want) return;
+    lyrApply(v);
+  }, function(){
+    if(LYR.id !== want) return;      /* 取不到（502/超时）就当没有 */
+    lyrShowNone('暂无歌词');
+  });
+}
+/* 最后一个 t <= pos 的行（二分；lines 已按 t 递增） */
+function lyrIndexAt(pos){
+  var a = LYR.lines;
+  if(!a || !a.length) return -1;
+  var lo = 0, hi = a.length - 1, r = 0;
+  while(lo <= hi){
+    var mid = (lo + hi) >> 1;
+    if(a[mid].t <= pos){ r = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return r;
+}
+function lyrPaint(from, to){
+  var inner = lyrIn();
+  var ch = (inner && inner.children) ? inner.children : null;
+  if(!ch) return;
+  if(from >= 0 && from !== to && ch[from] && ch[from].classList) ch[from].classList.remove('on');
+  if(to >= 0 && ch[to] && ch[to].classList) ch[to].classList.add('on');
+}
+function lyrScrollTo(top){
+  var box = lyrEl();
+  if(!box) return;
+  if(reduceMotion()){ box.scrollTop = top; return; }
+  if(typeof box.scrollTo === 'function'){
+    try{ box.scrollTo({ top:top, behavior:'smooth' }); return; }catch(e){}
+  }
+  box.scrollTop = top;    /* 老 Safari 不认 options 对象，退回直接赋值 */
+}
+/* 把第 i 行滚到容器垂直居中附近（只在行号变化时调用，不是每帧） */
+function lyrScrollCenter(i){
+  var box = lyrEl(), inner = lyrIn();
+  if(!box || !inner || i < 0) return;
+  var ch = inner.children;
+  var node = ch ? ch[i] : null;
+  if(!node || typeof node.offsetTop !== 'number') return;
+  var vh = box.clientHeight || 0;
+  if(!vh) return;                       /* 面板不可见（不在播放页）：别乱滚 */
+  var lh = node.offsetHeight || 30;
+  var max = (box.scrollHeight || 0) - vh;
+  var top = node.offsetTop - (vh - lh) / 2;
+  if(top < 0) top = 0;
+  if(max > 0 && top > max) top = max;
+  lyrScrollTo(top);
+}
+/* 跟随播放位置：只在「当前行号变了」时改 DOM + 滚一次 */
+function lyrTick(force){
+  if(!LYR.synced || !LYR.lines || !LYR.lines.length) return;
+  var n = lyrIndexAt(curPos());
+  if(n === LYR.cur && !force) return;
+  var from = LYR.cur;
+  LYR.cur = n;
+  lyrPaint(from, n);
+  if(S.tab === 'play') lyrScrollCenter(n);
+  else LYR.pending = true;
+}
+/* 点某一行 → 跳到那句（1.2s 静默期由 S.seekHold 负责，别让旧 status 把高亮打回去） */
+function lyrSeekTo(i){
+  var a = LYR.lines;
+  if(!a || !a[i]) return;
+  var t = a[i].t;
+  var from = LYR.cur;
+  LYR.cur = i;
+  S.posBase = t; S.posT0 = performance.now(); S.seekHold = performance.now();
+  lyrPaint(from, i);
+  lyrScrollCenter(i);
+  drawProgress();
+  post('/api/seek', {pos_ms: t}).then(function(){
+    setTimeout(function(){ refreshStatus(); }, 300);
+  }, function(e){
+    toast('跳转失败：' + e.message, 'err');
+    refreshStatus();
+  });
+}
+function bindLyrics(){
+  var box = lyrEl();
+  if(!box) return;
+  box.addEventListener('click', function(ev){
+    if(!LYR.synced) return;                 /* 非同步歌词没有时间轴，点了不动 */
+    var line = ev.target.closest ? ev.target.closest('[data-l]') : null;
+    if(!line || !box.contains(line)) return;
+    lyrSeekTo(Number(line.getAttribute('data-l')));
+  });
+}
+
+/* ============================================================
+   9. 设置面板
+   ============================================================ */
+function loadConfig(keepMsg){
+  return api('/api/config', {}, 8000).then(function(d){
+    d = d || {};
+    if(document.activeElement !== $('cfg-host')) $('cfg-host').value = d.host || '';
+    if(document.activeElement !== $('cfg-user') && !$('cfg-user').value) $('cfg-user').value = S.cfgUser || '';
+    $('cfg-pass').value = '';
+    $('cfg-pass').placeholder = d.pass_set ? '留空表示不修改已存密码' : '请输入服务器密码';
+    if(!keepMsg){
+      setMsg('cfg-msg', d.configured
+        ? ('已配置：' + (d.host || '') + (d.transcode ? (' · 转码 ' + d.transcode + (d.max_kbps ? ' ' + d.max_kbps + 'kbps' : '')) : ''))
+        : '尚未配置服务器，先填写并保存', d.configured ? 'ok' : '');
+    }
+  }, function(e){
+    if(!keepMsg) setMsg('cfg-msg', '读取配置失败：' + e.message, 'err');
+  });
+}
+function saveConfig(){
+  var host = $('cfg-host').value.trim();
+  if(!host){ setMsg('cfg-msg', '请填写服务器地址', 'err'); return; }
+  var user = $('cfg-user').value.trim();
+  var body = {host: host, user: user, pass: $('cfg-pass').value};
+  var btn = $('cfg-save');
+  busy(btn, true, '保存中…');
+  setMsg('cfg-msg', '正在连接服务器校验…');
+  post('/api/config', body, 25000).then(function(d){
+    S.cfgUser = user;      /* 设备不回显账号，本次会话里自己记住 */
+    setMsg('cfg-msg', '已保存' + (d && d.server ? ('：' + d.server) : ''), 'ok');
+    toast('配置已保存');
+    $('cfg-pass').value = '';
+    loadConfig(true);
+  }, function(e){
+    setMsg('cfg-msg', '保存失败：' + e.message, 'err');
+  }).then(function(){ busy(btn, false); });
+}
+function testConfig(){
+  var host = $('cfg-host').value.trim();
+  if(!host){ setMsg('cfg-msg', '请填写服务器地址', 'err'); return; }
+  var btn = $('cfg-test');
+  busy(btn, true, '测试中…');
+  setMsg('cfg-msg', '正在连接服务器…');
+  post('/api/config/test', {host: host, user: $('cfg-user').value.trim(), pass: $('cfg-pass').value}, 25000).then(function(d){
+    setMsg('cfg-msg', '连接成功' + (d && d.server ? ('：' + d.server) : ''), 'ok');
+  }, function(e){
+    setMsg('cfg-msg', '连接失败：' + e.message, 'err');
+  }).then(function(){ busy(btn, false); });
+}
+function loadWifi(){
+  return api('/api/wifi', {}, 8000).then(function(w){
+    renderWifi(w);
+  }, function(e){
+    $('wifi-info').innerHTML = '<span class="k">状态</span><span class="v">读取失败</span>';
+    setMsg('wifi-msg', 'WiFi 状态读取失败：' + e.message, 'err');
+  });
+}
+function renderWifi(w){
+  w = w || {};
+  $('wifi-info').innerHTML =
+    '<span class="k">状态</span><span class="v">' + (w.connected ? '已连接' : '未连接') + '</span>' +
+    '<span class="k">网络</span><span class="v">' + esc(w.ssid || '—') + '</span>' +
+    '<span class="k">IP 地址</span><span class="v">' + esc(w.ip || '—') + '</span>' +
+    '<span class="k">信号</span><span class="v"><span class="rssi">' +
+      (w.connected ? bars(w.rssi) + esc((typeof w.rssi === 'number' ? w.rssi + ' dBm · ' : '') + rssiText(w.rssi)) : '—') +
+    '</span></span>';
+  if(document.activeElement !== $('ap-ssid') && w.ap_ssid) $('ap-ssid').value = w.ap_ssid;
+  if(document.activeElement !== $('ap-on') && typeof w.ap_on === 'boolean') $('ap-on').checked = w.ap_on;
+}
+function wifiJoin(){
+  var ssid = $('wifi-ssid').value.trim();
+  var pass = $('wifi-pass').value;
+  if(!ssid){ setMsg('wifi-msg', '请先填写网络名称', 'err'); return; }
+  var btn = $('wifi-join');
+  busy(btn, true, '连接中…');
+  setMsg('wifi-msg', '正在提交到设备…');
+  post('/api/wifi', {ssid: ssid, pass: pass}, 15000).then(function(){
+    setMsg('wifi-msg', '正在连接 ' + ssid + ' ，设备切换网络中…');
+    var tries = 0, MAX = 36;   /* 36 × 1.5s ≈ 54s */
+    var poll = function(){
+      if(tries++ >= MAX){
+        setMsg('wifi-msg', '还没连上。若本页已失联，请连上设备热点后重新打开本页。', 'err');
+        busy(btn, false); loadWifi(); refreshStatus();
+        return;
+      }
+      api('/api/wifi', {}, 5000).then(function(w){
+        if(w && w.connected && w.ssid === ssid){
+          setMsg('wifi-msg', '已连接到 ' + ssid + (w.ip ? ('，IP ' + w.ip) : ''), 'ok');
+          renderWifi(w); busy(btn, false);
+          $('wifi-pass').value = '';
+          refreshStatus();
+          return;
+        }
+        setMsg('wifi-msg', '正在连接 ' + ssid + ' …（' + Math.round(tries * 1.5) + 's）');
+        setTimeout(poll, 1500);
+      }, function(){
+        setMsg('wifi-msg', '设备切换网络中断开，等待重新上线…（' + Math.round(tries * 1.5) + 's）');
+        setTimeout(poll, 1500);
+      });
+    };
+    setTimeout(poll, 1200);
+  }, function(e){
+    setMsg('wifi-msg', '提交失败：' + e.message, 'err');
+    busy(btn, false);
+  });
+}
+function wifiScan(){
+  var btn = $('wifi-scan');
+  busy(btn, true, '扫描中…');
+  $('scan-list').hidden = true;
+  $('scan-list').innerHTML = '';
+  setMsg('wifi-msg', '正在扫描附近网络，约 3 秒…');
+  api('/api/wifi/scan', {}, 8000).then(function(){
+    var tries = 0, MAX = 25;
+    var poll = function(){
+      if(tries++ >= MAX){
+        setMsg('wifi-msg', '扫描超时，请重试', 'err');
+        busy(btn, false);
+        return;
+      }
+      setTimeout(function(){
+        api('/api/wifi/scan/result', {}, 6000).then(function(d){
+          if(d && d.scanning){ poll(); return; }
+          renderScan((d && d.items) || []);
+          setMsg('wifi-msg', '');
+          busy(btn, false);
+        }, function(){ poll(); });
+      }, 1000);
+    };
+    poll();
+  }, function(e){
+    setMsg('wifi-msg', '扫描失败：' + e.message, 'err');
+    busy(btn, false);
+  });
+}
+function renderScan(items){
+  var el = $('scan-list');
+  /* 按信号从强到弱，同名只留最强的一条 */
+  var seen = {}, arr = [];
+  items.slice().sort(function(a, b){ return (b.rssi || -999) - (a.rssi || -999); }).forEach(function(it){
+    var k = it.ssid || '';
+    if(seen[k]) return;
+    seen[k] = 1;
+    arr.push(it);
+  });
+  arr = arr.slice(0, 30);
+  if(!arr.length){
+    el.innerHTML = '<div class="empty">没有扫描到网络</div>';
+    el.hidden = false;
+    return;
+  }
+  var html = '';
+  for(var n = 0; n < arr.length; n++){
+    var it = arr[n];
+    html += '<div class="row" role="button" tabindex="0" data-sn="' + n + '">' +
+              '<span class="rmain"><span class="rtitle">' + esc(it.ssid || '(隐藏网络)') + '</span>' +
+              '<span class="rsub">' + esc(it.auth || '开放') + (it.current ? ' · 当前' : '') + '</span></span>' +
+              '<span></span>' +
+              '<span class="rdur"><span class="rssi">' + bars(it.rssi) + esc((it.rssi || 0) + '') + '</span></span>' +
+            '</div>';
+  }
+  el.innerHTML = html;
+  el.hidden = false;
+  el.onclick = function(ev){
+    var row = ev.target.closest ? ev.target.closest('[data-sn]') : null;
+    if(!row) return;
+    var it = arr[Number(row.getAttribute('data-sn'))];
+    if(!it) return;
+    $('wifi-ssid').value = it.ssid || '';
+    $('wifi-pass').value = '';
+    setMsg('wifi-msg', '已选择「' + (it.ssid || '') + '」，请输入密码后点「连接」');
+    $('wifi-pass').focus();
+  };
+}
+function applyAp(){
+  var on = $('ap-on').checked;
+  var ssid = $('ap-ssid').value.trim();
+  var pass = $('ap-pass').value;
+  var body = {on: on};
+  if(ssid) body.ssid = ssid;
+  if(pass) body.pass = pass;   /* 留空 = 不修改已存密码 */
+  var btn = $('ap-apply');
+  busy(btn, true, '应用中…');
+  setMsg('ap-msg', '正在应用…');
+  post('/api/ap', body).then(function(){
+    setMsg('ap-msg', on ? ('热点已开启' + (ssid ? ('：' + ssid) : '')) : '热点已关闭', 'ok');
+    toast(on ? '热点已开启' : '热点已关闭');
+    $('ap-pass').value = '';
+    setTimeout(function(){ loadWifi(); }, 1200);
+  }, function(e){
+    setMsg('ap-msg', '应用失败：' + e.message, 'err');
+    loadWifi();
+  }).then(function(){ busy(btn, false); });
+}
+function loadDebug(){
+  return api('/api/debug', {}, 8000).then(function(d){
+    d = d || {};
+    $('dbg').innerHTML =
+      '<span class="k">固件 IDF</span><span class="v">' + esc(d.idf || (S.status && S.status.fw ? S.status.fw.idf : '') || '—') + '</span>' +
+      '<span class="k">运行时长</span><span class="v">' + fmtUptime(d.uptime_s) + '</span>' +
+      '<span class="k">空闲内存 SRAM</span><span class="v">' + (d.sram_kb !== undefined ? d.sram_kb + ' KB' : '—') + '</span>' +
+      '<span class="k">空闲内存 PSRAM</span><span class="v">' + (d.psram_kb !== undefined ? d.psram_kb + ' KB' : '—') + '</span>' +
+      '<span class="k">音频欠载次数</span><span class="v">' + (d.underruns !== undefined ? d.underruns : '—') + '</span>' +
+      '<span class="k">I2C 重试</span><span class="v">' + (d.i2c_retries !== undefined ? d.i2c_retries : '—') + '</span>' +
+      '<span class="k">采样率</span><span class="v">' + (d.sample_rate ? d.sample_rate + ' Hz' : '—') + '</span>' +
+      '<span class="k">音频格式</span><span class="v">' + esc(d.format || '—') + '</span>' +
+      '<span class="k">缓冲占用</span><span class="v">' + (d.ring_in_kb !== undefined ? d.ring_in_kb + ' / ' + d.ring_pcm_kb + ' KB' : '—') + '</span>';
+  }, function(e){
+    $('dbg').innerHTML = '<span class="k">读取失败</span><span class="v">' + esc(e.message) + '</span>';
+  });
+}
+
+/* ============================================================
+   10. 搜索（debounce 400ms）
+   ============================================================ */
+var qTimer = null;
+function clearSearch(){
+  clearTimeout(qTimer);
+  S.qseq++;
+  if($('q').value) $('q').value = '';
+  setMsg('s-msg', '');
+  S.SR.items = []; S.SR.total = 0; S.SR.err = '';
+}
+function doSearch(v){
+  var seq = ++S.qseq;
+  setMsg('s-msg', '搜索中…');
+  api('/api/search?q=' + encodeURIComponent(v), {}, 15000).then(function(d){
+    if(seq !== S.qseq) return;
+    S.mode = 'search';
+    S.SR.items = (d && d.items) || [];
+    S.SR.total = (d && typeof d.total === 'number') ? d.total : S.SR.items.length;
+    S.SR.shown = PAGE; S.SR.loading = false; S.SR.err = '';
+    renderList(false);
+    setMsg('s-msg', S.SR.items.length ? ('找到 ' + S.SR.total + ' 首，点一行即可播放') : '没有找到匹配的歌曲');
+  }, function(e){
+    if(seq !== S.qseq) return;
+    S.mode = 'search';
+    S.SR.items = []; S.SR.total = 0; S.SR.err = e.message;
+    renderList(false);
+    setMsg('s-msg', '搜索失败：' + e.message, 'err');
+  });
+}
+function bindSearch(){
+  var q = $('q');
+  q.addEventListener('input', function(){
+    var v = q.value.trim();
+    clearTimeout(qTimer);
+    if(!v){
+      S.qseq++;
+      if(S.mode === 'search'){
+        S.mode = 'src'; S.SR.items = []; S.SR.total = 0; S.SR.err = '';
+        renderList(false);
+      }
+      setMsg('s-msg', '');
+      return;
+    }
+    setMsg('s-msg', '输入中…');
+    qTimer = setTimeout(function(){ doSearch(q.value.trim()); }, 400);
+  });
+  q.addEventListener('keydown', function(e){
+    if(e.key === 'Enter'){
+      e.preventDefault();
+      clearTimeout(qTimer);
+      var v = q.value.trim();
+      if(v) doSearch(v);
+      q.blur();
+    }
+  });
+}
+
+/* ============================================================
+   11. Tab 切换（切回去用缓存，不重新拉数据）
+   ============================================================ */
+function showTab(t){
+  if(S.tab === t) return;
+  S.tab = t;
+  $('pg-play').hidden  = (t !== 'play');
+  $('pg-songs').hidden = (t !== 'songs');
+  $('pg-set').hidden   = (t !== 'set');
+  $('mini').hidden     = (t === 'play');
+  $('wrap').className  = 'wrap' + (t === 'play' ? '' : ' mini-on');
+  var bs = $('tbin').querySelectorAll('.tb');
+  for(var i = 0; i < bs.length; i++){
+    var on = (bs[i].getAttribute('data-tab') === t);
+    if(on) bs[i].classList.add('on'); else bs[i].classList.remove('on');
+  }
+  coverKey = '';       /* 封面要换到另一个元素上显示 */
+  replay(t === 'play' ? $('pg-play') : (t === 'songs' ? $('pg-songs') : $('pg-set')), 'anim');
+  renderSong();
+  /* 之前在别的 Tab 上时欠了一次歌词定位，现在补上 */
+  if(t === 'play' && LYR.pending){ LYR.pending = false; lyrScrollCenter(LYR.cur); }
+  if(t === 'songs' && !S.L.items.length && !S.L.loading && !S.L.err) fetchSrc(S.src);
+  if(t === 'set'){
+    if(!S.setLoaded){ S.setLoaded = true; loadConfig(); loadWifi(); loadDebug(); }
+    clearInterval(S.wifiTimer);
+    S.wifiTimer = setInterval(function(){ if(S.tab === 'set') loadWifi(); }, 15000);
+  }else{
+    clearInterval(S.wifiTimer);
+    S.wifiTimer = null;
+  }
+}
+
+/* ============================================================
+   11b. 折叠卡片的高度过渡
+   max-height 只在动画那 260ms 里写死，动完立刻清掉（写成 none），
+   否则面板里的扫描列表 / 诊断信息长高了会被切掉。
+   ============================================================ */
+function accOpen(pn, acc){
+  if(!pn) return;
+  clearTimeout(pn._t);
+  var hiding = !pn.hidden && pn.style.maxHeight === '0px';   /* 收起动画还没走完 */
+  if(!pn.hidden && !hiding) return;                          /* 已经开着 */
+  pn.hidden = false;
+  acc.classList.add('open');
+  var h = pn.scrollHeight;
+  if(!h || reduceMotion()){        /* 量不到高度（父级还藏着）就别硬动画 */
+    pn.style.maxHeight = ''; pn.style.paddingTop = ''; pn.style.paddingBottom = '';
+    return;
+  }
+  if(!hiding){
+    pn.style.maxHeight = '0px';
+    pn.style.paddingTop = '0px';
+    pn.style.paddingBottom = '0px';
+    void pn.offsetHeight;          /* 强制回流：让 0 成为过渡起点 */
+  }
+  pn.style.maxHeight = (h + 40) + 'px';
+  pn.style.paddingTop = '';
+  pn.style.paddingBottom = '';
+  pn._t = setTimeout(function(){ pn.style.maxHeight = ''; }, 280);
+}
+function accClose(pn, acc){
+  if(!pn || pn.hidden) return;
+  acc.classList.remove('open');
+  var h = pn.scrollHeight;
+  if(!h || reduceMotion()){ pn.hidden = true; return; }
+  pn.style.maxHeight = (h + 40) + 'px';
+  void pn.offsetHeight;
+  pn.style.maxHeight = '0px';
+  pn.style.paddingTop = '0px';
+  pn.style.paddingBottom = '0px';
+  clearTimeout(pn._t);
+  pn._t = setTimeout(function(){
+    pn.hidden = true;
+    pn.style.maxHeight = '';
+    pn.style.paddingTop = '';
+    pn.style.paddingBottom = '';
+  }, 280);
+}
+
+/* ============================================================
+   12. 事件绑定 / 定时器 / 启动
+   ============================================================ */
+function bindEvents(){
+  /* 底部 Tab 栏 */
+  var tb = [{k:'play', n:'播放', i:'play'}, {k:'songs', n:'歌曲', i:'list'}, {k:'set', n:'设置', i:'sliders'}];
+  var html = '';
+  for(var i = 0; i < tb.length; i++){
+    html += '<button type="button" class="tb' + (tb[i].k === 'play' ? ' on' : '') +
+            '" data-tab="' + tb[i].k + '">' + svg(tb[i].i) + '<span>' + tb[i].n + '</span></button>';
+  }
+  $('tbin').innerHTML = html;
+  $('tbin').addEventListener('click', function(ev){
+    var b = ev.target.closest ? ev.target.closest('.tb') : null;
+    if(b) showTab(b.getAttribute('data-tab'));
+  });
+
+  /* 迷你播放条：点条子去播放页，点按钮播放/暂停 */
+  $('mini').addEventListener('click', function(ev){
+    if(upId(ev.target, 'mini-play')){ togglePlay(); return; }
+    showTab('play');
+  });
+
+  /* 播放器 */
+  $('btn-play').onclick = togglePlay;
+  $('mini-play').onclick = function(){ togglePlay(); };
+  $('btn-next').onclick = function(){ skip(1); };
+  $('btn-prev').onclick = function(){ skip(-1); };
+  $('btn-star').onclick = toggleStar;
+  $('btn-mute').onclick = toggleMute;
+  bindProgress();
+
+  /* 音量：滑动乐观更新，停 250ms 再发 */
+  $('vol').addEventListener('input', function(e){
+    var v = Number(e.target.value);
+    S.volHold = performance.now();
+    $('vol-num').textContent = v;
+    if(S.status){ S.status.vol = v; S.status.muted = false; }
+    $('btn-mute').innerHTML = svg(v === 0 ? 'mute' : 'vol');
+    $('btn-mute').style.color = v === 0 ? 'var(--icon)' : 'var(--text)';
+    clearTimeout(S.volTimer);
+    S.volTimer = setTimeout(function(){
+      post('/api/volume', {vol: v}).catch(function(e){ toast('音量设置失败：' + e.message, 'err'); });
+    }, 250);
+  });
+  $('vol').addEventListener('change', function(){ S.volHold = performance.now(); });
+
+  /* 歌词：点某句跳过去 */
+  bindLyrics();
+
+  /* 来源选项卡 + 列表（事件委托，整个列表只挂一个监听器） */
+  $('tabs').addEventListener('click', function(ev){
+    var b = ev.target.closest ? ev.target.closest('[data-src]') : null;
+    if(b) pickSrc(b.getAttribute('data-src'));
+  });
+  $('list').addEventListener('click', function(ev){
+    var t = ev.target;
+    var more = t.closest ? t.closest('[data-more]') : null;
+    if(more && $('list').contains(more)){ loadMore(); return; }
+    var row = t.closest ? t.closest('[data-n]') : null;
+    if(!row || !$('list').contains(row)) return;
+    var L = curL();
+    var it = L.items[Number(row.getAttribute('data-n'))];
+    if(it) playItem(it);
+  });
+  $('list').addEventListener('keydown', function(ev){
+    if(ev.key !== 'Enter' && ev.key !== ' ') return;
+    var row = ev.target.closest ? ev.target.closest('[data-n]') : null;
+    if(!row) return;
+    ev.preventDefault();
+    var it = curL().items[Number(row.getAttribute('data-n'))];
+    if(it) playItem(it);
+  });
+  $('list-refresh').onclick = function(){
+    if(S.mode === 'search') return;
+    fetchSrc(S.src);
+  };
+
+  /* 搜索 */
+  bindSearch();
+
+  /* 设置：折叠卡片（展开/收起带高度过渡） */
+  $('pg-set').addEventListener('click', function(ev){
+    var acc = ev.target.closest ? ev.target.closest('.acc') : null;
+    if(!acc) return;
+    var pn = $(acc.getAttribute('data-pn'));
+    if(!pn) return;
+    if(pn.hidden) accOpen(pn, acc); else accClose(pn, acc);
+  });
+
+  /* Navidrome */
+  $('cfg-save').onclick = saveConfig;
+  $('cfg-test').onclick = testConfig;
+  $('cfg-pass').addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); saveConfig(); } });
+  $('cfg-user').addEventListener('input', function(){ S.cfgUser = $('cfg-user').value; });
+
+  /* WiFi */
+  $('wifi-scan').onclick = wifiScan;
+  $('wifi-join').onclick = wifiJoin;
+  $('wifi-pass').addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); wifiJoin(); } });
+
+  /* 热点 */
+  $('ap-apply').onclick = applyAp;
+  $('ap-on').addEventListener('change', function(){ applyAp(); });
+
+  /* 亮度 */
+  $('bright').addEventListener('input', function(e){
+    var v = Number(e.target.value);
+    S.brightHold = performance.now();
+    $('bright-num').textContent = v;
+    clearTimeout(S.brightTimer);
+    S.brightTimer = setTimeout(function(){
+      post('/api/bright', {bright: v}).catch(function(e){ toast('亮度设置失败：' + e.message, 'err'); });
+    }, 250);
+  });
+
+  /* 设备信息 */
+  $('dbg-refresh').onclick = loadDebug;
+
+  /* 回前台立刻校正一次 */
+  document.addEventListener('visibilitychange', function(){
+    if(!document.hidden) refreshStatus();
+  });
+  window.addEventListener('online', function(){ refreshStatus(); });
+}
+
+/* 每秒一次的 status 轮询：
+   - 上一次还没回来就跳过这一拍（设备只有 3 个 socket，堆请求会把所有请求拖慢）
+   - 先排下一拍再发请求，万一某次 fetch 永远不 settle 也不会断链
+   - 页面在后台就不发（手机锁屏时别白占设备的连接） */
+function pollStatus(){
+  if(S.stBusy || document.hidden) return;
+  S.stBusy = true;
+  refreshStatus().then(function(){ S.stBusy = false; }, function(){ S.stBusy = false; });
+}
+function scheduleStatus(){
+  setTimeout(function(){
+    scheduleStatus();
+    pollStatus();
+  }, 1000);
+}
+
+function init(){
+  /* 静态图标 / 静态内容 */
+  $('btn-prev').innerHTML = svg('prev');
+  $('btn-next').innerHTML = svg('next');
+  $('btn-play').innerHTML = svg('play');
+  $('mini-play').innerHTML = svg('play');
+  $('btn-mute').innerHTML = svg('vol');
+  $('cover-ph').innerHTML = svg('note');
+  $('mini-ph').innerHTML = svg('note');
+  $('search-ico').innerHTML = svg('search');
+  $('list-refresh').innerHTML = svg('refresh');
+  $('dbg-refresh').innerHTML = svg('refresh');
+  var chs = document.querySelectorAll('[data-chev]');
+  for(var i = 0; i < chs.length; i++) chs[i].innerHTML = svg('chev');
+  $('here1').textContent = location.origin;
+  $('here2').textContent = location.origin;
+  renderSrcTabs();
+
+  bindEvents();
+  drawProgress();
+
+  /* 首屏：状态 + 第一份列表（来源默认「最近播放」——它不改设备来源，最安全） */
+  refreshStatus();
+  fetchSrc(S.src);
+
+  /* 进度条内插：150ms 一次，只改两个 style；歌词高亮跟着同一个插值走，
+     但只有行号变了才碰 DOM（行号没变时 lyrTick 立刻 return）。 */
+  setInterval(function(){ if(!S.dragging) drawProgress(); lyrTick(); }, 150);
+  /* 乐观高亮最多保留 8 秒（设备一直没反应的话别一直挂着） */
+  setInterval(function(){
+    if(S.optKey && performance.now() - S.optKeyT > 8000){ clearOpt(); }
+  }, 2000);
+
+  scheduleStatus();
+}
+
+if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
+</script>
+</body>
+</html>

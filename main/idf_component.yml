@@ -1,0 +1,23 @@
+## ESP-Music 依赖
+##
+## 全部按本机离线缓存（~/.cache/Espressif/ComponentManager/service_d92d8f1e/）里
+## 实际存在的版本精确锁定，避免解析时联网或漂移。
+##
+## ⚠️ 本工程故意不依赖 esp_audio_simple_player / gmf_*（FLAC 内存破坏 bug 与
+##    无真实播放位置），音频管道自己写。
+dependencies:
+  idf: ">=5.5,<5.6"
+
+  # 音频：ES8388 驱动 + MP3/AAC/FLAC 解码器
+  espressif/esp_codec_dev: "==1.6.2"
+  espressif/esp_audio_codec: "==2.5.0"
+
+  # 显示
+  lvgl/lvgl: "==9.6.0"
+  waveshare/esp_lcd_st7735: "==2.0.0"
+
+  # 封面解码 / JSON / 按键 / mDNS
+  espressif/esp_new_jpeg: "==1.0.2"
+  espressif/cjson: "==1.7.19~2"
+  espressif/button: "==4.2.1"
+  espressif/mdns: "==1.13.1"

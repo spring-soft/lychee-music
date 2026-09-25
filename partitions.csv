@@ -1,0 +1,19 @@
+# ESP-Music 分区表（16MB flash）
+#
+# ⚠️ 偏移刻意对齐 esp-claw（分区表在 0x9000、nvs 在 0xA000、app 在 0x20000），
+#    这样新旧固件占用同一批 flash 区域，不会留下"残表"，将来整片还原 esp-claw 只需一条命令。
+#    对应 sdkconfig: CONFIG_PARTITION_TABLE_OFFSET=0x9000
+#    背景见 ~/esp32s3-backup/README-20260924.md
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0xA000,   0x6000,
+otadata,    data, ota,     0x10000,  0x2000,
+phy_init,   data, phy,     0x12000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x300000,
+ota_1,      app,  ota_1,   0x320000, 0x300000,
+# ⚠️ assets 从 2MB 扩到 4MB、cache 相应从 7.875MB 缩到 6.125MB：
+#    补全字库（CJK 全集 + 假名 + 符号）要 ~3.4MB，2MB 装不下。
+#    cache 是给封面/歌词缓存用的，6MB 依然远超需要（300 张封面 ≈ 3MB）。
+#    assets 的起始偏移 0x620000 没变，所以 app/引导区的布局不受影响。
+assets,     data, spiffs,  0x620000, 0x400000,
+cache,      data, fat,     0xA20000, 0x5E0000,

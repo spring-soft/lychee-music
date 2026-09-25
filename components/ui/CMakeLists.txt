@@ -1,0 +1,28 @@
+idf_component_register(
+    SRCS
+        "src/ui_display.c"
+        "src/ui.c"
+        "src/ui_pinyin.c"
+        "src/ui_pages.c"
+        "src/ui_search.c"
+        "src/ui_keys.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        board
+        assets
+        app_core
+        audio_engine
+        subsonic
+        player
+        net_mgr
+        settings
+        store
+        hid_remote
+        esp_partition
+        esp_lcd
+        esp_driver_spi
+        lvgl__lvgl
+        waveshare__esp_lcd_st7735
+        espressif__button
+)

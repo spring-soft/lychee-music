@@ -1,0 +1,28 @@
+# 构建产物（IDF 生成的，别提交）
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+*.elf
+*.map
+
+# 凭据：**绝不提交**。
+# ⚠️ sdkconfig 也必须排除 —— tools/sync_sdkconfig.py 会把 sdkconfig.local 里的
+#    WiFi / Navidrome 密码【同步写进 sdkconfig】，所以那个文件里也有密码。
+sdkconfig.local
+sdkconfig.local.*
+!sdkconfig.local.template
+
+# 默认忽略生成的二进制，但下面两个例外要提交：
+# 它们是"克隆下来就能直接用"的关键，且重新生成需要特定字体/Rime 词典（别人机器上未必有）
+*.bin
+!components/assets/assets.bin
+!assets_src/font/font_cjk_12.bin
+!assets_src/font/font_cjk_16.bin
+!assets_src/pinyin/pinyin.bin
+
+# 编辑器 / Python
+.vscode/
+.idea/
+__pycache__/
+*.pyc

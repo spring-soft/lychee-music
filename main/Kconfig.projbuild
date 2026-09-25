@@ -1,0 +1,54 @@
+menu "ESP-Music 配置"
+
+    config APP_WIFI_SSID
+        string "WiFi SSID（仅作首次开机的 NVS 默认值）"
+        default ""
+        help
+            留空表示不带默认凭据，由网页/串口配置。
+            实际运行值优先从 NVS(namespace "net", key "ssid"/"pass") 读，
+            NVS 里没有才用这里的默认值。敏感值建议放 sdkconfig.local。
+
+    config APP_WIFI_PASSWORD
+        string "WiFi 密码"
+        default ""
+
+    config APP_WIFI_HOSTNAME
+        string "主机名（mDNS 用）"
+        default "esp-music"
+
+    menu "Navidrome 音乐源"
+
+        config APP_NAV_HOST
+            string "服务器地址（含 http:// 与端口）"
+            default ""
+
+        config APP_NAV_USER
+            string "账号"
+            default ""
+
+        config APP_NAV_PASS
+            string "密码"
+            default ""
+
+        config APP_NAV_TRANSCODE
+            string "转码格式（mp3 / aac / raw）"
+            default "mp3"
+            help
+                强烈建议 mp3：只给 maxBitRate 不给 format 时 Navidrome 默认给 Opus，
+                ESP32 上解码开销大。raw = 不转码直出源文件（省服务器 CPU，FLAC 会丢尾帧）。
+
+        config APP_NAV_MAX_KBPS
+            int "转码码率上限（kbps）"
+            default 192
+            range 64 320
+
+    endmenu
+
+    config APP_M2_TEST_URL
+        string "M2 联调用的测试音频 URL"
+        default ""
+        help
+            M2 阶段先用本机 python3 -m http.server 验证 HTTP 流式拉取链路。
+            配好 Navidrome 后可留空。
+
+endmenu
