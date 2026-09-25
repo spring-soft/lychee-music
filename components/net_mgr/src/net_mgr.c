@@ -245,6 +245,14 @@ esp_err_t net_mgr_init(void)
     /* 放宽到 WPA/WPA2 混合：实测只要求 WPA2 时会 AUTH_FAIL(reason=202) 重试好几次 */
     wc.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     wc.sta.pmf_cfg.capable = true;
+    /* ★★ 必须显式指定 —— 默认（全 0）是 WIFI_FAST_SCAN，**扫到第一个同名 AP 就连**，
+     *    而 sort_method（按信号排序）只在 ALL_CHANNEL_SCAN 下才生效。
+     *    家里有多台同名路由/ mesh 节点时，设备就会随机连上一个弱的。
+     *    实测事故（2026-09-25）：设备连到 -70 dBm 的弱节点，而同一个 SSID 旁边就有
+     *    -22 dBm 的强节点 → 取流速率从 23KB/s 掉到 9KB/s（需要 24）→ 播放每几秒卡一下。
+     *    代价：扫完所有信道再连，开机多花约 1 秒 —— 换一个正确的接入点很值。 */
+    wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -324,6 +332,9 @@ esp_err_t net_mgr_set_sta(const char *ssid, const char *pass)
     strlcpy((char *)wc.sta.password, stored_pass, sizeof(wc.sta.password));
     wc.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     wc.sta.pmf_cfg.capable = true;
+    /* 同上：按信号选最强的那个同名 AP（mesh 环境下不加这个会连上弱的那个）*/
+    wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
     s_retry = 0;
     s_connected = false;
