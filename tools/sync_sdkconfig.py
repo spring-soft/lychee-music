@@ -4,8 +4,8 @@
 
 为什么需要它：IDF 的 SDKCONFIG_DEFAULTS 只在【sdkconfig 不存在】或【某个符号还没被
 赋值】时才起作用。一旦 sdkconfig 生成过，改 sdkconfig.defaults / sdkconfig.local 都
-不会再影响它 —— 踩过一次：用户换了地方、我改了 sdkconfig.local 里的 WiFi SSID，
-重新 build+flash 之后设备还是去连旧 SSID（日志 `STA 已启动，SSID="TP-LINK_4225"`）。
+不会再影响它 —— 踩过一次：改了 sdkconfig.local 里的 WiFi SSID，重新 build+flash 之后
+设备还是去连旧网络（日志里 `STA 已启动，SSID="..."` 打的是旧名字）。
 
 所以：在 cmake configure 之前跑一遍这个脚本，把这两个文件的值覆盖进 sdkconfig。
 只在真的有差异时才写文件（否则会不停触发 cmake 重新 configure）。
