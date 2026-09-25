@@ -20,6 +20,7 @@
 #include "ui_text_chars.h"
 #include "assets.h"
 #include "app_core.h"
+#include "player.h"
 #include "audio_engine.h"
 #include "subsonic.h"
 #include "board.h"
@@ -942,7 +943,18 @@ static char  s_splash_text[64];
 static int   s_splash_step, s_splash_total = 1;
 static bool  s_splash_finish_req;
 
-static lv_obj_t *s_splash_lbl, *s_splash_bar, *s_scr_splash;
+static lv_obj_t *s_splash_lbl, *s_splash_bar, *s_scr_splash, *s_splash_note;
+static char        s_splash_r_text[64];        /* 上次渲染的文字（变了才做淡入） */
+
+/* 开机背光淡入：上电时"啪一下全亮"很生硬，改成从 0 慢慢爬上来。
+ * 用一次性 esp_timer 做（不能在 ui_start 里 vTaskDelay —— 那是开机主路径，
+ * 之前测过一次阻塞 2.8 秒的教训，见 [[esp-music-boot-time]]）。 */
+static esp_timer_handle_t s_bl_timer;
+static int s_bl_cur, s_bl_target_bright = 100;
+
+/* 音符在底图上的位置：底图的圆心是 (80,40)，音符外接框 25x35 → 起点 (68,18) */
+#define SPLASH_NOTE_X  68
+#define SPLASH_NOTE_Y  18
 
 static void build_splash_screen(void)
 {
@@ -950,7 +962,11 @@ static void build_splash_screen(void)
     s_scr_splash = scr;
     ui_put_img(scr, ASSET_BG_SPLASH, 0, 0);
 
-    s_splash_lbl = ui_put_label_1line(scr, "启动中...", 0, 74, 160, ui_font_12, 0x6E6E73);
+    /* 音符是独立一张图（带 alpha），这样它能单独做动画 —— 底图是静态的，
+     * 画在底图里就只能是"死"的。 */
+    s_splash_note = ui_put_img(scr, ASSET_SPLASH_NOTE, SPLASH_NOTE_X, SPLASH_NOTE_Y - 22);
+
+    s_splash_lbl = ui_put_label_1line(scr, "", 0, 74, 160, ui_font_12, 0x6E6E73);
     lv_obj_set_style_text_align(s_splash_lbl, LV_TEXT_ALIGN_CENTER, 0);
 
     s_splash_bar = lv_bar_create(scr);
@@ -963,6 +979,8 @@ static void build_splash_screen(void)
     lv_obj_set_style_bg_color(s_splash_bar, lv_color_hex(0x1A73E8), LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(s_splash_bar, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(s_splash_bar, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    /* 进度条平滑长过去（原来每一步都是"啪"地跳一格，很生硬）。面积 150x6 ≈ 0.9KB/帧 */
+    lv_obj_set_style_anim_duration(s_splash_bar, 450, 0);
 }
 
 void ui_splash_set(const char *text, int step, int total)
@@ -984,6 +1002,62 @@ void ui_splash_finish(void)
 }
 
 /* UI 任务侧：应用启动页状态；收到 finish 就切到播放页 */
+/* 音符：先从上落下弹一下，然后轻轻浮动（表示"在干活"）。
+ * 生命周期只在启动页 —— 启动页收起时把动画删掉（见 splash_apply 的 finish 分支），
+ * 否则它会一直跑下去白耗 CPU。 */
+static void splash_note_anim(void)
+{
+#if UI_ANIM
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_splash_note);
+    lv_anim_set_values(&a, SPLASH_NOTE_Y - 26, SPLASH_NOTE_Y);
+    lv_anim_set_duration(&a, 560);
+    lv_anim_set_exec_cb(&a, anim_y_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_bounce);     /* 落地弹一下 */
+    lv_anim_start(&a);
+
+    /* 落定之后的持续浮动（无限循环）。延迟 620ms 让它落在弹跳结束之后，
+     * 两个动画不会同时抢 y。 */
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_splash_note);
+    lv_anim_set_values(&a, SPLASH_NOTE_Y, SPLASH_NOTE_Y - 3);
+    lv_anim_set_duration(&a, 950);
+    lv_anim_set_playback_duration(&a, 950);           /* 弹回来 = 一个来回 */
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_delay(&a, 620);
+    lv_anim_set_exec_cb(&a, anim_y_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_start(&a);
+#endif
+}
+
+static void bl_fade_cb(void *arg)
+{
+    s_bl_cur += 9;                       /* 每 32ms 加 9% → 约 360ms 亮到位 */
+    if (s_bl_cur >= s_bl_target_bright) s_bl_cur = s_bl_target_bright;
+    board_backlight_set(s_bl_cur);
+    if (s_bl_cur >= s_bl_target_bright) {
+        esp_timer_stop(s_bl_timer);
+        esp_timer_delete(s_bl_timer);
+        s_bl_timer = NULL;
+    }
+}
+
+/* 从上电的"啪一下全亮"改成 0 → 目标值慢慢爬上来 */
+static void splash_backlight_fade(int target)
+{
+    s_bl_cur = 0;
+    s_bl_target_bright = target;
+    board_backlight_set(0);
+    const esp_timer_create_args_t ta = { .callback = bl_fade_cb, .name = "bl_fade" };
+    if (s_bl_timer == NULL && esp_timer_create(&ta, &s_bl_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_bl_timer, 32 * 1000);
+    } else {
+        board_backlight_set(target);     /* 定时器起不来就直接到目标值 */
+    }
+}
+
 static void splash_apply(void)
 {
     char text[64];
@@ -999,6 +1073,8 @@ static void splash_apply(void)
 
     if (fin && s_splash_active) {
         s_splash_active = false;
+        /* 启动页收起来了：音符的浮动动画要删掉，否则它会一直跑（白耗 CPU） */
+        lv_anim_delete(s_splash_note, NULL);
         s_page = UI_PAGE_PLAY;
         s_play_refresh_all = true;
         lv_screen_load(s_screens[UI_PAGE_PLAY]);
@@ -1007,10 +1083,15 @@ static void splash_apply(void)
     }
     if (!s_splash_active) return;
 
-    ui_set_text(s_splash_lbl, text);
+    /* 文字变了才做淡入（每步一次），而不是每 250ms 无脑刷 */
+    if (strcmp(text, s_splash_r_text) != 0) {
+        strlcpy(s_splash_r_text, text, sizeof(s_splash_r_text));
+        ui_set_text(s_splash_lbl, text);
+        anim_fade_in(s_splash_lbl, 260);
+    }
     int32_t v = (int32_t)((int64_t)step * 1000 / total);
     if (lv_bar_get_value(s_splash_bar) != v) {
-        lv_bar_set_value(s_splash_bar, v, LV_ANIM_OFF);
+        lv_bar_set_value(s_splash_bar, v, LV_ANIM_ON);   /* 平滑长过去，别跳 */
     }
 }
 
@@ -1160,7 +1241,14 @@ esp_err_t ui_start(void)
     /* 画面建好再开背光，避免上电瞬间花屏。
      * 亮度用 NVS 里存的值（ui_pages_build 里读过），没有就是 100%。 */
     board_backlight_init();
-    ui_pages_apply_brightness();
+    ui_pages_apply_brightness();          /* 先把 NVS 里的目标亮度施加好 */
+    /* 再压黑并从这里慢慢爬上去 —— 上电"啪一下全亮"太生硬。
+     * 两句紧挨着执行、屏幕上还没有内容，所以看不到中间那一下。 */
+    splash_backlight_fade(player_brightness());
+    splash_note_anim();                   /* 音符落下 + 持续浮动 */
+    /* ⚠️ 这里【不要】再给文字单独做一次淡入：splash_apply 在文字第一次变化时
+     * 就会淡入一次（初始文字是空串，所以第一次 tick 必定触发）——
+     * 两处都做的话第二次会把第一次打断、从 0 重新淡，看起来是"闪两下"。 */
 
     /* 栈放 PSRAM：ui 任务只读快照 + 画 LVGL，不写 flash（内部 SRAM 太紧，
      * 见 audio_engine.c 里那段说明）。cover 任务【不搬】—— 它要写封面缓存到

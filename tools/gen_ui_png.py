@@ -238,18 +238,33 @@ def ic_pause_big(size=32):
 # ============================================================ 启动页
 # 开机要连 WiFi、拉歌单，实测 10~19 秒。没有反馈用户会以为卡死，所以给一个
 # 看得见的进度：中间 logo，下面一行状态文字（动态），底部一条进度条（动态）。
-def bg_splash():
-    img, d = base()
-    # 居中 logo：浅蓝圆底 + 蓝色音符
-    cx, cy, r = W // 2, 40, 26
-    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(232, 240, 254))
-    # 音符：两个实心圆 + 符杆 + 符梁
+def draw_note(d, cx, cy):
+    """一个蓝色音符：两个实心圆（符头）+ 符杆 + 符梁。
+    ⚠️ 单独抽出来是为了让启动页的它**能单独动** —— 底图是静态的，
+       画在底图里就没法做"落下来弹一下"。所以底图只留浅蓝圆底，
+       音符做成独立的 splash_note.png（带 alpha），LVGL 里叠在圆心上做动画。"""
     d.ellipse((cx - 12, cy + 2, cx - 2, cy + 12), fill=ACCENT)
     d.ellipse((cx + 2, cy - 6, cx + 12, cy + 4), fill=ACCENT)
     d.rectangle((cx - 4, cy - 12, cx - 2, cy + 8), fill=ACCENT)
     d.rectangle((cx + 10, cy - 20, cx + 12, cy), fill=ACCENT)
     d.polygon([(cx - 4, cy - 14), (cx + 12, cy - 22), (cx + 12, cy - 16), (cx - 4, cy - 8)],
               fill=ACCENT)
+
+
+def splash_note():
+    """音符单独一张图（带 alpha）。尺寸就是音符的外接框，见下面的注释。"""
+    # 音符相对圆心：x ∈ [cx-12, cx+12]（25 px）、y ∈ [cy-22, cy+12]（35 px）
+    img = Image.new("RGBA", (25, 35), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    draw_note(d, 12, 22)          # 把圆心挪到 (12, 22)，正好套进 25x35
+    return img
+
+
+def bg_splash():
+    img, d = base()
+    # 居中 logo：浅蓝圆底（音符单独一张图，见 splash_note()）
+    cx, cy, r = W // 2, 40, 26
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(232, 240, 254))
     # 底部进度槽（动态填充叠上去）
     progress_slot(d, 5, 104, 150, h=6)
     return img
@@ -274,6 +289,7 @@ def main():
         "bg_vol.png": bg_vol(),
         "bg_info.png": bg_info(),
         "bg_splash.png": bg_splash(),
+        "splash_note.png": splash_note(),
         "ic_play.png": ic_play(),
         "ic_play_big.png": ic_play_big(),
         "ic_pause_big.png": ic_pause_big(),
