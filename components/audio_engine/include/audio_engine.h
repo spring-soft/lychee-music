@@ -60,6 +60,9 @@ void       audio_engine_set_pos_base(uint32_t ms);
 uint32_t   audio_engine_decoded_ms(void);
 uint32_t   audio_engine_sample_rate(void);
 int        audio_engine_underruns(void);
+/* 诊断：网络取流 / 解码消耗的累计字节数（配合时间算速率，见 .c 里的 rate_log） */
+uint64_t   audio_engine_fetch_bytes(void);
+uint64_t   audio_engine_decode_bytes(void);
 size_t     audio_engine_ring_used_in(void);
 size_t     audio_engine_ring_used_pcm(void);
 size_t     audio_engine_ring_in_high_water(void);

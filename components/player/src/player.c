@@ -558,7 +558,8 @@ static int resume_find(int count, uint32_t *from_out)
         sub_song_t s;
         if (!player_queue_get(i, &s)) break;
         if (strcmp(s.id, buf) != 0) continue;
-        if (pos >= 5000 && (s.duration_s == 0 || (uint32_t)pos + 5000 < s.duration_s * 1000)) {
+        if (pos >= 5000 && (s.duration_s == 0 ||
+                            (uint64_t)pos + 5000 < (uint64_t)s.duration_s * 1000)) {
             *from_out = (uint32_t)pos;
         }
         return i;
@@ -708,7 +709,7 @@ static void start_index_from(int idx, uint32_t from_ms)
 
     /* 先登记到快照（UI/网页立刻看到新歌名），再开流 */
     player_status_set_song(song.id, song.title, song.artist, song.album, song.cover,
-                           song.duration_s * 1000, song.starred);
+                           (uint32_t)((uint64_t)song.duration_s * 1000), song.starred);
     player_status_set_queue(idx, count, player_src_name(s_src), false);
 
     s_cur_src = src;
@@ -1084,12 +1085,70 @@ static void player_task(void *arg)
         /* 无命令时：看引擎状态决定要不要自动接下一首 */
         ae_state_t st = audio_engine_state();
         if (st == AE_STATE_FINISHED) {
-            ESP_LOGI(TAG, "本首播完 → 下一首");
-            next_or_wrap(+1);
+            /* ⚠️⚠️ 这里必须区分【真播完】和【流被掐断】—— 用户报的"偶发卡顿"就是这个。
+             *
+             * 引擎在"网络读取出错"时也会置 s_fetch_eof（见 audio_engine.c 的 fetch 任务），
+             * 于是它走的是**"播放结束"**这条路（AE_STATE_FINISHED），**不是 ERROR** ——
+             * 所以上面那个 ERROR 分支根本轮不到。原来的代码一看到 FINISHED 就"下一首"，
+             * 用户听到的就是"歌放一半突然跳走"。
+             *
+             * 实测（2026-09-25 抓了 6 分钟）：网络取流 23KB/s == 解码消耗 23KB/s、
+             * ring_in/ring_pcm 一直是满的 —— **缓冲和服务器都不是瓶颈**；真正发生的是
+             * 大约每 5 分钟连接被对方关掉一次（`读取错误 (-1)` → `tcp_read error`）。
+             * 所以正确反应是"从声音停住的位置接着放"（位置由 DMA 帧数推导，可信；
+             * Navidrome 对转码流支持 timeOffset），代价只有约 1 秒重连。
+             * ⚠️ 位置要在 start_index_* 之前读：那里面会 audio_engine_stop() 清掉基准。 */
+            if (audio_engine_is_error()) {
+                uint32_t pos = audio_engine_position_ms();
+                player_status_t pst;
+                player_status_get(&pst);
+                uint32_t dur = pst.duration_ms;
+                /* ⚠️ 还要再分一种情况：**歌本来就放完了**。
+                 * Navidrome 的转码流在收尾时连接是【被复位】的（不是正常关闭），
+                 * 所以每首歌结束时读出来也是"错误"而不是 EOF —— 实测到
+                 * "位置 133953 / 总长 134000" 还判成断流，于是在歌尾反复续播、
+                 * 永远进不了下一首（死循环）。离结尾 3 秒以内就当它唱完了。 */
+                bool at_end = (dur > 0 && (uint64_t)pos + 3000 >= (uint64_t)dur);
+                if (at_end) {
+                    ESP_LOGI(TAG, "本首播完（%" PRIu32 "/%" PRIu32 " ms，连接被复位）→ 下一首",
+                             pos, dur);
+                    next_or_wrap(+1);
+                } else if (pos > 3000) {
+                    ESP_LOGW(TAG, "流被掐断在 %" PRIu32 " ms（总长 %" PRIu32 "）→ 从这儿接着放",
+                             pos, dur);
+                    start_index_from(s_index, pos);
+                } else {
+                    ESP_LOGW(TAG, "流刚起就断了（%" PRIu32 " ms）→ 换下一首", pos);
+                    next_or_wrap(+1);
+                }
+            } else {
+                ESP_LOGI(TAG, "本首播完 → 下一首");
+                next_or_wrap(+1);
+            }
         } else if (st == AE_STATE_ERROR) {
+            /* ★★ 断流/出错：**从当前位置接着放，不要从头重放**。
+             *
+             * 为什么这么改：实测（2026-09-25 抓的 5 分钟数据）——
+             *   网络取流 23KB/s == 解码消耗 23KB/s，ring_in/ring_pcm 一直是满的，
+             *   **缓冲和服务器都不是瓶颈**；真正发生的是大约每 5 分钟连接被对方关掉一次
+             *   （`http_src: 读取错误 (-1)` → `transport_base: tcp_read error`）。
+             *   而原来的处理是"重试当前这首" = `start_index()` = **从头重放**，
+             *   用户听到的就是"歌突然跳回开头"（他报的"偶发卡顿"）。
+             *
+             * 我们的位置本来就可信（由 DMA 帧数推导），Navidrome 也支持 timeOffset
+             * 从任意位置重转 —— 所以直接续上，代价只有约 1 秒的重连。
+             * ⚠️ 位置必须在 start_index_* 之前读：那里面会 audio_engine_stop() 把基准清掉。 */
+            uint32_t pos = audio_engine_position_ms();
             if (++s_err_streak <= 2) {
-                ESP_LOGW(TAG, "播放出错（第 %d 次）→ 重试当前这首", s_err_streak);
-                start_index(s_index);
+                if (pos > 3000) {
+                    ESP_LOGW(TAG, "播放出错（第 %d 次）→ 从 %" PRIu32 " ms 接着放（断流，不重头）",
+                             s_err_streak, pos);
+                    start_index_from(s_index, pos);
+                } else {
+                    ESP_LOGW(TAG, "播放出错（第 %d 次）→ 重试当前这首（刚开始，从头放）",
+                             s_err_streak);
+                    start_index(s_index);
+                }
             } else if (s_err_streak <= 6) {
                 ESP_LOGW(TAG, "连续出错 → 跳过这一首");
                 next_or_wrap(+1);

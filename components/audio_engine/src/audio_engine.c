@@ -45,6 +45,41 @@ static bool s_inited;
 static volatile uint32_t           s_gen;
 static volatile ae_state_t         s_state = AE_STATE_IDLE;
 static volatile bool               s_fetch_eof;     /* 源已读完 */
+
+/* 取流速率统计（诊断"偶发卡顿"的关键数据）。
+ * 为什么需要它：实测抓到过"两个缓冲同时归零、位置冻住 24 秒"的停顿，
+ * 而 128KB 预取 + 128KB PCM 合计约 6.4 秒 —— 加缓存根本盖不住 24 秒
+ * （用户问过"是不是加大缓存就好了"，答案是"不解决，只是把 6 秒变成 10 秒"）。
+ * 真正要回答的是"服务器到底给不给得上速度"：
+ *   源需要的速率 ≈ 转码码率 / 8（mp3@192k → 24 KB/s）
+ *   解码端消耗速率 = 采样率 × 声道 × 2 字节（44.1k 立体声 → 172 KB/s，这是 PCM 侧）
+ * 把"取流速率 / 解码消耗速率"一起打出来，一眼就能看出是不是服务器跟不上。 */
+static volatile uint64_t           s_fetch_bytes;    /* 累计从网络读到的字节 */
+static volatile uint64_t           s_decode_bytes;   /* 累计交给解码器的字节 */
+static uint64_t                    s_prev_fetch, s_prev_decode;   /* 上次打点时的字节数 */
+static int64_t                     s_rate_ms;                       /* 上次打点的时间 */
+
+/* 打一行"取流速率 / 解码消耗速率"。**卡顿现场的证据要抓在当场**，
+ * 否则事后再看计数器已经归零了（换歌会重置）。
+ * 判读：源是 mp3@192k → 需要 24 KB/s；网络速率长期低于它就一定会卡。 */
+static void rate_log(void)
+{
+    int64_t now = esp_timer_get_time() / 1000;
+    int64_t dt = now - s_rate_ms;
+    if (dt < 200) dt = 200;
+    uint64_t df = s_fetch_bytes - s_prev_fetch;
+    uint64_t dd = s_decode_bytes - s_prev_decode;
+    ESP_LOGW(TAG, "[速率] 网络取流 %u KB/s ｜ 解码消耗 %u KB/s ｜ 已播 %" PRIu32 " ms ｜ "
+                  "ring_in %u KB / ring_pcm %u KB / DMA 深度 %u 帧",
+             (unsigned)(df / (uint64_t)dt), (unsigned)(dd / (uint64_t)dt),
+             audio_engine_position_ms(),
+             (unsigned)(audio_ring_used(&s_rin) / 1024),
+             (unsigned)(audio_ring_used(&s_rpcm) / 1024),
+             (unsigned)BOARD_I2S_DMA_FRAMES);
+    s_prev_fetch = s_fetch_bytes;
+    s_prev_decode = s_decode_bytes;
+    s_rate_ms = now;
+}
 static volatile bool               s_dec_eof;       /* 解码器已冲完尾 */
 static volatile bool               s_sniff_done;
 static volatile bool               s_error;
@@ -188,6 +223,7 @@ static void fetch_task(void *arg)
         int n = s_src->read(s_src, dst, span);
         if (n > 0) {
             audio_ring_write_commit(&s_rin, (size_t)n);
+            s_fetch_bytes += (uint64_t)n;
         } else if (n == 0) {
             if (!s_fetch_eof_local) {
                 ESP_LOGI(TAG, "[fetch] 流结束，ring_in 剩 %u KB 待解码",
@@ -315,7 +351,7 @@ static void decode_task(void *arg)
                 }
                 s_dec_eof = true;
                 ESP_LOGI(TAG, "[dec] 解码收尾：共 %" PRIu32 " ms（eos 重试 %d 次）",
-                         s_frames_decoded * 1000 / s_fs, eos_retries);
+                         (uint32_t)((uint64_t)s_frames_decoded * 1000 / s_fs), eos_retries);
             } else {
                 /* ⚠️ 只在生产者已停止时才敢搬运数据：audio_ring_defrag() 会重置 rd/wr，
                  *   而 fetch 任务可能正拿旧的 wr 往同一块区域写 → 数据错位（听感=咔哒）。
@@ -330,7 +366,7 @@ static void decode_task(void *arg)
             continue;
         }
 
-        if (raw.consumed) audio_ring_read_commit(&s_rin, raw.consumed);
+        if (raw.consumed) { audio_ring_read_commit(&s_rin, raw.consumed); s_decode_bytes += raw.consumed; }
 
         if (out.decoded_size) {
             eos_retries = 0;                     /* 有输出说明还在正常解，冲尾计数归零 */
@@ -451,6 +487,8 @@ static void out_task(void *arg)
                 continue;
             }
             s_underruns++;                        /* 欠载：补静音，不让 I2S 停（避免爆音） */
+        /* 第一次欠载就把"取流速率"打出来 —— 卡顿现场的证据要抓在当场 */
+        if (s_underruns == 1 || (s_underruns % 50) == 0) rate_log();
             size_t w = 0;
             board_i2s_write(s_silence, sizeof(s_silence), &w, pdMS_TO_TICKS(200));
             if (underrun_logged++ < 8) {
@@ -461,6 +499,13 @@ static void out_task(void *arg)
                          s_fetch_eof ? "已完成" : "还在拉流");
             }
             continue;
+        }
+
+        /* 每 30 秒打一次速率：**不光卡顿时要看，健康时的数字才是对照基准** */
+        {
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (s_rate_ms == 0) s_rate_ms = now_ms;
+            else if (now_ms - s_rate_ms >= 30000) rate_log();
         }
 
         size_t w = 0;
@@ -600,14 +645,26 @@ uint32_t audio_engine_position_ms(void)
     uint32_t f = s_frames_out;
     uint32_t base = s_pos_base_ms;
     if (f <= BOARD_I2S_DMA_FRAMES) return base;   /* 还在 DMA 缓冲里，没真正出声 */
-    return base + (f - BOARD_I2S_DMA_FRAMES) * 1000 / s_fs;
+    /* ⚠️⚠️ 必须用 64 位算！
+     * 之前是 `(f - DMA) * 1000 / s_fs`，全是 32 位：f 到 4,294,967 帧
+     * （44.1kHz 下**只有 97.4 秒**）时 `f * 1000` 就超过 uint32 上限，
+     * 于是**任何长于约 97 秒的歌，位置每 97.4 秒回绕一次**。
+     * 实测对上了：续播基准 61.4s + 真实播放 106.6s → 算出 70.6s，观测值 69.7s。
+     * 后果：进度条回跳、歌词错位、seek 跑偏、"断流续播"跳到错的地方
+     * —— 而这些都是"看起来像卡顿"的现象。 */
+    uint64_t df = (uint64_t)f - BOARD_I2S_DMA_FRAMES;
+    return base + (uint32_t)(df * 1000 / s_fs);
 }
 
 /* seek 之后把位置基准挪到目标位置（必须在 audio_engine_play() 之后调，
  * 因为 play 会把基准清 0） */
 void audio_engine_set_pos_base(uint32_t ms) { s_pos_base_ms = ms; }
 
-uint32_t audio_engine_decoded_ms(void) { return s_frames_decoded * 1000 / s_fs; }
+/* 同 position_ms：长歌会溢出，必须 64 位 */
+uint32_t audio_engine_decoded_ms(void)
+{
+    return (uint32_t)((uint64_t)s_frames_decoded * 1000 / s_fs);
+}
 bool     audio_engine_is_paused(void) { return s_paused; }
 uint32_t audio_engine_sample_rate(void) { return s_fs; }
 int      audio_engine_underruns(void) { return (int)s_underruns; }
@@ -674,3 +731,6 @@ const uint8_t *ae_embed_test_audio(bool flac, size_t *len)
     *len = (size_t)(test_melody_mp3_end - test_melody_mp3_start);
     return test_melody_mp3_start;
 }
+
+uint64_t audio_engine_fetch_bytes(void)  { return s_fetch_bytes; }
+uint64_t audio_engine_decode_bytes(void) { return s_decode_bytes; }
