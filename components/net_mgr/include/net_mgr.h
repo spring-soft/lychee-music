@@ -39,6 +39,10 @@ esp_err_t   net_mgr_ap_apply(bool on, const char *ssid, const char *pass);
 bool        net_mgr_ap_is_on(void);
 const char *net_mgr_ap_ssid(void);
 const char *net_mgr_ap_pass(void);
+/* 热点自己的 IP（连上热点后用它打开网页控制台）。热点没起时返回 "" */
+const char *net_mgr_ap_ip_str(void);
+/* 没网时的应急入口：开热点但**不写 NVS**（不改用户"热点关着"的设置） */
+esp_err_t   net_mgr_ap_rescue_on(void);
 
 /* 热点扫描：⚠️ 必须异步（同步扫要 2~4 秒，在 httpd 任务里会把网页卡死）。
  * 用法：scan_start() → 轮询 scan_busy()，变 false 后 scan_count()/scan_get() 取结果。
