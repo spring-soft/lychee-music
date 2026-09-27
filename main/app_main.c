@@ -140,6 +140,7 @@ static void key_selftest_task(void *arg)
         ESP_LOGW(TAG, "[自检 %2u]   -> 按键后=%s  uid=%d", (unsigned)(i + 1),
                  ui_page_name(ui_page_current()), (int)ui_page_current());
         if (ui_page_current() == UI_PAGE_SEARCH_IN) ui_search_debug_dump();
+        if (ui_page_current() == UI_PAGE_INFO) ui_info_debug_dump();
     }
     ESP_LOGW(TAG, "[自检] 全部走完");
     vTaskDelete(NULL);
@@ -205,6 +206,29 @@ static void m1_embedded_test(void)
     play_and_watch(ae_source_memory_new(mp3, len), "内嵌 MP3", 25);
 }
 
+/* 没网 / 没配好音乐源时的救命入口：设备热点 + 网页控制台。
+ *
+ * 为什么非要有它：这两条路以前是 `goto heartbeat` 直接过去的，控制台**根本没起**，
+ * 于是"WiFi 换地方了 / 服务器地址变了"的唯一后果是——设备什么都干不了，
+ * 用户也进不去改配置，只能重新烧固件（2026-09-27 真踩过）。
+ * 控制台不设鉴权，热点也开着，连上就能改 WiFi / Navidrome 配置。
+ *
+ * ⚠️ 只在【起播之前】的这些失败分支里调：正常路径的控制台起点排在 BLE 之后，
+ *    那样才不跟 NimBLE 抢内部 SRAM（见 hid_remote_init 的注释）。
+ *    这些分支本来就不会走到 BLE，所以直接起是安全的。 */
+static void start_console_for_config(void)
+{
+    /* 热点可能在 NVS 里被用户关掉了，那这条救命路就没了 —— 临时拉起来（不写 NVS） */
+    net_mgr_ap_rescue_on();
+    if (web_console_start() != ESP_OK) {
+        ESP_LOGE(TAG, "网页控制台没起来 —— 配网只能靠串口/重烧固件了");
+        return;
+    }
+    /* ⚠️ 日志里只打热点名不打密码（和 net_mgr 同样的顾虑：串口日志也是泄口） */
+    ESP_LOGW(TAG, "★ 配网入口已就绪：手机连热点 \"%s\"，浏览器打开 http://%s/",
+             net_mgr_ap_ssid(), net_mgr_ap_ip_str());
+}
+
 /* 本机 python3 -m http.server 回归（可选，配了 URL 才跑） */
 static void m2_local_http_test(void)
 {
@@ -249,6 +273,12 @@ void app_main(void)
      *      实测能省 1.5~2 秒开机时间。顺序很重要，别挪回下面。 ---- */
     bool net_ok = (net_mgr_init() == ESP_OK);
 
+    /* 设置（音量/亮度/来源…）——必须在 player_init / ui_start 之前准备好，
+     * 它们开机就要读 NVS 里的上次设置。nvs_flash 已由 net_mgr_init 初始化。
+     * 放在这里（而不是起播前）是为了让【没网时的那条路径】也有设置可用 ——
+     * 那条路会开网页控制台给用户配网。 */
+    settings_init();
+
     /* ---- M3: 屏幕（4 个页面 + 按键都在这里建好） ---- */
     ESP_LOGW(TAG, "===== 显示 + 素材 + 中文字库 + 按键 =====");
     splash("加载界面...", 3);
@@ -260,6 +290,7 @@ void app_main(void)
 
     if (!net_ok) {
         ESP_LOGE(TAG, "网络初始化失败，回退到内嵌音频测试");
+        start_console_for_config();
         ui_splash_finish();
         m1_embedded_test();
         goto heartbeat;
@@ -270,6 +301,10 @@ void app_main(void)
              net_mgr_ip_str(), net_mgr_rssi());
     if (!up) {
         ESP_LOGE(TAG, "WiFi 没连上 —— 查 SSID/密码、以及是不是 2.4GHz 网络（S3 不支持 5GHz）");
+        /* ★ 用户要求（2026-09-27）：没连上网时最要紧的事是让用户能进控制台改 WiFi。
+         *   设备自己的热点默认是开的（net_mgr 里"初次连不上网时唯一能进控制台的入口"），
+         *   这里把网页控制台也起起来 —— 连上热点就能配网，系统信息页会显示热点 IP。 */
+        start_console_for_config();
         ui_splash_finish();        /* 没网也别把启动页挂在那儿，用户会以为死机 */
         m1_embedded_test();
         goto heartbeat;
@@ -299,6 +334,7 @@ void app_main(void)
     /* ---- M4: 起播（之后按键/网页都通过 player 命令层控制）---- */
     if (subsonic_init() != ESP_OK || !subsonic_configured()) {
         ESP_LOGE(TAG, "没配 Navidrome 音乐源（host 为空）");
+        start_console_for_config();     /* 网页里能填服务器地址/账号 */
         ui_splash_finish();
         m1_embedded_test();
         goto heartbeat;

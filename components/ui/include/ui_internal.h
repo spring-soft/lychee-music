@@ -121,6 +121,8 @@ void ui_keys_inject(int k, int kind);
 /* 诊断：把当前页面名和搜索输入页的内部状态打到日志 */
 const char *ui_page_name(ui_page_t p);
 void ui_search_debug_dump(void);
+/* 诊断：把系统信息页七行原样打到日志（看不见屏幕时验证"离线配网提示"用） */
+void ui_info_debug_dump(void);
 
 #ifdef __cplusplus
 }

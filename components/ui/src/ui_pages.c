@@ -372,14 +372,20 @@ static void info_line(int i, char *buf, size_t len)
     player_status_get(&st);
     uint32_t up_s = (uint32_t)(esp_timer_get_time() / 1000000);
     switch (i) {
-        case 0:   /* ★ 用户明确要求：系统信息里要能看到本机 IP */
-            snprintf(buf, len, "本机 IP  %.16s", net_mgr_ip_str());
+        /* ★ 用户要求（2026-09-27）：没连上网的时候，这两行要变成"怎么配网"的说明书 ——
+         *   第 0 行给热点的 IP（浏览器里输这个就能进控制台），第 1 行给热点名。
+         *   以前没网时第 0 行是空的（本机 IP 没有），用户连进去了也不知道该访问哪。 */
+        case 0:
+            if (net_mgr_is_connected())
+                snprintf(buf, len, "本机 IP  %.16s", net_mgr_ip_str());   /* ★ 用户明确要求过 */
+            else
+                snprintf(buf, len, "配网 IP  %.16s", net_mgr_ap_ip_str());
             break;
         case 1:
             if (net_mgr_is_connected())
                 snprintf(buf, len, "WiFi  %.10s  %d dBm", net_mgr_ssid(), net_mgr_rssi());
             else
-                snprintf(buf, len, "WiFi  未连接");
+                snprintf(buf, len, "热点  %.12s", net_mgr_ap_ssid());
             break;
         case 2:
             snprintf(buf, len, "内存  %uK / PSRAM %uK",
@@ -408,6 +414,17 @@ static void info_line(int i, char *buf, size_t len)
         default:
             buf[0] = 0;
             break;
+    }
+}
+
+/* 给按键自检（app_main 的 K4_SELFTEST）用：把这一页七行原样打进串口。
+ * 我看不见屏幕，"离线时第 0/1 行到底显示成什么"只能靠它验证。 */
+void ui_info_debug_dump(void)
+{
+    char buf[64];
+    for (int i = 0; i < INFO_ROWS; i++) {
+        info_line(i, buf, sizeof(buf));
+        ESP_LOGW(TAG, "[info %d] %s", i, buf);
     }
 }
 
