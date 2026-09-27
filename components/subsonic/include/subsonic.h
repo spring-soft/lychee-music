@@ -36,6 +36,10 @@ typedef struct {
 /* 从 NVS(ns "nav") 读配置，Kconfig 兜底 */
 esp_err_t subsonic_init(void);
 const char *subsonic_host(void);
+/* 当前生效的转码设置（"auto"/"mp3"/"aac"/"raw" 与码率上限）。
+ * 网页控制台用它回显真实值 —— 之前那边是写死的 "mp3"/192，改完看不出来。 */
+const char *subsonic_transcode(void);
+int         subsonic_max_kbps(void);
 bool        subsonic_configured(void);
 
 /* 连通性 + 服务器信息（/rest/ping）。server_info 失败时带回原因（如鉴权失败的消息） */

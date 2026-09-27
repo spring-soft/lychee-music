@@ -591,8 +591,10 @@ static esp_err_t h_config_get(httpd_req_t *req)
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "host", subsonic_host());
     /* ⚠️ 永远不回密码，只回"设没设" */
-    cJSON_AddStringToObject(o, "transcode", "mp3");
-    cJSON_AddNumberToObject(o, "max_kbps", 192);
+    /* ⚠️ 这两个以前是写死的 "mp3"/192，不反映真实设置 —— 改成实际值，
+     *    否则改了 transcode 在网页上完全看不出来。 */
+    cJSON_AddStringToObject(o, "transcode", subsonic_transcode());
+    cJSON_AddNumberToObject(o, "max_kbps", subsonic_max_kbps());
     cJSON_AddBoolToObject(o, "configured", subsonic_configured());
     cJSON_AddBoolToObject(o, "pass_set", subsonic_has_password());
     return send_json(req, o);

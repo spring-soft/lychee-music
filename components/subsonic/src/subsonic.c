@@ -1,4 +1,5 @@
 #include <string.h>
+#include <strings.h>   /* strcasecmp：判断后缀用 */
 #include <stdio.h>
 #include <inttypes.h>
 #include "subsonic.h"
@@ -28,7 +29,7 @@ static char s_host[160];
 static char s_user[48];
 static char s_pass[64];
 static int  s_max_kbps;
-static char s_transcode[8];              /* "mp3" / "aac" / "raw" */
+static char s_transcode[8];              /* "auto" / "mp3" / "aac" / "raw" */
 
 static bool nvs_get_str_or(const char *key, char *dst, size_t len, const char *fallback)
 {
@@ -69,6 +70,8 @@ esp_err_t subsonic_init(void)
 
 const char *subsonic_host(void) { return s_host; }
 bool subsonic_configured(void) { return s_host[0] != 0; }
+const char *subsonic_transcode(void) { return s_transcode; }
+int         subsonic_max_kbps(void) { return s_max_kbps; }
 
 /* u/t/s 认证参数（salt 每次随机，t = md5(pass+salt) 小写 hex） */
 static void append_auth_ex(char *url, size_t len, const char *user, const char *pass)
@@ -454,6 +457,26 @@ esp_err_t subsonic_star(const char *song_id, bool on)
     return star_action(on ? "star" : "unstar", song_id);
 }
 
+/* ---------- 能不能直出（不转码）----------
+ * 判据用 Subsonic 返回的 suffix（sub_song_t.suffix，列表/搜索/单曲接口里都带），
+ * 不需要额外发请求。
+ *
+ * ⚠️ 只列【本固件确实解得了、且后缀无歧义】的两种：
+ *     mp3  → MP3 解码器
+ *     flac → FLAC 解码器
+ * 故意不含 m4a / ogg：m4a 容器里可能是 ALAC、ogg 里可能是 Vorbis，
+ * 这两种解码器本工程都没开（见 sdkconfig 的 CONFIG_AUDIO_DECODER_*）。
+ * 直出了解不了 = 直接没声音，比转码一声道还糟。拿不准就交给服务端转码。
+ *
+ * ⚠️ 已知代价：FLAC 直出会丢最后一个 block（约 89ms）—— 流式 FLAC parser 需要
+ *    "下一帧同步字"来定当前帧边界，末尾没有下一帧就冲不出来（详见开发记录）。
+ *    MP3 直出一帧不差。权衡下来直出仍然远好于转码 MP3 192k。 */
+static bool suffix_direct_playable(const char *suffix)
+{
+    if (!suffix || !suffix[0]) return false;
+    return !strcasecmp(suffix, "mp3") || !strcasecmp(suffix, "flac");
+}
+
 /* offset_s = 0 时不带 timeOffset */
 static esp_err_t stream_url_ex(const sub_song_t *song, int max_kbps, uint32_t offset_s,
                                char *out, size_t out_len)
@@ -461,13 +484,27 @@ static esp_err_t stream_url_ex(const sub_song_t *song, int max_kbps, uint32_t of
     if (!subsonic_configured()) return ESP_ERR_INVALID_STATE;
     if (max_kbps <= 0) max_kbps = s_max_kbps;
 
+    /* 这一次请求要不要转码：
+     *   "raw"  —— 永远直出
+     *   "auto" —— 首次播放且源文件直接可解 → 直出；其余（含 seek）转码
+     *   mp3/aac —— 永远转码
+     */
     bool raw = !strcmp(s_transcode, "raw");
+    if (!strcmp(s_transcode, "auto")) {
+        /* ★ seek 必须转码：raw 流不吃 timeOffset（会被服务端静默忽略，表现为
+         *   "seek 之后从头播"），而转码流又拿不到 Accept-Ranges。两者只能二选一，
+         *   所以规则是"平时直出、seek 时转码"。 */
+        raw = (offset_s == 0) && suffix_direct_playable(song->suffix);
+    }
+
     if (raw) {
         snprintf(out, out_len, "%s/rest/stream.view?id=%s&format=raw&f=json", s_host, song->id);
     } else {
+        /* auto 模式转码时用 mp3 兜底 —— s_transcode 是 "auto"，不能直接塞进 format= */
+        const char *fmt = (s_transcode[0] && strcmp(s_transcode, "auto")) ? s_transcode : "mp3";
         /* ⚠️ format 必须显式给：只给 maxBitRate 时 Navidrome 默认给 Opus（ESP32 上不划算） */
         snprintf(out, out_len, "%s/rest/stream.view?id=%s&format=%s&maxBitRate=%d&estimateContentLength=true&f=json",
-                 s_host, song->id, s_transcode[0] ? s_transcode : "mp3", max_kbps);
+                 s_host, song->id, fmt, max_kbps);
     }
     /* ★ seek：转码流没有 Accept-Ranges（实测），所以只能让服务端从 timeOffset 开始转。
      *   这是 OpenSubsonic 的 transcodeOffset 扩展，Navidrome 0.63 支持。

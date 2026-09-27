@@ -48,11 +48,18 @@ menu "ESP-Music 配置"
             default ""
 
         config APP_NAV_TRANSCODE
-            string "转码格式（mp3 / aac / raw）"
-            default "mp3"
+            string "转码格式（auto / mp3 / aac / raw）"
+            default "auto"
             help
-                强烈建议 mp3：只给 maxBitRate 不给 format 时 Navidrome 默认给 Opus，
-                ESP32 上解码开销大。raw = 不转码直出源文件（省服务器 CPU，FLAC 会丢尾帧）。
+                auto（推荐）= 首次播放时【直出原文件】（服务端不转码，音质最好），
+                             只有 seek 时才让服务端转码（因为 raw 流不吃 timeOffset）。
+                             仅当源是 mp3/flac 才直出，其余后缀（m4a/ogg/wma…）自动转码。
+                mp3 / aac   = 永远转码。⚠️ 必须显式给 format：只给 maxBitRate 时
+                             Navidrome 默认给 Opus，ESP32 上解码开销大。
+                raw         = 永远直出（连 seek 也直出，但 seek 会失效）。
+
+                ⚠️ FLAC 直出会丢最后一个 block（约 89ms）：流式 FLAC parser 需要
+                   "下一帧同步字"来定帧边界，末尾没有下一帧就冲不出来。MP3 直出一帧不差。
 
         config APP_NAV_MAX_KBPS
             int "转码码率上限（kbps）"
