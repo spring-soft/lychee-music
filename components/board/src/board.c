@@ -75,7 +75,9 @@ static void es_mute_apply(void) { board_es8388_mute(s_user_muted); }
 
 void board_pa_enable(bool on)
 {
-    gpio_set_level(BOARD_PIN_PA_EN, on ? 1 : 0);
+    /* 自制板无功放（已去掉 PAM8406），ES8388 内置耳放经耦合电容直推耳机。
+     * 保留函数签名以兼容调用方，实际不做任何事。 */
+    (void)on;
 }
 
 bool board_is_ready(void) { return s_ready; }
@@ -405,7 +407,7 @@ static void i2s_fill_cfg(i2s_std_config_t *cfg, uint32_t fs)
     cfg->gpio_cfg.bclk = BOARD_PIN_I2S_BCLK;
     cfg->gpio_cfg.ws   = BOARD_PIN_I2S_WS;
     cfg->gpio_cfg.dout = BOARD_PIN_I2S_DOUT;
-    cfg->gpio_cfg.din  = BOARD_PIN_I2S_DIN;
+    cfg->gpio_cfg.din  = I2S_GPIO_UNUSED;   /* 自制板不录音：ES8388 ADC 已断电 */
 }
 
 static esp_err_t i2s_init(uint32_t fs)
@@ -563,14 +565,6 @@ void board_play_tone(int ms, float freq_hz, int amplitude, bool square)
 
 esp_err_t board_init(void)
 {
-    /* PA 使能脚先配好（默认关，避免上电爆音） */
-    gpio_config_t pa = {
-        .pin_bit_mask = 1ULL << BOARD_PIN_PA_EN,
-        .mode         = GPIO_MODE_OUTPUT,
-    };
-    gpio_config(&pa);
-    gpio_set_level(BOARD_PIN_PA_EN, 0);
-
     board_i2c_line_check();
     if (board_i2c_init() != ESP_OK) return ESP_FAIL;
     board_i2c_scan();
@@ -594,10 +588,9 @@ int board_selftest(void)
 {
     int bad = 0;
     ESP_LOGI(TAG, "================= 板级自检 =================");
-    ESP_LOGI(TAG, "[hw] SDA=%d SCL=%d | MCK=%d BCK=%d WS=%d | out=%d in=%d | PA=%d",
+    ESP_LOGI(TAG, "[hw] SDA=%d SCL=%d | MCK=%d BCK=%d WS=%d | out=%d",
              BOARD_PIN_I2C_SDA, BOARD_PIN_I2C_SCL, BOARD_PIN_I2S_MCLK,
-             BOARD_PIN_I2S_BCLK, BOARD_PIN_I2S_WS, BOARD_PIN_I2S_DOUT,
-             BOARD_PIN_I2S_DIN, BOARD_PIN_PA_EN);
+             BOARD_PIN_I2S_BCLK, BOARD_PIN_I2S_WS, BOARD_PIN_I2S_DOUT);
 
     if (board_i2c_line_check() != 0) bad++;
 

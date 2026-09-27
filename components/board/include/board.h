@@ -1,9 +1,11 @@
 /*
- * ESP-Music — 板级硬件抽象（ESP32-S3-COREBOARD V1.4 + ES8388/PAM8406 + ST7735 + K1-K4）
+ * ESP-Music — 板级硬件抽象（自制 PCB：ESP32-S3-WROOM-1-N16R8 + ES8388 + ST7735 + K1-K4）
  *
- * 接线（原理图与本机原生测试双向核实，别改）：
- *   SDA=GPIO1  SCL=GPIO2 | MCK=42 BCK=41 WS=39 | ESP出(GPIO40)=音频板 DO(第5脚)
- *   ESP收(GPIO38)=音频板 DI(第7脚) | PEN=GPIO47(高有效, PAM8406 使能)
+ * 接线（对应自制 PCB，改板请同步改这里）：
+ *   SDA=GPIO1  SCL=GPIO2 | MCK=42 BCK=41 WS=39 | DOUT=GPIO40 -> ES8388 DSDIN
+ *   K1 由 GPIO3 改为 GPIO38（避开 strapping 脚）
+ *   无功放：ES8388 内置耳放经耦合电容直推 3.5mm 耳机座
+ *   不录音：ES8388 ADC 已断电，I2S 只发不收，无 DIN
  *
  * 设计取舍：ES8388 走【直接 I2C 写寄存器 + 写后读回校验重试】，不经过 esp_codec_dev。
  * 理由：唯一被真机验证过的序列就是直写形式；且 esp_codec_dev 的 open() 会把
@@ -27,9 +29,11 @@ extern "C" {
 #define BOARD_PIN_I2S_MCLK  42
 #define BOARD_PIN_I2S_BCLK  41
 #define BOARD_PIN_I2S_WS    39
-#define BOARD_PIN_I2S_DOUT  40   /* ESP -> 音频板 DO(第5脚) */
-#define BOARD_PIN_I2S_DIN   38   /* 音频板 DI(第7脚) -> ESP */
-#define BOARD_PIN_PA_EN     47   /* PAM8406 使能，高有效 */
+#define BOARD_PIN_I2S_DOUT  40   /* ESP -> ES8388 DSDIN */
+/* BOARD_PIN_I2S_DIN 已删除：自制板不录音（ES8388 ADC 断电），I2S 通道是 TX-only，
+ * 原 GPIO38 腾出来给 K1。board.c 里 i2s_fill_cfg() 的 din 改为 I2S_GPIO_UNUSED。 */
+/* BOARD_PIN_PA_EN 已删除：自制板去掉 PAM8406 功放，ES8388 内置耳放直推耳机。
+ * board_pa_enable() 保留为空实现，以兼容调用方。 */
 
 #define BOARD_PIN_LCD_SCLK  4
 #define BOARD_PIN_LCD_MOSI  5
@@ -38,7 +42,8 @@ extern "C" {
 #define BOARD_PIN_LCD_CS    15
 #define BOARD_PIN_LCD_BLK   16
 
-#define BOARD_PIN_KEY1      3    /* ⚠️ GPIO3 是 strapping 脚，开机按住会进 JTAG */
+#define BOARD_PIN_KEY1      38   /* ⚠️ 自制板从 GPIO3 改到 GPIO38：GPIO3 是 strapping 脚，
+                                  *    上电被拉低会进 JTAG 下载模式。改板时必须同步改这里。 */
 #define BOARD_PIN_KEY2      8
 #define BOARD_PIN_KEY3      18
 #define BOARD_PIN_KEY4      17
