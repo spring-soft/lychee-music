@@ -351,6 +351,19 @@ bool        net_mgr_ap_is_on(void)   { return s_ap_on; }
 const char *net_mgr_ap_ssid(void)    { return s_ap_ssid; }
 const char *net_mgr_ap_pass(void)    { return s_ap_pass; }
 
+/* 热点的 IP（`esp_netif_create_default_wifi_ap()` 的默认值 192.168.4.1）。
+ * 没连上 WiFi 时，屏幕上的系统信息页就显示这个地址 —— 用户连上热点后照着输。
+ * 不写死成常量：热点 netif 的 IP 是可配的，问 netif 才是唯一真相。 */
+const char *net_mgr_ap_ip_str(void)
+{
+    static char s_ap_ip[16];
+    if (s_ap_netif == NULL) return "";
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(s_ap_netif, &ip) != ESP_OK || ip.ip.addr == 0) return "";
+    snprintf(s_ap_ip, sizeof(s_ap_ip), IPSTR, IP2STR(&ip.ip));
+    return s_ap_ip;
+}
+
 esp_err_t net_mgr_ap_apply(bool on, const char *ssid, const char *pass)
 {
     if (!s_started) return ESP_ERR_INVALID_STATE;
@@ -371,6 +384,21 @@ esp_err_t net_mgr_ap_apply(bool on, const char *ssid, const char *pass)
         esp_wifi_set_mode(on ? WIFI_MODE_APSTA : WIFI_MODE_STA);
         s_retry = 0;
     }
+    return ap_apply();
+}
+
+/* 应急热点：没网、又要用户进控制台配网时把热点拉起来。
+ *
+ * ⚠️ 故意【不写 NVS】：用户自己关掉热点的偏好不该被开机流程悄悄改掉
+ *    （下次开机仍按用户的设置来）。只在"起播之前、确认没连上网"的分支里调。
+ * 返回 ESP_OK 表示这次热点是开着的（本来开着也算）。 */
+esp_err_t net_mgr_ap_rescue_on(void)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    if (s_ap_on) return ESP_OK;                 /* 本来就开着，什么都不用做 */
+    ESP_LOGW(TAG, "没网可用 —— 临时打开设备热点（不写 NVS，下次开机仍按用户设置）");
+    s_ap_on = true;
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
     return ap_apply();
 }
 
