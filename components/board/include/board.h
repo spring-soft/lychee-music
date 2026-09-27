@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
+#include "sdkconfig.h"   /* 板型开关 CONFIG_BOARD_VARIANT_* 在这里 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,10 +31,27 @@ extern "C" {
 #define BOARD_PIN_I2S_BCLK  41
 #define BOARD_PIN_I2S_WS    39
 #define BOARD_PIN_I2S_DOUT  40   /* ESP -> ES8388 DSDIN */
-/* BOARD_PIN_I2S_DIN 已删除：自制板不录音（ES8388 ADC 断电），I2S 通道是 TX-only，
- * 原 GPIO38 腾出来给 K1。board.c 里 i2s_fill_cfg() 的 din 改为 I2S_GPIO_UNUSED。 */
-/* BOARD_PIN_PA_EN 已删除：自制板去掉 PAM8406 功放，ES8388 内置耳放直推耳机。
- * board_pa_enable() 保留为空实现，以兼容调用方。 */
+
+/* ---- 板型差异（只有这 3 个引脚不同）
+ * 开关：CONFIG_BOARD_VARIANT_BREADBOARD（menuconfig → ESP-Music 配置，
+ *       或直接往 sdkconfig.local 里加一行 CONFIG_BOARD_VARIANT_BREADBOARD=y）
+ *       —— 不选就是自制 PCB V2。----------------------------------------------------
+ *                    面包板（开发板+音频模块）      自制 PCB V2
+ *   I2S_DIN          GPIO38（录音回读）              不接（ADC 断电，只发不收）
+ *   PA_EN            GPIO47（PAM8406 功放使能）      不接（无功放，耳放直推耳机）
+ *   KEY1             GPIO3（strapping 脚）           GPIO38（避开 strapping）
+ */
+#if CONFIG_BOARD_VARIANT_BREADBOARD
+#  define BOARD_HAS_PA_EN    1
+#  define BOARD_HAS_I2S_DIN  1
+#  define BOARD_PIN_I2S_DIN  38
+#  define BOARD_PIN_PA_EN    47
+#  define BOARD_PIN_KEY1     3    /* ⚠️ GPIO3 是 strapping 脚，开机按住会进 JTAG */
+#else   /* 自制 PCB V2 */
+#  define BOARD_HAS_PA_EN    0    /* 无功放：ES8388 内置耳放经耦合电容直推耳机 */
+#  define BOARD_HAS_I2S_DIN  0    /* 不录音：ES8388 ADC 已断电，I2S 只发不收 */
+#  define BOARD_PIN_KEY1     38   /* ⚠️ GPIO3 是 strapping 脚，上电被拉低会进 JTAG */
+#endif
 
 #define BOARD_PIN_LCD_SCLK  4
 #define BOARD_PIN_LCD_MOSI  5
@@ -42,8 +60,6 @@ extern "C" {
 #define BOARD_PIN_LCD_CS    15
 #define BOARD_PIN_LCD_BLK   16
 
-#define BOARD_PIN_KEY1      38   /* ⚠️ 自制板从 GPIO3 改到 GPIO38：GPIO3 是 strapping 脚，
-                                  *    上电被拉低会进 JTAG 下载模式。改板时必须同步改这里。 */
 #define BOARD_PIN_KEY2      8
 #define BOARD_PIN_KEY3      18
 #define BOARD_PIN_KEY4      17

@@ -1,5 +1,22 @@
 menu "ESP-Music 配置"
 
+    config BOARD_VARIANT_BREADBOARD
+        bool "板型 = 面包板（默认是自制 PCB V2）"
+        default n
+        help
+            只用一个 bool 而不是 Kconfig choice —— 因为 tools/sync_sdkconfig.py 是
+            【按行覆盖】的，对 choice 会留下"两个选项都是 y"的矛盾状态。
+
+            两块板只有 3 个引脚不同，其余完全一样（详见 components/board/include/board.h）：
+
+              引脚        面包板（开发板+音频模块）   自制 PCB V2
+              I2S_DIN     GPIO38（录音回读）          不接（ADC 断电，只发不收）
+              PA_EN       GPIO47（PAM8406 使能）      不接（无功放，耳放直推耳机）
+              KEY1        GPIO3（strapping 脚）       GPIO38（避开 strapping）
+
+            ⚠️ 换板型后请 `idf.py fullclean` 再编译 —— 引脚宏影响多个组件的条件编译，
+               增量编译容易留下旧目标文件。
+
     config APP_WIFI_SSID
         string "WiFi SSID（仅作首次开机的 NVS 默认值）"
         default ""
