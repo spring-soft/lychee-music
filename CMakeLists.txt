@@ -26,9 +26,27 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.forced"
     "${CMAKE_CURRENT_LIST_DIR}/tools/sync_sdkconfig.py"
 )
+# ⚠️ 必须明确指定用哪个 Python，不能裸写 python3：
+#    有的机器上 PATH 里的 python3/python 是 Microsoft Store 的占位程序，执行它
+#    既不产出也不报错（rc=0、无输出），下面这段就【静默跳过】。实测踩到：
+#    sdkconfig.forced 里的 4 项（NimBLE 角色裁剪、WiFi IRAM 优化）从来没生效过，
+#    而它们是 M7 蓝牙能不能跑起来的关键，不是调优项。
+#    ESP-IDF 自己的虚拟环境最可靠：export.bat / export.sh 之后 IDF_PYTHON_ENV_PATH 必然存在。
+if(DEFINED ENV{IDF_PYTHON_ENV_PATH})
+    file(TO_CMAKE_PATH "$ENV{IDF_PYTHON_ENV_PATH}" _idf_pyenv)
+    if(WIN32)
+        set(_sync_py "${_idf_pyenv}/Scripts/python.exe")
+    else()
+        set(_sync_py "${_idf_pyenv}/bin/python")
+    endif()
+endif()
+if(NOT _sync_py OR NOT EXISTS "${_sync_py}")
+    find_program(_sync_py NAMES python3 python)
+endif()
+
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.local" OR EXISTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.forced")
     execute_process(
-        COMMAND python3 "${CMAKE_CURRENT_LIST_DIR}/tools/sync_sdkconfig.py"
+        COMMAND "${_sync_py}" "${CMAKE_CURRENT_LIST_DIR}/tools/sync_sdkconfig.py"
         RESULT_VARIABLE _sync_rc
         OUTPUT_VARIABLE _sync_out
         ERROR_VARIABLE _sync_err
