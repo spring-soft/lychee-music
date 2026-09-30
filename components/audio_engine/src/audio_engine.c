@@ -380,7 +380,18 @@ static void decode_task(void *arg)
                              info.sample_rate, info.channel, info.bits_per_sample,
                              info.bitrate, info.frame_size);
                     if (board_i2s_get_rate() != info.sample_rate) {
-                        board_i2s_set_rate(info.sample_rate);   /* 换 I2S 时钟，不做重采样 */
+                        /* 换 I2S 时钟（同时会切 ES8388 的单速/双速档），不做重采样。
+                         * ★ 失败必须停：那是"采样率超出 ES8388 的 8k–96k"，继续下去
+                         *   就会拿旧时钟去放，表现是变调/怪声 —— 比明确报错难查得多。 */
+                        if (board_i2s_set_rate(info.sample_rate) != ESP_OK) {
+                            ESP_LOGE(TAG, "[dec] 采样率 %" PRIu32 " Hz 不受支持，停止播放",
+                                     info.sample_rate);
+                            /* ⚠️ 必须【两个都设】：循环靠 s_state 退出，只设 s_error
+                             *   会一直重试同一个错误 → 日志刷屏，而且继续按错误时钟放。 */
+                            s_error = true;
+                            s_state = AE_STATE_ERROR;
+                            continue;
+                        }
                     }
                 }
             }

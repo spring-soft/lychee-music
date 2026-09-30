@@ -63,6 +63,9 @@ static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 static i2s_chan_handle_t       s_tx  = NULL;
 static uint32_t                s_fs  = 48000;
+/* 硬件上 ES8388 寄存器 0x18 当前的值（单速 0x02 / 双速 0x20）。
+ * 跨档换采样率时要靠它判断需不需要重写，避免每次都多一轮 I2C。 */
+static int                     s_es_dacctrl2 = 0x02;
 static int                     s_i2c_retries = 0;
 static int                     s_es_init_fails = 0;
 static int                     s_vol_percent = 40;   /* 默认 40%：70% 时用户反馈"音量太大且底噪明显" */
@@ -284,6 +287,9 @@ static int es8388_init(void)
     if (v >= 0 && board_es8388_write_verified(R_DACCONTROL3, v & ~0x04) != ESP_OK) {
         fails++;
     }
+    /* 初始化表里 0x18 写的是 0x02（单速 / MCLK/fs=256），之后没有任何一条再动它。
+     * 把软件侧的记录同步过来 —— 否则上一首 96k 留下的 0x20 会让下次判断出错。 */
+    s_es_dacctrl2 = 0x02;
     s_es_init_fails = fails;
     ESP_LOGI(TAG, "[es8388] 初始化完成：失败 %d 项，I2C 累计重试 %d 次", fails, s_i2c_retries);
     return fails;
@@ -390,6 +396,47 @@ bool board_es8388_is_muted(void) { return s_user_muted; }
 
 /* ================================================================= I2S */
 
+/* ==================== 采样率 → 时钟方案 ====================
+ * ES8388 手册把 fs 分成两档，由寄存器 0x18 的 DACFsMode（bit5）选择：
+ *
+ *   单速   8k – 50kHz    MCLK/fs = 256   0x18 bit4:0 = 00010  → 0x02
+ *   双速  50k – 100kHz   MCLK/fs = 128   0x18 bit5=1 + 00000  → 0x20
+ *
+ * ⚠️ 换档【必须同时改两处】，只改一处不报错、只表现为没声音或严重失真：
+ *     1) ES8388 的 0x18   —— 它按哪个比值去解 MCLK
+ *     2) ESP32 的 mclk_multiple —— 它输出多快的 MCLK
+ *   之前 board_i2s_set_rate() 只改了 ESP32 那侧、压根不碰 ES8388，
+ *   所以只要放一个 96k 音源进来就是【静默出错】。
+ *
+ * bclk_div = mclk_multiple / (2 × 槽位宽)。当前是 16bit 数据装在 16bit 槽，立体声：
+ *     单速 256 / 32 = 8（与实测 WS 一致）
+ *     双速 128 / 32 = 4
+ *
+ * 注：ES8388 上限是 96kHz（官方手册 8k–96k，不是 192k）。*/
+#define BOARD_FS_MIN       8000
+#define BOARD_FS_MAX       96000
+#define BOARD_FS_MID       50000     /* 单速/双速分界 */
+
+typedef struct {
+    int      dacctrl2;        /* 写进 ES8388 寄存器 0x18 */
+    uint32_t mclk_multiple;   /* I2S_MCLK_MULTIPLE_xxx */
+    uint32_t bclk_div;
+} clk_plan_t;
+
+static clk_plan_t clk_plan_for(uint32_t fs)
+{
+    clk_plan_t p;
+    if (fs > BOARD_FS_MID) {
+        p.dacctrl2      = 0x20;   /* bit5=1 双速 + ratio 00000(=128) */
+        p.mclk_multiple = I2S_MCLK_MULTIPLE_128;
+    } else {
+        p.dacctrl2      = 0x02;   /* bit5=0 单速 + ratio 00010(=256) */
+        p.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    }
+    p.bclk_div = p.mclk_multiple / (2 * 16);   /* 16bit 数据 / 16bit 槽 / 立体声 */
+    return p;
+}
+
 static void i2s_fill_cfg(i2s_std_config_t *cfg, uint32_t fs)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -400,9 +447,10 @@ static void i2s_fill_cfg(i2s_std_config_t *cfg, uint32_t fs)
      *   所以 MCLK 只能从 160MHz 分数分频得到：48k 时 160/12.288 = 13.0208 不是整数，
      *   瞬时周期有抖动。XTAL(40MHz) 更差（40/12.288 = 3.255，抖动达 ±25ns）。
      *   结论：S3 上没法把 MCLK 做成整数分频，这条优化路径不存在。 */
+    clk_plan_t plan = clk_plan_for(fs);
     cfg->clk_cfg.clk_src        = I2S_CLK_SRC_DEFAULT;   /* = PLL_F160M */
-    cfg->clk_cfg.mclk_multiple  = I2S_MCLK_MULTIPLE_256;
-    cfg->clk_cfg.bclk_div       = 8;
+    cfg->clk_cfg.mclk_multiple  = plan.mclk_multiple;
+    cfg->clk_cfg.bclk_div       = plan.bclk_div;
     cfg->slot_cfg = (i2s_std_slot_config_t)
         I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
     cfg->slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
@@ -443,6 +491,19 @@ static esp_err_t i2s_reconfig(uint32_t sample_rate_hz)
     board_es8388_mute(true);
     vTaskDelay(pdMS_TO_TICKS(30));      /* 让 ES8388 的静音真的生效（内部有去加重/软斜坡） */
 
+    /* ★ 先让 ES8388 知道该按哪个 MCLK/fs 比值解，再改 ESP32 的时钟。
+     *   跨档（≤50k ↔ >50k）时必须重写 0x18，否则 ES8388 还按旧比值解新时钟
+     *   —— 表现是没声音或严重失真，而且不报任何错。 */
+    clk_plan_t plan = clk_plan_for(sample_rate_hz);
+    if (s_es_dacctrl2 != plan.dacctrl2) {
+        if (board_es8388_write_verified(R_DACCONTROL2, plan.dacctrl2) == ESP_OK) {
+            s_es_dacctrl2 = plan.dacctrl2;
+        } else {
+            ESP_LOGE(TAG, "[clk] ES8388 0x18 写 0x%02X 失败 —— %" PRIu32
+                          " Hz 可能失真（单速/双速没切过去）", plan.dacctrl2, sample_rate_hz);
+        }
+    }
+
     i2s_std_config_t cfg;
     i2s_fill_cfg(&cfg, sample_rate_hz);
     i2s_channel_disable(s_tx);
@@ -459,8 +520,10 @@ static esp_err_t i2s_reconfig(uint32_t sample_rate_hz)
     es_mute_apply();                    /* 用户静音要保持，不能在这里被解开 */
     /* 用 100ms 窗口量才准（20ms 窗口的量化误差能到几百 Hz，会误判成"时钟不准"） */
     int ws = board_measure_ws_hz(100);
-    ESP_LOGW(TAG, "[clk] 采样率切到 %" PRIu32 " Hz（已静音过渡）: %s，实测 WS=%d（偏差 %d Hz / %d‰）",
-             sample_rate_hz, esp_err_to_name(err), ws,
+    ESP_LOGW(TAG, "[clk] 采样率切到 %" PRIu32 " Hz（%s档, MCLK/fs=%" PRIu32 "）: %s，实测 WS=%d（偏差 %d Hz / %d‰）",
+             sample_rate_hz, plan.dacctrl2 == 0x20 ? "双速" : "单速",
+             plan.mclk_multiple / sample_rate_hz,
+             esp_err_to_name(err), ws,
              ws - (int)sample_rate_hz,
              (int)((int64_t)(ws - (int)sample_rate_hz) * 1000 / (int)sample_rate_hz));
     return err;
@@ -469,6 +532,13 @@ static esp_err_t i2s_reconfig(uint32_t sample_rate_hz)
 esp_err_t board_i2s_set_rate(uint32_t sample_rate_hz)
 {
     if (s_tx == NULL) return ESP_ERR_INVALID_STATE;
+    /* ES8388 只支持 8k–96k（官方手册，不是 192k）。超出范围就【拒绝】而不是
+     * 硬按错误的时钟放 —— 那样会变调/爆音，比明确报错难查得多。 */
+    if (sample_rate_hz < BOARD_FS_MIN || sample_rate_hz > BOARD_FS_MAX) {
+        ESP_LOGE(TAG, "[clk] 采样率 %" PRIu32 " Hz 超出 ES8388 能力（%d–%d Hz），拒绝切换",
+                 sample_rate_hz, BOARD_FS_MIN, BOARD_FS_MAX);
+        return ESP_ERR_INVALID_ARG;
+    }
     if (sample_rate_hz == s_fs) return ESP_OK;
     return i2s_reconfig(sample_rate_hz);
 }
