@@ -535,7 +535,10 @@ static void mem_render(void)
     size_t use = tot - fre;
     unsigned pct = tot ? (unsigned)(use * 100 / tot) : 0;
     char buf[48];
-    snprintf(buf, sizeof(buf), "PSRAM  %u/%u KB  %u%%",
+    /* ⚠️ 这行文字要短：12px 字体下 23 个字符就会超出 150px 被截断
+     *    （实测 "PSRAM  2995/8192 KB  36%" 显示不全）。
+     *    现在用紧凑写法 + 拉丁字体（比中文字体的拉丁字符窄），一行放得下。*/
+    snprintf(buf, sizeof(buf), "PSRAM %u/%uK %u%%",
              (unsigned)(use / 1024), (unsigned)(tot / 1024), pct);
     ui_set_text(s_mem_lbl_psram, buf);
     if (lv_bar_get_value(s_mem_bar_psram) != pct) lv_bar_set_value(s_mem_bar_psram, pct, LV_ANIM_OFF);
@@ -545,7 +548,7 @@ static void mem_render(void)
     fre = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     use = tot - fre;
     pct = tot ? (unsigned)(use * 100 / tot) : 0;
-    snprintf(buf, sizeof(buf), "SRAM   %u/%u KB  %u%%",
+    snprintf(buf, sizeof(buf), "SRAM %u/%uK %u%%",
              (unsigned)(use / 1024), (unsigned)(tot / 1024), pct);
     ui_set_text(s_mem_lbl_sram, buf);
     if (lv_bar_get_value(s_mem_bar_sram) != pct) lv_bar_set_value(s_mem_bar_sram, pct, LV_ANIM_OFF);
@@ -563,9 +566,11 @@ static void build_mem_screen(void)
 
     /* 两块内存各一行字 + 一条进度条。PSRAM 蓝、SRAM 橙 —— 颜色区分开，
      * 不然两条长得一样，一眼分不清哪条是哪条。 */
-    s_mem_lbl_psram = ui_put_label_1line(scr, "", 6, 26, 150, ui_font_12, 0x3C3C40);
+    /* 这两行全是 ASCII（PSRAM/SRAM + 数字），所以用拉丁字体 ——
+     * 比中文字体的拉丁字符窄一截，长的数字行才放得下（见 mem_render 的注释）。*/
+    s_mem_lbl_psram = ui_put_label_1line(scr, "", 5, 26, 152, ui_font_lat, 0x3C3C40);
     s_mem_bar_psram = mem_make_bar(scr, 42, 0x1A73E8);
-    s_mem_lbl_sram  = ui_put_label_1line(scr, "", 6, 66, 150, ui_font_12, 0x3C3C40);
+    s_mem_lbl_sram  = ui_put_label_1line(scr, "", 5, 66, 152, ui_font_lat, 0x3C3C40);
     s_mem_bar_sram  = mem_make_bar(scr, 82, 0xC77700);
 
     ESP_LOGI(TAG, "内存用量页已建好（PSRAM + 内部 SRAM 两条进度条）");
