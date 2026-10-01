@@ -461,12 +461,21 @@ esp_err_t subsonic_star(const char *song_id, bool on)
  * 判据用 Subsonic 返回的 suffix（sub_song_t.suffix，列表/搜索/单曲接口里都带），
  * 不需要额外发请求。
  *
- * ⚠️ 只列【本固件确实解得了】的常见音乐后缀（解码器见 sdkconfig.forced）：
+ * ⚠️ 只列【本固件确实解得动、且实测跑通过】的：
  *     mp3  → MP3 解码器
- *     flac → FLAC 解码器
- *     ogg  → Vorbis 解码器（曲库 99 首）
+ *     flac → FLAC 解码器   ← 实机验证通过（44.1k/24bit，181KB/s，欠载 0）
  *     aac  → AAC 解码器（裸 ADTS）
  *     m4a  → AAC 或 ALAC 解码器（两个都开了，所以 m4a 不再是歧义后缀）
+ *
+ * ❌ 【ogg 暂时不在名单里】—— 2026-10-01 实机踩到：
+ *    Vorbis 解码器【已经能打开并解出首批 PCM】（日志里解析出了 44100/2ch/16bit，
+ *    起播时 ring_pcm 攒到 130KB），但随后【停止消费】—— ring_in 涨满 512KB、
+ *    解码消耗掉到 0，同时内部 SRAM 掉到 6~13KB，WiFi 的 net80211 开始刷
+ *    "m f null"（该字符串来自闭源 libnet80211.a，判断是分配失败）。
+ *    结果就是卡死后一直灌静音、欠载计数飙升。
+ *    嫌疑最大的是 Vorbis 解码器对内部 SRAM 的占用把 WiFi 挤爆了，
+ *    但没在板上定位到确凿证据，先回退成"服务端转码"（那本来是好的）。
+ *    要重试的话：盯住 Vorbis 解码器的内部分配（是否走了 MALLOC_CAP_INTERNAL）。
  *
  * ⚠️ 组件里【根本没有】WMA / APE / DSD 的解码器 —— 这些后缀无论怎么配都解不了，
  *    必须交给服务端转码（脱机插 TF 卡时就是放不了，不是配置问题）。
@@ -480,7 +489,6 @@ static bool suffix_direct_playable(const char *suffix)
     if (!suffix || !suffix[0]) return false;
     return !strcasecmp(suffix, "mp3")  ||
            !strcasecmp(suffix, "flac") ||
-           !strcasecmp(suffix, "ogg")  ||
            !strcasecmp(suffix, "aac")  ||
            !strcasecmp(suffix, "m4a");
 }
