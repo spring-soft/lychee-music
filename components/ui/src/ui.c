@@ -900,8 +900,13 @@ static void cover_mark_bad(const char *id)
  *                                识破碰撞（撞了就当没缓存，重新下，不显示错封面）
  */
 #define COVER_HDR        48
-#define COVER_CACHE_MAX  300
-#define COVER_CACHE_KEEP 240
+/* 封面缓存的限额（用户要求 300 → 100 张）。
+ * 每张 = 48B 头 + 72×72×2 = 10.4 KB，所以 100 张 ≈ **1.04 MB**，
+ * 只占 cache 分区（6.125MB）的六分之一 —— 剩下的留给最近播放/收藏列表，
+ * 以及将来离线曲库的索引文件。
+ * 淘汰留 20% 余量（100 → 80），免得一超限就每存一张淘汰一次。*/
+#define COVER_CACHE_MAX  100
+#define COVER_CACHE_KEEP 80
 
 /* 像素数据在缓冲里的位置（缓冲前面 48 字节是文件头） */
 #define COVER_PIX (s_cover_buf + COVER_HDR)
