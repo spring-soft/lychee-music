@@ -59,6 +59,8 @@ const lv_font_t *ui_font_lat = &lv_font_montserrat_12;
 
 /* 播放页控件（build_play_screen 里赋值，play_refresh 里更新） */
 static lv_obj_t *s_lbl_title, *s_lbl_artist, *s_lbl_time_cur, *s_lbl_time_tot;
+/* 时间行中间那块空档：显示解码格式与音频规格（例 "FLAC 44.1k/16"） */
+static lv_obj_t *s_lbl_spec;
 static lv_obj_t *s_bar, *s_img_cover, *s_img_state, *s_img_star;
 
 /* 屏幕注册表：4 个页面开机全建好，切换只 lv_screen_load（运行时绝不建/删 widget） */
@@ -626,6 +628,33 @@ static void play_refresh(void)
     ui_fmt_mmss(pos, buf, sizeof(buf));
     ui_set_text(s_lbl_time_cur, buf);
 
+    /* 音频规格那行：<解码格式> <采样率>/<源位深>，如 "FLAC 44.1k/16"。
+     * ⚠️ 只在内容真的变了才写 —— 这里每秒都会跑一遍，无条件 set_text 会让
+     *    LVGL 每次都把这块重绘一遍，白白吃内部 SRAM 带宽（见 README 的内存说明）。 */
+    {
+        const char *fmt = audio_engine_format_str();
+        /* 缓冲留得比"实际会出现的长度"宽 —— 本工程开了 -Werror=format-truncation，
+         * 而 GCC 无法从 `const char *fmt` 推断长度，必须靠 %.7s 限长 + 足够大的缓冲
+         * 才能证明不会截断。7 个字符也正好够 MP3/FLAC/AAC/Opus/Vorbis/ALAC/PCM。 */
+        char spec[48];
+        if (!fmt || !strcmp(fmt, "none")) {
+            spec[0] = 0;                       /* 没在放 → 留空，别显示上一次的残留 */
+        } else {
+            /* 采样率写成 44.1k / 48k / 96k：以 0.1kHz 为单位四舍五入，整数就不带小数点 */
+            unsigned k10 = (unsigned)((audio_engine_sample_rate() + 50) / 100);
+            char rate[16];
+            if (k10 % 10 == 0) snprintf(rate, sizeof(rate), "%uk", k10 / 10);
+            else               snprintf(rate, sizeof(rate), "%u.%uk", k10 / 10, k10 % 10);
+            /* 位深取的是【源文件】的（audio_engine_bit_depth 的注释说明了为什么） */
+            snprintf(spec, sizeof(spec), "%.7s %s/%u", fmt, rate, audio_engine_bit_depth());
+        }
+        static char last_spec[48];
+        if (strcmp(spec, last_spec) != 0) {
+            strlcpy(last_spec, spec, sizeof(last_spec));
+            ui_set_text(s_lbl_spec, spec);
+        }
+    }
+
     /* 收藏状态（长按 K1 之后要立刻反映） */
     static bool last_starred;
     if (force || st.starred != last_starred) {
@@ -686,6 +715,14 @@ static void build_play_screen(void)
                                  LV_LABEL_LONG_MODE_CLIP);
     s_lbl_time_tot = ui_put_label(scr, "0:00", 126, 100, 0, ui_font_lat, 0x6E6E73,
                                  LV_LABEL_LONG_MODE_CLIP);
+
+    /* 时间行中间的空档（x 38..124，左右两个时间都够不着）：显示解码格式与音频规格。
+     * 起点取 38 而不是 32 —— 已播时间可能长到 "12:34"（约 30px，5..35），32 会蹭上。
+     * 颜色比左右两个时间浅一档，让它读起来是"次要信息"。
+     * CLIP 而不是滚动：这行是"扫一眼"的，滚动反而烦；超长就截断。 */
+    s_lbl_spec = ui_put_label(scr, "", 38, 100, 86, ui_font_lat, 0x9A9AA0,
+                              LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_style_text_align(s_lbl_spec, LV_TEXT_ALIGN_CENTER, 0);
 
     /* 底部全宽细进度条（槽在底图里，这里只画填充，重绘面积=进度条本身） */
     s_bar = lv_bar_create(scr);

@@ -59,6 +59,11 @@ void       audio_engine_set_pos_base(uint32_t ms);
 /* 已解码出的总时长（ms）—— 进度/时长参考（M2 起用 Subsonic 的 duration 更准） */
 uint32_t   audio_engine_decoded_ms(void);
 uint32_t   audio_engine_sample_rate(void);
+/* 解码器报出来的【源文件】位深（播放页显示用）。
+ * ⚠️ 注意这不是"到达 ES8388 的位深" —— ae_normalize() 会把 24/32bit 截成 16bit
+ *    再送进 I2S（I2S 槽也是写死的 16bit）。显示源位深是为了让用户看清【文件的质量】，
+ *    24 说明这是高解析文件，不代表芯片真的按 24bit 在放。 */
+uint8_t    audio_engine_bit_depth(void);
 int        audio_engine_underruns(void);
 /* 诊断：网络取流 / 解码消耗的累计字节数（配合时间算速率，见 .c 里的 rate_log） */
 uint64_t   audio_engine_fetch_bytes(void);

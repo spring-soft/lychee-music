@@ -667,6 +667,8 @@ const char *audio_engine_format_str(void)
     return esp_audio_simple_dec_get_name(s_type);
 }
 
+uint8_t audio_engine_bit_depth(void) { return s_bits; }
+
 uint32_t audio_engine_position_ms(void)
 {
     uint32_t f = s_frames_out;
