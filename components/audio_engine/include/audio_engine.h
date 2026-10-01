@@ -69,6 +69,9 @@ int        audio_engine_underruns(void);
 uint64_t   audio_engine_fetch_bytes(void);
 uint64_t   audio_engine_decode_bytes(void);
 size_t     audio_engine_ring_used_in(void);
+/* ring_in 的总容量（字节）。屏幕/网页要显示"缓冲占用百分比"就得知道分母 ——
+ * 别在 UI 侧硬编码 512KB，那是 audio_engine.c 里的 RING_IN_BYTES，改了会不一致。 */
+size_t     audio_engine_ring_in_cap(void);
 size_t     audio_engine_ring_used_pcm(void);
 size_t     audio_engine_ring_in_high_water(void);
 bool       audio_engine_is_error(void);

@@ -669,6 +669,8 @@ const char *audio_engine_format_str(void)
 
 uint8_t audio_engine_bit_depth(void) { return s_bits; }
 
+size_t audio_engine_ring_in_cap(void) { return RING_IN_BYTES; }
+
 uint32_t audio_engine_position_ms(void)
 {
     uint32_t f = s_frames_out;

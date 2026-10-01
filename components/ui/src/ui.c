@@ -679,9 +679,13 @@ static void play_refresh(void)
         lv_obj_set_style_text_color(s_lbl_mode,
                                     lv_color_hex(raw ? 0x1B7F3B : 0xC77700), 0);
         char nbuf[20];
-        /* 速率/缓冲水位：缓冲掉到 0 就是欠载的前兆，能提前看出来 */
-        snprintf(nbuf, sizeof(nbuf), "%uK/%uK",
-                 (unsigned)kbs, (unsigned)(audio_engine_ring_used_in() / 1024));
+        /* 速率 + 缓冲占用【百分比】（用户要求：别显示 KB，看百分比更直观）。
+         * 分母取 audio_engine_ring_in_cap() 而不是硬编码 512 —— 那个常量在
+         * audio_engine.c 里，改了这边会自动跟上。
+         * 百分比掉到 0 就是欠载的前兆，能提前看出来。 */
+        size_t cap = audio_engine_ring_in_cap();
+        unsigned pct = cap ? (unsigned)(audio_engine_ring_used_in() * 100 / cap) : 0;
+        snprintf(nbuf, sizeof(nbuf), "%uK %u%%", (unsigned)kbs, pct);
         ui_set_text(s_lbl_net, nbuf);
     }
 

@@ -47,6 +47,18 @@ int         subsonic_max_kbps(void);
  *    而续播带 timeOffset，按规则必然落到转码 —— 所以直出播放中途一旦断流，
  *    这个值会翻成 false，屏幕上就会看到"转码"。 */
 bool subsonic_last_raw(void);
+
+/* ---------- 音质挡位 ----------
+ * 放在 subsonic 层而不是 UI 层：屏幕菜单和网页控制台都要用同一套挡位，
+ * 各写一份必然不一致（UI 是上层，网页控制台不能 include ui）。
+ *
+ * 挡位本质上就是"要不要转码 + 转码码率"两个设置，对应 /rest/stream 的
+ * format= 和 maxBitRate=。set 会立刻生效并写 NVS(ns "nav")，重启保留。
+ */
+int         subsonic_quality_count(void);
+const char *subsonic_quality_name(int i);    /* 越界返回 "" */
+int         subsonic_quality_current(void);  /* 认不出来就返回 0（无损优先）*/
+esp_err_t   subsonic_quality_set(int i);
 bool        subsonic_configured(void);
 
 /* 连通性 + 服务器信息（/rest/ping）。server_info 失败时带回原因（如鉴权失败的消息） */

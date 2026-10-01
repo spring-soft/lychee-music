@@ -256,6 +256,11 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(au, "bits", audio_engine_bit_depth());
     cJSON_AddBoolToObject(au, "raw", subsonic_last_raw());
     cJSON_AddNumberToObject(au, "ring_kb", audio_engine_ring_used_in() / 1024);
+    /* 缓冲占用百分比（前端显示用；分母从引擎取，别在前端硬编码 512）*/
+    size_t ring_cap = audio_engine_ring_in_cap();
+    cJSON_AddNumberToObject(au, "ring_pct",
+                            ring_cap ? (double)audio_engine_ring_used_in() * 100.0 / ring_cap : 0);
+    cJSON_AddNumberToObject(au, "qual", subsonic_quality_current());   /* 当前音质挡位下标 */
     cJSON_AddNumberToObject(au, "underruns", audio_engine_underruns());
 
     cJSON *q = cJSON_AddObjectToObject(o, "queue");
@@ -563,6 +568,28 @@ static esp_err_t h_bright(httpd_req_t *req)
     cJSON_Delete(b);
     if (v < 5 || v > 100) return fail(req, "400 Bad Request", "bright 要在 5..100");
     player_set_brightness(v);
+    return ok_json(req);
+}
+
+/* 音质挡位：GET 拿当前值和全部挡位名，POST {"i":N} 设置。
+ * 挡位表在 subsonic 层，和屏幕菜单用的是同一套 —— 不会出现两边不一致。
+ * 立刻生效并存 NVS(ns "nav")，所以前端不用再点"应用"。 */
+static esp_err_t h_quality(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "i", subsonic_quality_current());
+        cJSON *a = cJSON_AddArrayToObject(o, "items");
+        for (int i = 0; i < subsonic_quality_count(); i++) {
+            cJSON_AddItemToArray(a, cJSON_CreateString(subsonic_quality_name(i)));
+        }
+        return send_json(req, o);
+    }
+    cJSON *b = read_body(req);
+    if (b == NULL) return fail(req, "400 Bad Request", "请求体不是合法 JSON");
+    int i = json_int(b, "i", -1);
+    cJSON_Delete(b);
+    if (subsonic_quality_set(i) != ESP_OK) return fail(req, "400 Bad Request", "挡位越界");
     return ok_json(req);
 }
 
@@ -908,6 +935,9 @@ esp_err_t web_console_start(void)
         { .uri = "/api/mute",            .method = HTTP_POST, .handler = h_mute },
         { .uri = "/api/bright",          .method = HTTP_POST, .handler = h_bright },
         { .uri = "/api/source",          .method = HTTP_POST, .handler = h_source },
+        /* 音质挡位：GET 读、POST 写，同一个处理器按 method 分支 */
+        { .uri = "/api/quality",         .method = HTTP_GET,  .handler = h_quality },
+        { .uri = "/api/quality",         .method = HTTP_POST, .handler = h_quality },
         { .uri = "/api/star",            .method = HTTP_POST, .handler = h_star },
         { .uri = "/api/hid",             .method = HTTP_GET,  .handler = h_hid },
         { .uri = "/api/hid",             .method = HTTP_POST, .handler = h_hid_set },

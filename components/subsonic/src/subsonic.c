@@ -75,6 +75,49 @@ int         subsonic_max_kbps(void) { return s_max_kbps; }
 static bool s_last_raw = false;
 bool subsonic_last_raw(void) { return s_last_raw; }
 
+/* ---------- 音质挡位 ----------
+ * ⚠️ 放在这一层而不是 UI 层：屏幕菜单和网页控制台共用同一套挡位。
+ *    网页控制台在 ui 的下层结构里不能 include ui，各写一份必然会不一致。
+ *
+ * "强制无损" = format=raw，服务端一个字节不改。两个代价：
+ *   1) raw 流不支持定位 → seek 失效
+ *   2) 源文件是固件解不了的格式（WMA/APE/DSD）→ 直接放不出声
+ * 日常用"无损优先"就够 —— 它已经能直出 FLAC/MP3/OGG/AAC/M4A。 */
+typedef struct { const char *name; const char *tc; int kbps; } qual_t;
+
+static const qual_t k_qual[] = {
+    { "无损优先", "auto", 320 },
+    { "强制无损", "raw",  320 },
+    { "高音质",   "mp3",  320 },
+    { "标准",     "mp3",  192 },
+    { "省流",     "mp3",  128 },
+};
+
+int subsonic_quality_count(void) { return (int)(sizeof(k_qual) / sizeof(k_qual[0])); }
+
+const char *subsonic_quality_name(int i)
+{
+    return (i >= 0 && i < subsonic_quality_count()) ? k_qual[i].name : "";
+}
+
+int subsonic_quality_current(void)
+{
+    int n = subsonic_quality_count();
+    for (int i = 0; i < n; i++) {
+        if (strcmp(s_transcode, k_qual[i].tc) != 0) continue;
+        /* raw 不看码率（服务端不转码，这个值没意义），其余要码率也对上 */
+        if (!strcmp(s_transcode, "raw") || k_qual[i].kbps == s_max_kbps) return i;
+    }
+    return 0;
+}
+
+esp_err_t subsonic_quality_set(int i)
+{
+    if (i < 0 || i >= subsonic_quality_count()) return ESP_ERR_INVALID_ARG;
+    /* host/user/pass 传 NULL = 保持原值不动，只改转码设置 */
+    return subsonic_set_config(NULL, NULL, NULL, k_qual[i].tc, k_qual[i].kbps);
+}
+
 /* u/t/s 认证参数（salt 每次随机，t = md5(pass+salt) 小写 hex） */
 static void append_auth_ex(char *url, size_t len, const char *user, const char *pass)
 {

@@ -95,6 +95,11 @@ svg{display:block;}
 .pspec{font-size:12px;margin-top:2px;color:var(--icon);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums;}
 .pspec.raw{color:#1B7F3B;}
 .pspec.tc{color:#C77700;}
+/* 音质挡位按钮组：选中的那个高亮。换行排，窄屏也放得下 */
+.qrow{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;}
+.qbtn{font-size:13px;line-height:28px;padding:0 12px;border-radius:8px;border:1px solid var(--line);
+      background:transparent;color:var(--fg);cursor:pointer;}
+.qbtn.on{background:var(--accent-bg);color:var(--accent);border-color:var(--accent);font-weight:600;}
 .prow2{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:6px;min-height:38px;}
 .pill{font-size:11px;line-height:18px;padding:0 8px;border-radius:9px;background:var(--accent-bg);color:var(--accent);white-space:nowrap;flex:none;}
 .pill.gray{background:var(--press);color:var(--muted);}
@@ -434,6 +439,17 @@ input.sw:checked::after{transform:translateX(18px);}
 
   <!-- ================= Tab 3：设置 ================= -->
   <section id="pg-set" class="pg" hidden>
+
+    <!-- 音质挡位：和屏幕菜单用的是同一套（挡位表在 subsonic 层），点了立刻生效 -->
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-qual"><span>音质</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-qual" hidden>
+        <div class="qrow" id="qual-row"></div>
+        <div class="msg" id="qual-msg"></div>
+        <div class="hint">「无损优先」能直出就直出（FLAC/MP3/OGG/AAC/M4A），其余交给服务器转码。
+          「强制无损」绝不转码，但 <b>seek 会失效</b>，且解不了的格式（WMA/APE/DSD）放不出声。</div>
+      </div>
+    </div>
 
     <div class="card acc-card">
       <button class="acc" data-pn="pn-nav"><span>Navidrome 服务器</span><span class="chev" data-chev></span></button>
@@ -887,7 +903,8 @@ function renderSong(){
                                           : ((au.fs / 1000).toFixed(1) + 'k');
     var txt = (au.raw ? '无损直出 ' : '转码 ') + au.fmt
             + (rate ? ' ' + rate : '') + (au.bits ? '/' + au.bits : '');
-    if(typeof au.ring_kb === 'number') txt += '  ·  缓冲 ' + au.ring_kb + 'K';
+    /* 缓冲显示成【占用百分比】（用户要求，别显示 KB）——分母由后端给 */
+    if(typeof au.ring_pct === 'number') txt += '  ·  缓冲 ' + Math.round(au.ring_pct) + '%';
     if(au.underruns) txt += '  ·  欠载 ' + au.underruns;
     spEl.textContent = txt;
     spEl.className = 'pspec ' + (au.raw ? 'raw' : 'tc');
@@ -2079,6 +2096,35 @@ function bindEvents(){
   });
 
   /* Navidrome */
+  /* ---- 音质挡位 ----
+   * 挡位表和屏幕菜单共用（在 subsonic 层），所以两边显示的名字一定一致。
+   * 点一下立刻生效并存 NVS，不需要再点"保存"。 */
+  function renderQuality(){
+    var box = $('qual-row');
+    if(!box || !S.quals) return;
+    box.innerHTML = '';
+    (S.quals.items || []).forEach(function(nm, i){
+      var b = document.createElement('button');
+      b.className = 'qbtn' + (i === S.quals.i ? ' on' : '');
+      b.textContent = nm;
+      b.onclick = function(){
+        post('/api/quality', {i: i}).then(function(){
+          setMsg('qual-msg', '已切换：' + nm, 'ok');
+          loadQuality();
+        }, function(e){
+          setMsg('qual-msg', '切换失败：' + e.message, 'err');
+        });
+      };
+      box.appendChild(b);
+    });
+  }
+  function loadQuality(){
+    api('/api/quality', {}, 8000).then(function(d){ S.quals = d; renderQuality(); },
+                                      function(){});
+  }
+  S.loadQuality = loadQuality;      /* 切到设置页时拉一次（见页面切换处）*/
+  loadQuality();
+
   $('cfg-save').onclick = saveConfig;
   $('cfg-test').onclick = testConfig;
   $('cfg-pass').addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); saveConfig(); } });

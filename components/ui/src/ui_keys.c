@@ -166,6 +166,15 @@ static void key_short(int k)
             }
             break;
 
+        case UI_PAGE_QUALITY:                   /* 音质二级菜单 */
+            switch (k) {
+                case 0: ui_qualmenu_move(-1); break;
+                case 1: ui_qualmenu_move(+1); break;
+                case 2: ui_qualmenu_activate(); break;  /* 确定并退回主菜单 */
+                default: break;              /* K4 由 k4_navigate 管 */
+            }
+            break;
+
         case UI_PAGE_SETTINGS:                  /* 设置二级菜单 */
             switch (k) {
                 case 0: ui_setmenu_move(-1); break;
