@@ -14,6 +14,17 @@
  *    按下用 esp_hidd_dev_input_set()，20ms 后用一次性 esp_timer 发全零释放。
  *    （主机把一直按着的位当成"长按"，不释放会出现"上一首一直跳"。）
  */
+#include "sdkconfig.h"
+
+/* 2026-10-01：BLE 默认编掉了 —— 内部 SRAM 不够用，要让给 WiFi 接收缓冲。
+ * 直出无损需要持续 ~200 KB/s，而 WiFi 的 RX 缓冲必须在内部 SRAM 里，
+ * 原先只敢配 4/16（默认 10/32）就是被 BLE 的 40KB 逼的。
+ * 关掉 CONFIG_BT_ENABLED 后，核心网卡缓冲能配到 8/48 + BA 窗口 16，
+ * 实测峰值吞吐从 ~100 KB/s 提到 ~194 KB/s。
+ * 代价：K4 的"蓝牙控制"页显示"不可用"，功能降级但不崩。
+ * 要恢复：把 sdkconfig.forced 里的 CONFIG_BT_ENABLED 去掉即可（其余不用改）。 */
+#if CONFIG_BT_ENABLED
+
 #include <string.h>
 #include "hid_remote.h"
 #include "esp_log.h"
@@ -398,3 +409,27 @@ const char *hid_remote_state_str(void)
 const char *hid_remote_peer_name(void) { return s_peer; }
 
 int hid_remote_sent_count(void) { return s_sent; }
+
+#else   /* !CONFIG_BT_ENABLED —— 全部编成空实现
+         *
+         * UI 侧不用改：hid_remote_available() 返回 false 之后，
+         * "蓝牙控制"页会显示"不可用"，K4 长按进不去那一页，
+         * 播放页的按键语义也自动回落到普通播放控制（ui_keys.c 里判的就是这个）。
+         * 这样"砍 BLE"只丢功能、不留半死状态。 */
+
+#include <stdbool.h>
+#include "esp_err.h"
+#include "hid_remote.h"
+
+esp_err_t   hid_remote_init(void)        { return ESP_OK; }
+bool        hid_remote_available(void)   { return false; }
+bool        hid_remote_connected(void)   { return false; }
+bool        hid_remote_mode(void)        { return false; }
+void        hid_remote_set_mode(bool on) { (void)on; }
+bool        hid_remote_active(void)      { return false; }
+void        hid_remote_send(hid_key_t k) { (void)k; }
+const char *hid_remote_state_str(void)   { return "不可用"; }
+const char *hid_remote_peer_name(void)   { return ""; }
+int         hid_remote_sent_count(void)  { return 0; }
+
+#endif  /* CONFIG_BT_ENABLED */

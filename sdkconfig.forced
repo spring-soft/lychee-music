@@ -152,3 +152,45 @@ CONFIG_AUDIO_DECODER_ADPCM_SUPPORT=y
 #    WiFi/lwIP 的分配会先走 PSRAM（现在还有 5.2MB 空闲）。别把那条关掉，
 #    关了以后这个窗口会把内部 SRAM（只剩 13KB）撑爆。
 CONFIG_LWIP_TCP_WND_DEFAULT=32768
+
+# ===== WiFi 接收缓冲：从省 SRAM 的保守值调回接近默认 =====
+#
+# 2026-10-01 实机定位：ESP32 拉流稳定在 **100~130 KB/s（约 1Mbps）**，
+# 而同一台服务器、同一个局域网，电脑能拉到 **4101 KB/s** —— 服务器和 LAN 都没问题，
+# 瓶颈是 WiFi 接收缓冲。
+#
+# 原因：这两条被砍到默认值的 40%（默认 10 / 32）：
+#     ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+#     ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+# 16 × 1.6KB ≈ 26KB 的接收缓冲，**TCP 窗口开再大也填不满**（这就是为什么前面
+# 把 TCP_WND 提到 32KB 并没有真正提上去 —— 那个改动的验证是撞上了一首低码率的歌，
+# 网络刚好配得上，看起来像成功）。
+#
+# 这不是原作者疏忽，是**为省内部 SRAM 给 BLE 让路**的有意取舍（BLE 要 40KB）。
+# 所以这一条是"把吞吐换回来"，代价是内部 SRAM —— 开机日志里会看到余量掉多少，
+# 如果掉到 0 或 BLE 起不来，就把这两条调回去，改用"按码率决定要不要直出"的策略。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=48
+# 接收方向的块确认窗口：默认 6 —— 太小，AMPDU 聚合不起来，吞吐上不去。
+# 实测把它和其他缓冲一起放大后，峰值从 ~100 KB/s 提到 194 KB/s。
+# 上限受 DYNAMIC_RX_BUFFER_NUM 约束（要 ≤ 它），48 配 16 是安全组合。
+CONFIG_ESP_WIFI_RX_BA_WIN=16
+# 发送方向同理由（HTTP 请求本身很小，但确认包走同一条路）
+CONFIG_ESP_WIFI_TX_BA_WIN=16
+
+# ===== 关掉 BLE，把内部 SRAM 让给 WiFi（2026-10-01 用户拍板）=====
+#
+# 直出无损要持续 ~200 KB/s，而 WiFi 的接收缓冲是 DMA 目标，**必须在内部 SRAM**。
+# 原先只敢配 4/16（默认 10/32），就是被 BLE 的 ~40KB 逼的。
+#
+# 关掉之后把 RX 缓冲放到 8/48 + BA 窗口 16，实测峰值吞吐 ~100 → ~194 KB/s。
+#
+# 代价：K4 的"蓝牙控制"页显示"不可用"（hid_remote.c 在 !CONFIG_BT_ENABLED 时
+# 编成空实现，UI 侧不用改，功能优雅降级）。
+#
+# 要恢复蓝牙遥控：删掉下面这行即可 —— hid_remote.c 和它的 CMakeLists 都按
+# CONFIG_BT_ENABLED 条件编译，不需要改任何代码。
+#
+# ⚠️ 恢复 BLE 后 WiFi 缓冲会被重新挤小，高码率 FLAC 会重新开始卡；
+#    那时应该同时把 subsonic.c 里的 DIRECT_PLAY_MAX_KBS 调低。
+CONFIG_BT_ENABLED=n

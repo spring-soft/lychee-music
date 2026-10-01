@@ -493,6 +493,33 @@ static bool suffix_direct_playable(const char *suffix)
            !strcasecmp(suffix, "m4a");
 }
 
+/* ---------- 码率闸门：码率过高的源不直出，交给服务端转码 ----------
+ *
+ * 为什么需要它：直出无损要求【持续】吞吐跟得上源文件码率，而 ESP32-S3 的
+ * WiFi 拉流是有上限的 —— 实测把 RX 缓冲调到 8/48、BA 窗口 16 之后，
+ * 峰值也只有 **194 KB/s 左右**（原始保守配置只有 ~100 KB/s）。
+ *
+ * 实测踩到的例子：一首 48kHz/1623kbps 的 FLAC 需要 203 KB/s，
+ * 正好卡在临界点上 —— ring_in 被一路抽干、欠载从 0 涨到 488。
+ * 听感就是不停卡顿，比转码难听得多。
+ *
+ * 所以规则改成"码率放得下才直出"：
+ *     需要吞吐 KB/s = size / duration_s / 1024
+ * 超过 DIRECT_PLAY_MAX_KBS 就走转码（有损但不卡）。
+ *
+ * ⚠️ 这个阈值是实测出来的，不是拍的：峰值 194 KB/s 留一半余量取 120
+ *    （约 960kbps）。BLE 砍掉之后 WiFi 缓冲还能再放大，那时可以往上调 ——
+ *    但**别贴着峰值设**，WiFi 抖动是常态，贴着就会周期性卡。 */
+#define DIRECT_PLAY_MAX_KBS  120
+
+static bool bitrate_fits_direct(const sub_song_t *song)
+{
+    /* 缺元数据就不拦（宁可试一把，也别把能放的都拦掉） */
+    if (song->duration_s == 0 || song->size == 0) return true;
+    uint32_t kbs = song->size / song->duration_s / 1024;
+    return kbs <= DIRECT_PLAY_MAX_KBS;
+}
+
 /* offset_s = 0 时不带 timeOffset */
 static esp_err_t stream_url_ex(const sub_song_t *song, int max_kbps, uint32_t offset_s,
                                char *out, size_t out_len)
@@ -510,7 +537,14 @@ static esp_err_t stream_url_ex(const sub_song_t *song, int max_kbps, uint32_t of
         /* ★ seek 必须转码：raw 流不吃 timeOffset（会被服务端静默忽略，表现为
          *   "seek 之后从头播"），而转码流又拿不到 Accept-Ranges。两者只能二选一，
          *   所以规则是"平时直出、seek 时转码"。 */
-        raw = (offset_s == 0) && suffix_direct_playable(song->suffix);
+        raw = (offset_s == 0) && suffix_direct_playable(song->suffix) && bitrate_fits_direct(song);
+        /* 因为码率被拦下来时打一行 —— 否则用户只会看到"这歌怎么变成 MP3 了"，
+         * 却不知道为什么。日志里能直接看到需要多少、上限多少。 */
+        if ((offset_s == 0) && suffix_direct_playable(song->suffix) && !bitrate_fits_direct(song)) {
+            ESP_LOGI(TAG, "[stream] %s 需要 %u KB/s，超过直出上限 %d KB/s → 转码",
+                     song->suffix, song->size / (song->duration_s ? song->duration_s : 1) / 1024,
+                     DIRECT_PLAY_MAX_KBS);
+        }
     }
 
     if (raw) {
