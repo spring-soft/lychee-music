@@ -916,6 +916,21 @@ static void handle_resume(void)
     int idx = resume_find(player_queue_count(), &from);
     if (idx < 0) idx = first;
 
+    /* ★ 用户要求：设置里能关掉"开机续播"（键名 "resume_on"，默认开）。
+     * 关掉之后从队列第一首的 **0:00** 开始放。
+     *
+     * ⚠️ 注意"关掉续播"不只是"不跳到上次的位置"，它还顺带保住了【无损】：
+     *    续播走的是带 timeOffset 的请求，而 raw 流不吃 timeOffset（实测：
+     *    同一首 raw 流带不带 timeOffset 拿到的前 8KB 完全一样），所以续播
+     *    必然落到转码。要全程无损就必须从 0 开始。
+     *
+     * ⚠️ 键名 "resume_on" 在 ui_pages.c 里也硬编码了一份 —— player 是 ui 的
+     *    下层，不能反向 include ui，所以没法共用一个宏。改的时候两边一起改。 */
+    if (settings_get_int("resume_on", 1) == 0) {
+        from = 0;
+        idx  = first;
+    }
+
     s_active = true;
     if (from > 0) {
         start_index_from(idx, from);

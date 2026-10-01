@@ -29,6 +29,7 @@ typedef enum {
     UI_PAGE_SEARCH_MODE,  /* M8：搜索方式选择（字母直搜 / 拼音输入）*/
     UI_PAGE_SEARCH_IN,    /* M8：输入页（字母格 + 拼音候选字，两种模式共用一页）*/
     UI_PAGE_SEARCH_RES,   /* M8：搜索结果列表 */
+    UI_PAGE_SETTINGS,     /* 设置二级菜单（主菜单"设置"那一项按 K3 进来的）*/
     UI_PAGE_COUNT,
 } ui_page_t;
 
@@ -84,6 +85,13 @@ void ui_menu_activate(void);
 void ui_srcmenu_open(void);         /* 来源二级菜单：主菜单按 K3 进来 */
 void ui_srcmenu_move(int delta);    /* K1 / K2 */
 void ui_srcmenu_activate(void);     /* K3：确定并退回主菜单 */
+
+/* 设置二级菜单：开机续播（开/关）+ 重连 WiFi（需二次确认）*/
+void ui_setmenu_open(void);
+void ui_setmenu_move(int delta);
+void ui_setmenu_activate(void);
+/* 开机续播开关（存 NVS，默认开）—— player.c 的续播逻辑要读它 */
+bool ui_resume_enabled(void);
 void ui_vol_set_mode(bool brightness);
 void ui_vol_open(bool brightness, bool remote);  /* 打开音量页并记住来路（K4 回上一级）*/
 ui_page_t ui_page_parent(ui_page_t p);           /* K4 短按的"上一级" */

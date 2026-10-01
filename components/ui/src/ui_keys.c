@@ -163,6 +163,18 @@ static void key_short(int k)
             }
             break;
 
+        case UI_PAGE_SETTINGS:                  /* 设置二级菜单 */
+            switch (k) {
+                case 0: ui_setmenu_move(-1); break;
+                case 1: ui_setmenu_move(+1); break;
+                /* K3：开机续播=切换；重连 WiFi=两段式（第一次进确认态，
+                 *     再按一次才真重连）。逻辑都在 ui_setmenu_activate 里。
+                 * K4 由 k4_navigate 管 —— 确认态下按 K4 直接退出，不重连。 */
+                case 2: ui_setmenu_activate(); break;
+                default: break;
+            }
+            break;
+
         case UI_PAGE_VOL:
             switch (k) {
                 case 0: ui_vol_step(+5); break;       /* K1 = 加（用户指定） */

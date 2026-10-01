@@ -172,7 +172,7 @@ static void build_list_screen(void)
 #define MENU_ROWS  6                       /* 屏上能放 6 行 */
 #define MENU_ROW_H 17
 #define MENU_Y0    22                      /* 对应 bg_menu 的 TOPBAR_H + 2 */
-#define MENU_N     6                       /* 菜单总项数（现在正好一屏，不再滚动） */
+#define MENU_N     5                       /* 菜单总项数（删掉"蓝牙控制"后 5 项，一屏放得下） */
 
 static lv_obj_t *s_scr_menu;
 static lv_obj_t *s_menu_hl;
@@ -182,49 +182,36 @@ static int       s_menu_r_sel = -1;
 static int       s_menu_win;
 static bool      s_menu_dirty = true;
 
-/* 蓝牙遥控的短状态（菜单第 8 项的动态后缀）。
- * ⚠️ 用中文而不是 "BT ON/CONN" —— 字库是 GB2312 子集，ASCII 走 Montserrat
- *    兜底没问题，但中英混排在这个小字号上更难看；而且用户看的是中文。 */
-static const char *bt_state_short(void)
-{
-    if (!hid_remote_available()) return "不可用";
-    if (hid_remote_mode())       return hid_remote_connected() ? "控制中" : "未连";
-    return hid_remote_connected() ? "已连" : "待连";
-}
-
 static const char *menu_name(int i)
 {
-    /* 第 1、2 项是动态的（蓝牙状态 / 当前来源），文本在这两个静态缓冲里 */
-    static char s_menu_bt_lbl[32];
+    /* 第 1 项是动态的（当前来源），文本在这个静态缓冲里 */
     static char s_menu_src_lbl[48];
     switch (i) {
-        /* ★ 用户要求：蓝牙控制【独立成一项、放第一个】—— 它是个模式，不是
-         *   混在播放器设置里的一个开关，所以摆在最上面最好找。 */
-        case 0:
-            snprintf(s_menu_bt_lbl, sizeof(s_menu_bt_lbl), "蓝牙控制 %s", bt_state_short());
-            return s_menu_bt_lbl;
-        /* ★ 用户要求：来源只占【一项】，冒号后面直接显示当前来源；
+        /* ★ 来源只占【一项】，冒号后面直接显示当前来源；
          *   按 K3 进二级菜单选（K1/K2 选、K3 确定退出）。 */
-        case 1:
+        case 0:
             snprintf(s_menu_src_lbl, sizeof(s_menu_src_lbl), "来源: %s",
                      player_src_name(player_source()));
             return s_menu_src_lbl;
-        case 2: return "搜索";                 /* ★ 取代原来的"播放 / 暂停" */
-        case 3: return "屏幕亮度";
-        case 4: return "重连 WiFi";
-        case 5: return "系统信息";
+        case 1: return "搜索";                 /* ★ 取代原来的"播放 / 暂停" */
+        case 2: return "屏幕亮度";
+        /* ★ 2026-10-01：这里原来是"重连 WiFi"，用户要求换成"设置"，
+         *   重连挪进设置二级菜单（并且在那边加了二次确认）。 */
+        case 3: return "设置";
+        case 4: return "系统信息";
         default: return "";
     }
 }
 
 static void menu_render(void)
 {
-    /* 前两项的文字是动态的（蓝牙状态、当前来源）。它们一变就把菜单标脏，
-     * 否则要等到用户翻页才刷新 —— 用户会以为"换了来源但屏幕上没反应"。 */
+    /* 现在只有"来源"那一项的文字是动态的。它一变就把菜单标脏，
+     * 否则要等到用户翻页才刷新 —— 用户会以为"换了来源但屏幕上没反应"。
+     * （2026-10-01：删掉"蓝牙控制"那一项后，这里的脏检测只剩来源。） */
     {
         static char prev[64];
         char now[64];
-        snprintf(now, sizeof(now), "%s|%s", bt_state_short(), player_src_name(player_source()));
+        snprintf(now, sizeof(now), "%s", player_src_name(player_source()));
         if (strcmp(now, prev) != 0) {
             strlcpy(prev, now, sizeof(prev));
             s_menu_dirty = true;
@@ -273,6 +260,7 @@ ui_page_t ui_page_parent(ui_page_t p)
     switch (p) {
         case UI_PAGE_MENU:        return UI_PAGE_PLAY;
         case UI_PAGE_SRC:         return UI_PAGE_MENU;
+        case UI_PAGE_SETTINGS:    return UI_PAGE_MENU;   /* 设置页的上一级 = 菜单 */
         case UI_PAGE_SEARCH_MODE: return UI_PAGE_MENU;
         case UI_PAGE_SEARCH_IN:   return UI_PAGE_SEARCH_MODE;   /* 用户要的：回输入页要先过方式选择 */
         case UI_PAGE_SEARCH_RES:  return UI_PAGE_SEARCH_IN;     /* 用户要的：方便改词重搜 */
@@ -354,6 +342,104 @@ void ui_srcmenu_activate(void)
     player_set_source((player_src_t)s_src_sel, true);   /* 立刻播第一首 */
     s_menu_dirty = true;      /* 主菜单那行"来源: X"要跟着变 */
     ui_page_show(UI_PAGE_MENU);                          /* 确定并退出（回上级菜单） */
+}
+
+/* ============================================================ 设置二级菜单
+ *
+ * 用户要求：主菜单原来的"重连 WiFi"换成"设置"，按 K3 进这一页，里面有
+ *   1) 开机续播 —— 开/关（存 NVS，player.c 的续播逻辑读同一个键）
+ *   2) 重连 WiFi —— ★ 必须二次确认
+ *
+ * 为什么要确认：重连会把当前连接掐掉、正在放的歌会中断。原来它直接摆在主菜单里
+ * 按一下就执行，往上翻菜单很容易误触。现在第一次按 K3 只是把这一行变成
+ * "重连 WiFi？再按K3确认"，再按一次才真的动网络，K4 随时退出。
+ *
+ * ⚠️ NVS 键名 "resume_on" 在两处硬编码（这里 + player.c）—— player 是 ui 的
+ *    下层，不能反向 include ui，所以没法共用一个宏。改的时候两边一起改。
+ */
+#define SET_N  2
+
+static lv_obj_t *s_scr_set, *s_set_hl, *s_set_lbl[SET_N];
+static int       s_set_sel;
+static int       s_set_r_sel = -1;
+static bool      s_set_confirm;      /* true = 正停在"重连 WiFi"的确认态 */
+
+bool ui_resume_enabled(void) { return settings_get_int("resume_on", 1) != 0; }
+
+static void set_render(void)
+{
+    for (int i = 0; i < SET_N; i++) {
+        char buf[48];
+        if (i == 0) {
+            snprintf(buf, sizeof(buf), "开机续播 %s", ui_resume_enabled() ? "开" : "关");
+        } else {
+            /* 确认态下把提示直接写在行里 —— 这个屏幕上没有独立的弹窗层，
+             * 复用同一行最省事，也不会盖住别的东西。 */
+            snprintf(buf, sizeof(buf), "重连 WiFi%s", s_set_confirm ? "？再按K3确认" : "");
+        }
+        ui_set_text(s_set_lbl[i], buf);
+    }
+    int y = MENU_Y0 + s_set_sel * MENU_ROW_H;
+    if (s_set_r_sel < 0 || lv_obj_get_y(s_set_hl) != y) {
+        ui_anim_slide_obj(s_set_hl, y, 120);
+    }
+    s_set_r_sel = s_set_sel;
+}
+
+static void build_set_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    s_scr_set = scr;
+    ui_page_register(UI_PAGE_SETTINGS, scr);
+
+    ui_put_img(scr, ASSET_BG_MENU, 0, 0);
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    ui_put_label_1line(scr, "设置", 20, 2, 134, ui_font_16, 0x1C1C1E);
+
+    s_set_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
+    for (int i = 0; i < SET_N; i++) {
+        s_set_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
+                                          136, ui_font_12, 0x1C1C1E);
+    }
+    ESP_LOGI(TAG, "设置二级菜单已建好（%d 项）", SET_N);
+}
+
+void ui_setmenu_open(void)
+{
+    s_set_sel     = 0;
+    s_set_r_sel   = -1;
+    s_set_confirm = false;      /* 每次进来都从"没在确认"开始 */
+    set_render();
+    ui_page_show(UI_PAGE_SETTINGS);
+}
+
+void ui_setmenu_move(int delta)
+{
+    if (s_set_confirm) return;  /* 确认态下锁住移动：手一抖移开就取消了，反而更迷惑 */
+    s_set_sel = (s_set_sel + delta + SET_N) % SET_N;
+    set_render();
+}
+
+void ui_setmenu_activate(void)
+{
+    if (s_set_sel == 0) {
+        bool was = ui_resume_enabled();
+        settings_set_int("resume_on", was ? 0 : 1);
+        ui_toast(was ? "开机续播已关" : "开机续播已开");
+        set_render();
+        return;
+    }
+    /* 重连 WiFi：两段式 */
+    if (!s_set_confirm) {
+        s_set_confirm = true;
+        ui_toast("再按 K3 确认重连");
+        set_render();
+        return;
+    }
+    s_set_confirm = false;
+    net_mgr_reconnect();
+    ui_toast("正在重连 WiFi...");
+    ui_page_show(UI_PAGE_MENU);     /* 确认后退出，让它自己去连 */
 }
 
 /* 系统信息整页 —— 一行 toast 放不下这么多事实（IP + 内存 + 欠载 + …），
@@ -513,21 +599,11 @@ static void menu_pick_source(player_src_t src)
 static void menu_activate(int i)
 {
     switch (i) {
-        case 0:                                  /* ★ 蓝牙控制：进入独立模式 */
-            if (!hid_remote_available()) {
-                ui_toast("蓝牙不可用");
-            } else {
-                hid_remote_set_mode(true);
-                ui_page_show(UI_PAGE_BT);        /* 立刻切，不等 tick */
-                ui_toast(hid_remote_connected() ? "按键只发给对方" : "还没连上对端");
-            }
-            s_menu_dirty = true;
-            break;
-        case 1: ui_srcmenu_open(); break;        /* 来源 → 二级菜单 */
-        case 2: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
-        case 3: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
-        case 4: net_mgr_reconnect(); ui_toast("正在重连 WiFi..."); break;
-        case 5: ui_page_show(UI_PAGE_INFO); break;
+        case 0: ui_srcmenu_open(); break;        /* 来源 → 二级菜单 */
+        case 1: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
+        case 2: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
+        case 3: ui_setmenu_open(); break;        /* 设置 → 二级菜单 */
+        case 4: ui_page_show(UI_PAGE_INFO); break;
         default: break;
     }
 }
@@ -721,6 +797,7 @@ void ui_pages_build(void)
     build_info_screen();
     build_bt_screen();
     build_src_screen();
+    build_set_screen();              /* 设置二级菜单（开机续播 / 重连 WiFi）*/
     ui_search_build();               /* M8：搜索方式 / 输入 / 结果 三页 */
     vol_render(true);
 }

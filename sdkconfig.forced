@@ -151,7 +151,9 @@ CONFIG_AUDIO_DECODER_ADPCM_SUPPORT=y
 # ⚠️ 窗口内存不占内部 SRAM：CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y 已经开着，
 #    WiFi/lwIP 的分配会先走 PSRAM（现在还有 5.2MB 空闲）。别把那条关掉，
 #    关了以后这个窗口会把内部 SRAM（只剩 13KB）撑爆。
-CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+# 发送方向也放大：HTTP 请求本身很小，但确认包走同一条路，SND_BUF 太小会拖慢窗口推进
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 
 # ===== WiFi 接收缓冲：从省 SRAM 的保守值调回接近默认 =====
 #
@@ -169,14 +171,18 @@ CONFIG_LWIP_TCP_WND_DEFAULT=32768
 # 这不是原作者疏忽，是**为省内部 SRAM 给 BLE 让路**的有意取舍（BLE 要 40KB）。
 # 所以这一条是"把吞吐换回来"，代价是内部 SRAM —— 开机日志里会看到余量掉多少，
 # 如果掉到 0 或 BLE 起不来，就把这两条调回去，改用"按码率决定要不要直出"的策略。
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=48
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
 # 接收方向的块确认窗口：默认 6 —— 太小，AMPDU 聚合不起来，吞吐上不去。
 # 实测把它和其他缓冲一起放大后，峰值从 ~100 KB/s 提到 194 KB/s。
 # 上限受 DYNAMIC_RX_BUFFER_NUM 约束（要 ≤ 它），48 配 16 是安全组合。
-CONFIG_ESP_WIFI_RX_BA_WIN=16
+CONFIG_ESP_WIFI_RX_BA_WIN=32
 # 发送方向同理由（HTTP 请求本身很小，但确认包走同一条路）
-CONFIG_ESP_WIFI_TX_BA_WIN=16
+CONFIG_ESP_WIFI_TX_BA_WIN=32
+# lwIP 的接收邮箱：段到达时先投这里，太小会丢段 → TCP 重传 → 吞吐掉。
+# TCPIP 那个是跨线程邮箱（WiFi 任务 → TCP/IP 任务），整机只有一份，加大最划算。
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 
 # ===== 关掉 BLE，把内部 SRAM 让给 WiFi（2026-10-01 用户拍板）=====
 #
