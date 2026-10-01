@@ -104,6 +104,9 @@ static bool k4_navigate(int k, bool long_press)
     if (cur == UI_PAGE_PLAY) return false;      /* 播放页自己处理（见文件头的键位表）*/
 
     if (cur == UI_PAGE_BT) hid_remote_set_mode(false);
+    /* ★ 离开音量/亮度页时把去抖中的改动立刻落盘 —— 本机是硬断电，
+     *   没有关机流程补写，去抖窗口内关机就丢了（用户报的亮度不保留）。*/
+    if (cur == UI_PAGE_VOL) ui_vol_commit();
     if (long_press) ui_page_show(UI_PAGE_PLAY);
     else            ui_page_show(ui_page_parent(cur));
     return true;

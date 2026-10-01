@@ -1,4 +1,4 @@
-/* æœ¬æ–‡ä»¶ç”± tools/gen_assets.py ç”Ÿæˆï¼Œä¸è¦æ‰‹æ”¹ */
+/* ±¾ÎÄ¼şÓÉ tools/gen_assets.py Éú³É£¬²»ÒªÊÖ¸Ä */
 #pragma once
 
 typedef enum {
@@ -34,7 +34,7 @@ typedef enum {
     ASSET_COUNT,
 } asset_id_t;
 
-/* ä¾¿äºè°ƒè¯•ï¼šid â†’ æ–‡ä»¶å */
+/* ±ãÓÚµ÷ÊÔ£ºid ¡ú ÎÄ¼şÃû */
 static const char *asset_names[] = {
     "bg_info.png",
     "bg_list.png",

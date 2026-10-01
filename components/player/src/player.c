@@ -1066,6 +1066,10 @@ static void handle_cmd(const player_cmd_t *c)
         case CMD_BRIGHT:
             s_bright_target = c->iarg < 5 ? 5 : (c->iarg > 100 ? 100 : c->iarg);
             board_backlight_set(s_bright_target);
+            /* 亮度也走去抖（和音量一致）：长按连调时不会把 NVS 写爆。
+             * ⚠️ 但本机是**电源开关硬断电**，没有关机流程补写 —— 去抖窗口内关机
+             *    会丢。补偿办法在 UI 侧：**离开亮度页时立刻补一次落盘**
+             *    （见 ui_pages.c 的 ui_vol_commit，由 ui_keys.c 的 k4_navigate 调用）。*/
             settings_set_int_lazy("bright", s_bright_target);
             ESP_LOGI(TAG, "亮度 %d%%", s_bright_target);
             break;

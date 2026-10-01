@@ -245,6 +245,19 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(song, "cover", st.cover_id);
     cJSON_AddBoolToObject(song, "starred", st.starred);
 
+    /* ★ 音频规格：解码格式 / 采样率 / 位深 / 是否直出 / 缓冲水位 / 欠载次数。
+     *   屏幕播放页右栏已经有一份同样的信息，网页这边也要能看 ——
+     *   排查"这首歌怎么变成 MP3 了"的时候，网页是最顺手的入口（不用盯串口）。
+     *   ⚠️ raw 是"最近一次取流"的属性，不是"当前这首歌"的：断流续播会重新
+     *      拼 URL，而续播带 timeOffset 必然落到转码，这个值会翻成 false。 */
+    cJSON *au = cJSON_AddObjectToObject(o, "audio");
+    cJSON_AddStringToObject(au, "fmt", audio_engine_format_str());
+    cJSON_AddNumberToObject(au, "fs", audio_engine_sample_rate());
+    cJSON_AddNumberToObject(au, "bits", audio_engine_bit_depth());
+    cJSON_AddBoolToObject(au, "raw", subsonic_last_raw());
+    cJSON_AddNumberToObject(au, "ring_kb", audio_engine_ring_used_in() / 1024);
+    cJSON_AddNumberToObject(au, "underruns", audio_engine_underruns());
+
     cJSON *q = cJSON_AddObjectToObject(o, "queue");
     cJSON_AddNumberToObject(q, "index", player_queue_index());
     cJSON_AddNumberToObject(q, "count", player_queue_count());

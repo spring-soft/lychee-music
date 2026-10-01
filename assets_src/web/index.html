@@ -91,6 +91,10 @@ svg{display:block;}
 .ptitle{font-size:17px;font-weight:600;line-height:1.3;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}
 .partist{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;}
 .palbum{font-size:12px;color:var(--icon);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+/* 音频规格行：绿色=无损直出，橙色=转码。数字用等宽数字，避免每秒跳动时宽度抖 */
+.pspec{font-size:12px;margin-top:2px;color:var(--icon);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums;}
+.pspec.raw{color:#1B7F3B;}
+.pspec.tc{color:#C77700;}
 .prow2{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:6px;min-height:38px;}
 .pill{font-size:11px;line-height:18px;padding:0 8px;border-radius:9px;background:var(--accent-bg);color:var(--accent);white-space:nowrap;flex:none;}
 .pill.gray{background:var(--press);color:var(--muted);}
@@ -371,6 +375,8 @@ input.sw:checked::after{transform:translateX(18px);}
         <div class="ptitle" id="song-title">未在播放</div>
         <div class="partist" id="song-artist">—</div>
         <div class="palbum" id="song-album"></div>
+        <!-- 音频规格：无损直出/转码 + 格式 + 采样率/位深 + 缓冲 + 欠载（见 renderSong） -->
+        <div class="pspec" id="song-spec"></div>
       </div>
       <div class="prow2">
         <span class="pill" id="state-pill">空闲</span>
@@ -869,6 +875,26 @@ function renderSong(){
   $('song-title').textContent = title;
   $('song-artist').textContent = song.artist || '—';
   $('song-album').textContent = (song.album && song.album !== song.artist) ? song.album : '';
+
+  /* 音频规格行：无损直出/转码 + 格式 + 采样率/位深 + 缓冲 + 欠载。
+   * raw 来自 /api/status 的 audio.raw —— 它反映【最近一次取流】是 raw 还是转码，
+   * 所以直出播放中途一旦断流续播，这里会从绿色"无损直出"翻成橙色"转码"。
+   * 这正是要暴露的：一眼看出这首歌是什么时候掉进转码的。 */
+  var au = (st && st.audio) || {}, spEl = $('song-spec');
+  if(au.fmt && au.fmt !== 'none'){
+    var rate = '';
+    if(au.fs) rate = (au.fs % 1000 === 0) ? ((au.fs / 1000) + 'k')
+                                          : ((au.fs / 1000).toFixed(1) + 'k');
+    var txt = (au.raw ? '无损直出 ' : '转码 ') + au.fmt
+            + (rate ? ' ' + rate : '') + (au.bits ? '/' + au.bits : '');
+    if(typeof au.ring_kb === 'number') txt += '  ·  缓冲 ' + au.ring_kb + 'K';
+    if(au.underruns) txt += '  ·  欠载 ' + au.underruns;
+    spEl.textContent = txt;
+    spEl.className = 'pspec ' + (au.raw ? 'raw' : 'tc');
+  } else {
+    spEl.textContent = '';
+    spEl.className = 'pspec';
+  }
   $('mini-title').textContent = title;
   $('mini-sub').textContent = song.artist || song.album || '—';
 

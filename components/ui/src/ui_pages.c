@@ -694,6 +694,22 @@ void ui_vol_set_mode(bool brightness)
     vol_render(true);
 }
 
+/* 离开音量/亮度页时补一次落盘（由 ui_keys.c 的 k4_navigate 调用）。
+ *
+ * 为什么需要：音量/亮度的改动都走 settings_set_int_lazy（去抖 2000ms），
+ * 而本机是**电源开关硬断电**，没有关机流程可以补写 —— 去抖窗口内关机就丢了。
+ * 用户报的"屏幕亮度重启后不保留"就是这个。
+ *
+ * 用户又明确要求保留去抖（防长按连调把 NVS 写爆），所以折中：
+ *   **页内照旧去抖，离开这一页时立刻补写一次**。
+ * 代价：如果调完亮度**停在那一页直接断电**，仍然会丢 —— 这个场景没法两全，
+ * 因为硬断电时没有任何代码有机会跑。 */
+void ui_vol_commit(void)
+{
+    if (s_vol_brightness) (void)settings_set_int("bright", player_brightness());
+    else                  (void)settings_set_int("vol",    player_volume_get());
+}
+
 /* 打开音量/亮度页。把两个入口（播放页长按 K2、菜单"屏幕亮度"、蓝牙遥控页长按 K2）
  * 收成一个，顺便记住来路 —— 这样 K4 就能统一按"上一级"处理。 */
 void ui_vol_open(bool brightness, bool remote)

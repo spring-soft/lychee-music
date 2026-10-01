@@ -92,6 +92,9 @@ void ui_setmenu_move(int delta);
 void ui_setmenu_activate(void);
 /* 开机续播开关（存 NVS，默认开）—— player.c 的续播逻辑要读它 */
 bool ui_resume_enabled(void);
+
+/* 离开音量/亮度页时调用：把去抖中的改动立刻落盘（本机是硬断电，没有关机补写的机会）*/
+void ui_vol_commit(void);
 void ui_vol_set_mode(bool brightness);
 void ui_vol_open(bool brightness, bool remote);  /* 打开音量页并记住来路（K4 回上一级）*/
 ui_page_t ui_page_parent(ui_page_t p);           /* K4 短按的"上一级" */
