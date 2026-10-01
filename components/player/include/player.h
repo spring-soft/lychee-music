@@ -68,6 +68,12 @@ void player_star_song(const char *song_id, bool on);/* 收藏任意一首（离�
  * 只是多了一步"如果队列第一首就是上次那首，就从上次的位置接着放"。 */
 void player_resume(void);
 
+/* 开机同步曲库：跟服务器对一次收藏，并把列表里缺后缀的歌补上完整信息。
+ * ⚠️ 必须在 player_init() 之后、player_resume() 之前调用（前者分配列表，后者要读）。
+ * 为什么要它：收藏/最近播放是从本地镜像恢复的，镜像里的 suffix 可能是空的，
+ * 而后缀空 = 判不出格式 = 必然转码 → 整列歌都变成 MP3。 */
+void player_sync_library(void);
+
 /* ---------------- M8：屏幕上的搜索 ----------------
  *
  * 屏幕上的搜索是"UI 发命令 → player 任务做网络 → UI 轮询结果"。

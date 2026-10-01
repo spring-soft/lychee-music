@@ -284,17 +284,10 @@ void app_main(void)
     splash("准备存储...", 6);
     store_init();
 
-    /* ---- M7: 蓝牙遥控（K1-K4 当 HID 外设控制手机/电脑）----
-     * ⚠️ 必须排在这里：
-     *   1) WiFi 先于 BT（共存要求，net_mgr_init 已经跑过了）；
-     *   2) 播放【之前】—— BLE 要 40KB 量级的内部 SRAM，起播后只剩 10~15KB
-     *      （见 [[esp-music-m6-persistence]]）。能不能跑起来靠 sdkconfig.forced
-     *      把 NimBLE 的内存挪到 PSRAM，不是靠这里省出来的。
-     * ⚠️ 失败非致命：只让遥控不可用，播放/UI/网页完全不受影响。 */
-    splash("蓝牙遥控...", 7);
-    if (hid_remote_init() != ESP_OK) {
-        ESP_LOGW(TAG, "蓝牙遥控起不来（不影响播放，菜单里会显示\"不可用\"）");
-    }
+    /* 这里原来是 M7「蓝牙遥控」那一步（K1-K4 当 BLE HID 外设）。
+     * 2026-10-01 砍掉 BLE 换 WiFi 吞吐（内部 SRAM 从 7KB 涨到 49KB），那一步没了。
+     * 原来的位置改成了「同步曲库」——但它必须排在 player_init 之后
+     * （那时 s_recent / s_lock 才分配好），所以挪到下面第 7 步。 */
 
     /* ---- M4: 起播（之后按键/网页都通过 player 命令层控制）---- */
     if (subsonic_init() != ESP_OK || !subsonic_configured()) {
@@ -310,6 +303,14 @@ void app_main(void)
         ESP_LOGE(TAG, "player 初始化失败");
         goto heartbeat;
     }
+    /* ★ 开机同步曲库（用户要求做成启动步骤的一步，进度条上看得到）。
+     * 为什么需要：收藏/最近播放是从【本地镜像】恢复的，镜像里的 suffix 可能是空的，
+     * 而后缀空 = 判不出格式 = 必然转码 → 整列歌都变成 MP3（随机来源却正常）。
+     * ⚠️ 顺序：必须在 player_init 之后（那时 s_recent/s_lock 才分配好）、
+     *          player_resume 之前（resume 要读这些列表）。 */
+    splash("同步曲库...", 7);
+    player_sync_library();
+
     splash("开始播放...", 8);
     /* ---- M5: 网页控制台 ---- */
     web_console_start();

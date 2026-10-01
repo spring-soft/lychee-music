@@ -1269,6 +1269,10 @@ function playItem(it){
     if(it.album)  body.album  = it.album;
     if(it.cover)  body.cover  = it.cover;
     if(typeof it.dur_s === 'number' && it.dur_s > 0) body.dur_s = it.dur_s;
+    /* ★ suffix/size 一定要带上：设备端就是靠 suffix 判断"能不能直出无损"的，
+       少了它这歌会被当成解不了的格式、一律转码（网页点歌变 MP3 就是这个原因）*/
+    if(it.suffix) body.suffix = it.suffix;
+    if(typeof it.size === 'number' && it.size > 0) body.size = it.size;
     if(isStarred(it)) body.starred = true;
     /* 设备端请求体上限 1024 字节，超了直接 400。元数据太大就只发 id
        （宁可多一次回源往返，也不能点下去报错） */

@@ -613,6 +613,75 @@ static void queue_store(const sub_song_t *songs, int n, player_src_t src, bool c
 }
 
 /* 按来源拉取歌单（会阻塞几百毫秒，只在 player 任务里调） */
+static void fill_missing_suffix(sub_song_t *v, int n);   /* 定义在下面，这里先声明 */
+
+/* ★ 开机同步曲库（用户要求做成启动步骤的一步，进度条上能看到）。
+ *
+ * 为什么需要：**收藏 / 最近播放这两个来源的歌曲是从本地镜像恢复的**，而镜像里的
+ * suffix 可能是空的 —— 后缀空 = 判不出格式 = **必然转码**，于是列表里整列歌都变成
+ * MP3，而「随机」来源（每次从服务器拉、后缀是全的）却完全正常。开机对一次就干净了。
+ *
+ * ⚠️ 补后缀要发 HTTP 请求，**绝不能持 s_lock 做**（会挡住 UI 读列表）。
+ *    所以先拷出来、放锁、补完再拷回去。 */
+void player_sync_library(void)
+{
+    if (s_lock == NULL) return;
+    /* 不在这里判"有没有网" —— player 不该反向依赖 net_mgr（分层约定），
+     * 而且没网时下面的取数本来就会快速失败，不影响启动。 */
+
+    /* ① 收藏：整体跟服务器对一次（服务器那边的 suffix 是全的，一次全修好）*/
+    starred_ensure(true);
+
+    /* ② 最近播放：服务器没有对应列表，只能逐首补缺的后缀 */
+    static sub_song_t *tmp;
+    if (tmp == NULL) {
+        tmp = heap_caps_malloc(PLAYER_RECENT_MAX * sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
+        if (tmp == NULL) return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int n = s_recent_n;
+    if (n > 0) memcpy(tmp, s_recent, (size_t)n * sizeof(sub_song_t));
+    xSemaphoreGive(s_lock);
+    if (n <= 0) return;
+
+    fill_missing_suffix(tmp, n);        /* 里面发 HTTP，所以必须放锁之后 */
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_recent_n == n) memcpy(s_recent, tmp, (size_t)n * sizeof(sub_song_t));
+    xSemaphoreGive(s_lock);
+    recent_save();                      /* 补好的存回去，下次开机就不用再补 */
+}
+
+/* ★ 从本地镜像/落盘列表恢复出来的歌曲，suffix 可能是空的（实测踩过）。
+ *
+ * 后缀空 = 判不出格式 = **必然转码** → 播「我的收藏」「最近播放」时整列歌都变成 MP3，
+ * 而「随机」来源（每次从服务器拉、后缀是全的）却完全正常 —— 症状极迷惑，
+ * 当初就是在网页上点歌变 MP3、在屏幕上点同一首却是无损，才顺藤摸到这儿。
+ *
+ * 这里发现一个补一个：回源拿那一首的完整信息。
+ * ⚠️ 限的是**时间**不是条数：一次开机最多花 3 秒补。按条数限的话 50 首要 10 次开机
+ *    才补得完，太蠢；按时间限既能一次补完大多数，又不会让开机无限拖下去。
+ *    补好的会存回本地，所以第二次开机基本没得补。 */
+static void fill_missing_suffix(sub_song_t *v, int n)
+{
+    int fixed = 0;
+    int64_t t0 = esp_timer_get_time() / 1000;
+    for (int i = 0; i < n; i++) {
+        if ((esp_timer_get_time() / 1000) - t0 > 3000) {
+            ESP_LOGW(TAG, "补后缀超 3 秒，剩下的下次开机再补");
+            break;
+        }
+        if (v[i].suffix[0]) continue;
+        sub_song_t full;
+        if (subsonic_get_song(v[i].id, &full) == ESP_OK && full.suffix[0]) {
+            strlcpy(v[i].suffix, full.suffix, sizeof(v[i].suffix));
+            v[i].size = full.size;
+            fixed++;
+        }
+    }
+    if (fixed) ESP_LOGW(TAG, "列表里有 %d 首缺后缀，已回源补上", fixed);
+}
+
 static bool load_source(player_src_t src, bool autoplay, int *first_idx)
 {
     static sub_song_t *tmp;       /* 复用，避免每次 malloc */
@@ -634,6 +703,7 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
         xSemaphoreGive(s_lock);
         got = n;
         err = n > 0 ? ESP_OK : ESP_FAIL;
+        fill_missing_suffix(tmp, got);
         ESP_LOGI(TAG, "来源「最近播放」: %d 首", n);
     } else if (src == PLAYER_SRC_STARRED) {
         /* 切到"我的收藏"= 用户想看最新的，强制跟服务器对一次；
@@ -642,6 +712,7 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
         bool synced = false;
         got = starred_copy(tmp, PLAYER_QUEUE_MAX, &synced);
         err = got > 0 ? ESP_OK : ESP_FAIL;
+        fill_missing_suffix(tmp, got);
         ESP_LOGI(TAG, "来源「我的收藏」: %d 首%s", got, synced ? "" : "（本地镜像，未与服务器对上）");
     } else {
         err = subsonic_get_random(tmp, 30, &got);

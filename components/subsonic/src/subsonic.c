@@ -91,6 +91,11 @@ int         subsonic_max_kbps(void) { return s_max_kbps; }
 static bool s_last_raw = false;
 bool subsonic_last_raw(void) { return s_last_raw; }
 
+/* 最近一次"为什么直出/为什么转码"的原因，给 /api/debug 用。
+ * 排查"这歌怎么变 MP3 了"时，这一条比串口日志还直接（不用插 USB）。 */
+static char s_last_why[48] = "?";
+const char *subsonic_last_why(void) { return s_last_why; }
+
 /* ---------- 音质挡位 ----------
  * ⚠️ 放在这一层而不是 UI 层：屏幕菜单和网页控制台共用同一套挡位。
  *    网页控制台在 ui 的下层结构里不能 include ui，各写一份必然会不一致。
@@ -614,6 +619,23 @@ static esp_err_t stream_url_ex(const sub_song_t *song, int max_kbps, uint32_t of
                      song->suffix, song->size / (song->duration_s ? song->duration_s : 1) / 1024,
                      DIRECT_PLAY_MAX_KBS);
         }
+    }
+
+    /* 记下这次的真实原因 —— 排查"怎么变 MP3 了"靠这一条。
+     * 必须按 raw 为 false 的**每一种可能**分清楚，否则只能靠猜（踩过）。 */
+    if (raw) {
+        strlcpy(s_last_why, "直出", sizeof(s_last_why));
+    } else if (strcmp(s_transcode, "raw") && strcmp(s_transcode, "auto")) {
+        snprintf(s_last_why, sizeof(s_last_why), "设置=%s", s_transcode);
+    } else if (offset_s != 0) {
+        snprintf(s_last_why, sizeof(s_last_why), "seek@%us", (unsigned)offset_s);
+    } else if (!suffix_direct_playable(song->suffix)) {
+        /* 最常见的一种：后缀空/不认识。把原值打出来，别只说"不支持" */
+        snprintf(s_last_why, sizeof(s_last_why), "后缀='%.14s'", song->suffix);
+    } else {
+        snprintf(s_last_why, sizeof(s_last_why), "码率%u>%dKB/s",
+                 (unsigned)(song->size / (song->duration_s ? song->duration_s : 1) / 1024),
+                 DIRECT_PLAY_MAX_KBS);
     }
 
     if (raw) {

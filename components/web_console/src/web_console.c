@@ -173,6 +173,12 @@ static void add_song(cJSON *arr, int i, const sub_song_t *s, int playing_index)
     cJSON_AddStringToObject(o, "album", s->album);
     cJSON_AddStringToObject(o, "cover", s->cover);
     cJSON_AddNumberToObject(o, "dur_s", s->duration_s);
+    /* ★ suffix / size 必须给前端 —— 它在"点歌时把元数据一起 POST 上来"的快路径里要用。
+     *   少了这个，设备端拿 POST 上来的字段建的队列项**后缀是空的**，于是被判成
+     *   "解不了这个格式" → 一律转码。症状极迷惑：**从网页点歌永远是 MP3，从屏幕点歌
+     *   却是无损**（屏幕走队列，队列里的对象是从服务器解析来的，后缀是全的）。 */
+    if (s->suffix[0]) cJSON_AddStringToObject(o, "suffix", s->suffix);
+    if (s->size)      cJSON_AddNumberToObject(o, "size", (double)s->size);
     if (s->starred) cJSON_AddBoolToObject(o, "starred", true);
     if (i >= 0 && i == playing_index) cJSON_AddBoolToObject(o, "playing", true);
     cJSON_AddItemToArray(arr, o);
@@ -487,7 +493,12 @@ static esp_err_t h_play(httpd_req_t *req)
             if (player_queue_get(k, &s) && strcmp(s.id, id) == 0) { found = k; break; }
         }
         if (found >= 0) {
-            player_play_index(found);
+            /* ⚠️ 队列项可能是从【本地镜像】恢复来的，而镜像里的 suffix 可能是空的
+             *    （实测踩到：网页点「我的收藏」的歌**全部变成 MP3**，而屏幕上点同一首
+             *     却是无损 —— 因为屏幕走队列没这道坎，而后缀空 = 判不出格式 = 必然转码）。
+             *    所以后缀空就宁可多一次回源往返，拿全的元数据。 */
+            if (s.suffix[0]) player_play_index(found);
+            else             player_play_song_id(id);
         } else {
             /* ★ 前端把列表里已有的元数据一起 POST 上来了（title/artist/cover/dur_s…），
              *   那就直接用，**不再向 Navidrome 请求一次 getSong** ——
@@ -506,12 +517,19 @@ static esp_err_t h_play(httpd_req_t *req)
                 CP(artist, "artist");
                 CP(album, "album");
                 CP(cover, "cover");
+                CP(suffix, "suffix");          /* ★ 少了它就会被判成"解不了"→ 转码 */
                 #undef CP
                 cJSON *jd = cJSON_GetObjectItem(b, "dur_s");
                 if (jd && cJSON_IsNumber(jd)) m.duration_s = (uint32_t)jd->valuedouble;
+                cJSON *jz = cJSON_GetObjectItem(b, "size");
+                if (jz && cJSON_IsNumber(jz)) m.size = (uint32_t)jz->valuedouble;
                 cJSON *js = cJSON_GetObjectItem(b, "starred");
                 if (js) m.starred = cJSON_IsTrue(js);
-                player_play_song(&m);
+                /* ⚠️ 防御：万一日后又有字段漏传（比如浏览器缓存着旧版网页），
+                 *   宁可贵一次回源往返（200~800ms），也别让后缀空着 ——
+                 *   后缀空 = 判不出格式 = 必然转码，用户看到的就是"无损莫名变 MP3"。 */
+                if (m.suffix[0]) player_play_song(&m);
+                else             player_play_song_id(id);
             } else {
                 player_play_song_id(id);
             }
@@ -865,6 +883,11 @@ static esp_err_t h_debug(httpd_req_t *req)
     cJSON_AddNumberToObject(o, "sram_kb", heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
     cJSON_AddNumberToObject(o, "psram_kb", heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
     cJSON_AddNumberToObject(o, "underruns", audio_engine_underruns());
+
+    /* ★ 排查"这歌怎么变 MP3 了"用：最近一次取流为什么直出/为什么转码。
+     * 值形如 "直出" / "后缀=''" / "码率234>300KB/s" / "seek@139s" / "设置=raw"。
+     * 有了它不用插串口就能查 —— 之前就是靠猜，来回烧了好几次固件。 */
+    cJSON_AddStringToObject(o, "stream_why", subsonic_last_why());
     cJSON_AddNumberToObject(o, "i2c_retries", board_i2c_retries());
     cJSON_AddNumberToObject(o, "sample_rate", audio_engine_sample_rate());
     cJSON_AddNumberToObject(o, "ring_in_kb", audio_engine_ring_used_in() / 1024);

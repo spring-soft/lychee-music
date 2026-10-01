@@ -47,6 +47,9 @@ int         subsonic_max_kbps(void);
  *    而续播带 timeOffset，按规则必然落到转码 —— 所以直出播放中途一旦断流，
  *    这个值会翻成 false，屏幕上就会看到"转码"。 */
 bool subsonic_last_raw(void);
+/* 最近一次"为什么直出/为什么转码"的短说明（"直出" / "后缀=''" / "码率234>300KB/s" /
+ * "seek@139s" / "设置=raw"）。排查"这歌怎么变 MP3 了"时看 /api/debug 的 stream_why。 */
+const char *subsonic_last_why(void);
 
 /* ---------- 音质挡位 ----------
  * 放在 subsonic 层而不是 UI 层：屏幕菜单和网页控制台都要用同一套挡位，
