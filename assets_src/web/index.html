@@ -903,12 +903,11 @@ function renderSong(){
                                           : ((au.fs / 1000).toFixed(1) + 'k');
     var txt = (au.raw ? '无损直出 ' : '转码 ') + au.fmt
             + (rate ? ' ' + rate : '') + (au.bits ? '/' + au.bits : '');
-    /* 缓冲：占用量 + 占用率（用户要百分率，量也留着）。
-     * 健康时就是 512/512K = 100% —— 网络供得上、预读一直填满；
-     * 掉下来才说明网络跟不上、快欠载了。一直满反而是好事。 */
-    if(typeof au.ring_kb === 'number' && au.ring_cap_kb)
-      txt += '  ·  缓冲 ' + au.ring_kb + '/' + au.ring_cap_kb + 'K（'
-           + Math.round(au.ring_pct || 0) + '%）';
+    /* 听歌缓存占用率 = 已用量 / 全部为播放预留的缓冲（分母由后端算，见 audio_engine.h）。
+     * 只算单个环的话这个数会永远贴着 100%（网络跟得上时环就是满的），没有信息量。 */
+    if(typeof au.cache_pct === 'number')
+      txt += '  ·  听歌缓存 ' + Math.round(au.cache_pct) + '%（'
+           + au.cache_used_kb + '/' + au.cache_cap_kb + 'K）';
     if(au.underruns) txt += '  ·  欠载 ' + au.underruns;
     spEl.textContent = txt;
     spEl.className = 'pspec ' + (au.raw ? 'raw' : 'tc');

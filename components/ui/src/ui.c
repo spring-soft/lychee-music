@@ -682,14 +682,13 @@ static void play_refresh(void)
         ui_set_text(s_lbl_mode, mbuf);
         lv_obj_set_style_text_color(s_lbl_mode,
                                     lv_color_hex(raw ? 0x1B7F3B : 0xC77700), 0);
-        /* 下行：缓冲【占用量 + 占用率】（用户要百分率，但量也留着，两个都在一眼看全）。
-         * ⚠️ 健康时就是 512K / 100% —— 网络供得上，预读一直填满。
-         *    **它掉下来才说明网络跟不上、快欠载了**；一直满反而是好事。 */
-        size_t used = audio_engine_ring_used_in();
-        size_t cap  = audio_engine_ring_in_cap();
+        /* 下行：听歌缓存的【占用率】—— 已用量 / 全部听歌缓存（见 audio_engine.h 的说明）。
+         * 分母是所有为播放预留的缓冲，不是单个环 —— 只算单个环的话网络跟得上时
+         * 分子分母都贴着满，那个百分比永远 100%、没有任何信息量。 */
+        size_t cu = audio_engine_audio_cache_used();
+        size_t cc = audio_engine_audio_cache_cap();
         char nbuf[20];
-        snprintf(nbuf, sizeof(nbuf), "%uK %u%%",
-                 (unsigned)(used / 1024), (unsigned)(cap ? used * 100 / cap : 0));
+        snprintf(nbuf, sizeof(nbuf), "缓存 %u%%", (unsigned)(cc ? cu * 100 / cc : 0));
         ui_set_text(s_lbl_net, nbuf);
     }
 

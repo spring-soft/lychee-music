@@ -261,10 +261,13 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(au, "ring_cap_kb", ring_cap / 1024);
     cJSON_AddNumberToObject(au, "ring_pct",
                             ring_cap ? (double)audio_engine_ring_used_in() * 100.0 / ring_cap : 0);
-    /* 解码后的 PCM 缓冲（同理）*/
-    size_t pcm_cap = audio_engine_ring_pcm_cap();
-    cJSON_AddNumberToObject(au, "pcm_kb",     audio_engine_ring_pcm_used() / 1024);
-    cJSON_AddNumberToObject(au, "pcm_cap_kb", pcm_cap / 1024);
+    /* 「听歌缓存」整体：所有为播放预留的缓冲里，眼下装了多少（前端显示百分率）*/
+    cJSON_AddNumberToObject(au, "cache_used_kb", audio_engine_audio_cache_used() / 1024);
+    cJSON_AddNumberToObject(au, "cache_cap_kb",  audio_engine_audio_cache_cap() / 1024);
+    cJSON_AddNumberToObject(au, "cache_pct",
+                            audio_engine_audio_cache_cap()
+                              ? (double)audio_engine_audio_cache_used() * 100.0
+                                / audio_engine_audio_cache_cap() : 0);
     cJSON_AddNumberToObject(au, "qual", subsonic_quality_current());   /* 当前音质挡位下标 */
     cJSON_AddNumberToObject(au, "underruns", audio_engine_underruns());
 

@@ -72,9 +72,20 @@ size_t     audio_engine_ring_used_in(void);
 /* ring_in 的总容量（字节）。屏幕/网页要显示"缓冲占用百分比"就得知道分母 ——
  * 别在 UI 侧硬编码 512KB，那是 audio_engine.c 里的 RING_IN_BYTES，改了会不一致。 */
 size_t     audio_engine_ring_in_cap(void);
-/* 解码后的 PCM 环总容量（ring_pcm）—— 和 ring_in 一样，UI 侧别硬编码 */
+/* 解码后的 PCM 环（ring_pcm）—— 和 ring_in 一样，UI 侧别硬编码 */
 size_t     audio_engine_ring_pcm_used(void);
 size_t     audio_engine_ring_pcm_cap(void);
+
+/* ===== 「听歌缓存」的已用量 / 总量 =====
+ * 这是给界面显示用的一个整体指标：把所有为播放数据预留的缓冲加在一起，
+ * 看眼下装了多少。
+ *   分子 = ring_in(压缩流) + ring_pcm(解码后 PCM) 里实际存着的数据
+ *   分母 = ring_in + ring_pcm + 解码输出暂存 + 解码暂存 的总容量
+ * 分母为什么把"暂存"也算进去：那些内存同样是【为听歌预留的】，
+ * 只算两个环的话分子分母会一直贴着 100%（网络跟得上时两个环都是满的），
+ * 那个数字就完全没有信息量了。 */
+size_t     audio_engine_audio_cache_used(void);
+size_t     audio_engine_audio_cache_cap(void);
 size_t     audio_engine_ring_used_pcm(void);
 size_t     audio_engine_ring_in_high_water(void);
 bool       audio_engine_is_error(void);
