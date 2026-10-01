@@ -40,6 +40,13 @@ const char *subsonic_host(void);
  * 网页控制台用它回显真实值 —— 之前那边是写死的 "mp3"/192，改完看不出来。 */
 const char *subsonic_transcode(void);
 int         subsonic_max_kbps(void);
+
+/* 最近一次 stream_url 拼出来的是【直出】(format=raw) 还是【转码】。
+ * 屏幕/网页上显示"无损直出 / 转码"用 —— 光看歌名分不出来。
+ * ⚠️ 这是"最近一次请求"的状态，不是"当前这首歌"的属性：断流续播会重新拼 URL，
+ *    而续播带 timeOffset，按规则必然落到转码 —— 所以直出播放中途一旦断流，
+ *    这个值会翻成 false，屏幕上就会看到"转码"。 */
+bool subsonic_last_raw(void);
 bool        subsonic_configured(void);
 
 /* 连通性 + 服务器信息（/rest/ping）。server_info 失败时带回原因（如鉴权失败的消息） */

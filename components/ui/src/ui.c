@@ -58,9 +58,11 @@ lv_font_t       *ui_font_12  = NULL;   /* 12px 中文（菜单行/歌手/专辑�
 const lv_font_t *ui_font_lat = &lv_font_montserrat_12;
 
 /* 播放页控件（build_play_screen 里赋值，play_refresh 里更新） */
-static lv_obj_t *s_lbl_title, *s_lbl_artist, *s_lbl_time_cur, *s_lbl_time_tot;
+static lv_obj_t *s_lbl_title, *s_lbl_time_cur, *s_lbl_time_tot;
 /* 时间行中间那块空档：显示解码格式与音频规格（例 "FLAC 44.1k/16"） */
 static lv_obj_t *s_lbl_spec;
+/* 右栏（原来放歌手的地方，用户要求去掉歌手）：解码模式 + 网络拉流状态 */
+static lv_obj_t *s_lbl_mode, *s_lbl_net;
 static lv_obj_t *s_bar, *s_img_cover, *s_img_state, *s_img_star;
 
 /* 屏幕注册表：4 个页面开机全建好，切换只 lv_screen_load（运行时绝不建/删 widget） */
@@ -576,7 +578,7 @@ static void play_refresh(void)
         ui_sanitize_text(st.title[0] ? st.title : "(无标题)", tbuf, sizeof(tbuf), ui_font_16);
         ui_sanitize_text(st.artist, abuf, sizeof(abuf), ui_font_12);
         ui_set_text(s_lbl_title, tbuf);
-        ui_set_text(s_lbl_artist, abuf);
+        /* 歌手不再上屏（用户要求）—— abuf 还留着，下面那行日志要用它排查缺字 */
         /* 这行是给"屏上显示不出歌名"这类问题排查用的：能一眼看出是替换误伤还是真缺字 */
         ESP_LOGI(TAG, "屏上显示: 歌名=\"%s\" 作者=\"%s\"（原始歌名 \"%s\"）",
                  tbuf, abuf, st.title);
@@ -655,6 +657,34 @@ static void play_refresh(void)
         }
     }
 
+    /* 右栏：解码模式 + 网络拉流状态。
+     * 「直出还是转码」光看歌名分不出来 —— 而且**断流续播会把它从"直出"翻成"转码"**
+     * （续播带 timeOffset，而 raw 流不吃 timeOffset），屏幕上一眼就能看出这个陷阱。
+     * 速率用 fetch_bytes 的增量算；这段每秒跑一次，正好一个采样周期。 */
+    {
+        static uint64_t last_bytes;
+        static uint32_t last_ms;
+        bool raw = subsonic_last_raw();
+
+        uint32_t now = lv_tick_get();
+        uint64_t bytes = audio_engine_fetch_bytes();
+        uint32_t kbs = 0;
+        if (last_ms && now > last_ms) {
+            kbs = (uint32_t)((bytes - last_bytes) * 1000 / (now - last_ms) / 1024);
+        }
+        last_bytes = bytes;
+        last_ms = now;
+
+        ui_set_text(s_lbl_mode, raw ? "直出" : "转码");
+        lv_obj_set_style_text_color(s_lbl_mode,
+                                    lv_color_hex(raw ? 0x1B7F3B : 0xC77700), 0);
+        char nbuf[20];
+        /* 速率/缓冲水位：缓冲掉到 0 就是欠载的前兆，能提前看出来 */
+        snprintf(nbuf, sizeof(nbuf), "%uK/%uK",
+                 (unsigned)kbs, (unsigned)(audio_engine_ring_used_in() / 1024));
+        ui_set_text(s_lbl_net, nbuf);
+    }
+
     /* 收藏状态（长按 K1 之后要立刻反映） */
     static bool last_starred;
     if (force || st.starred != last_starred) {
@@ -702,10 +732,14 @@ static void build_play_screen(void)
      * 必须同时限定宽和高，否则 LVGL 的 label 会自己长高、溢出卡片。
      * 作者名经常很长（实测 "Le Bober/George Daniel/Adam Hann/..."），
      * 单行 + 循环滚动才看得全 */
-    s_lbl_artist = ui_put_label(scr, "", 86, 32, 66, ui_font_12, 0x3C3C40,
-                               LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
-    lv_obj_set_height(s_lbl_artist, 16);
-    lv_obj_set_style_anim_duration(s_lbl_artist, 9000, 0);
+    /* 右栏：原来这里是歌手名，用户要求去掉歌手，改显示"解码模式 + 网络拉流状态"。
+     * 两行 12px：上行模式（直出/转码，带颜色），下行"速率/缓冲"。
+     * 宽度沿用歌手的 66px（x 86..152）—— 左边是封面(5..77)、右边是屏边，
+     * 下沿 56 也刚好不碰播放圆钮（y 58 起）。 */
+    s_lbl_mode = ui_put_label(scr, "", 86, 30, 66, ui_font_12, 0x1B7F3B,
+                              LV_LABEL_LONG_MODE_CLIP);
+    s_lbl_net  = ui_put_label(scr, "", 86, 44, 66, ui_font_lat, 0x6E6E73,
+                              LV_LABEL_LONG_MODE_CLIP);
 
     /* 作者下方：播放状态按钮（32x32 圆钮，居中在卡片里 81..155 → x=102） */
     s_img_state = ui_put_img(scr, ASSET_IC_PLAY_BIG, 102, 58);

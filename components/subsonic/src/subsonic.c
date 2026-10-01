@@ -72,6 +72,8 @@ const char *subsonic_host(void) { return s_host; }
 bool subsonic_configured(void) { return s_host[0] != 0; }
 const char *subsonic_transcode(void) { return s_transcode; }
 int         subsonic_max_kbps(void) { return s_max_kbps; }
+static bool s_last_raw = false;
+bool subsonic_last_raw(void) { return s_last_raw; }
 
 /* u/t/s 认证参数（salt 每次随机，t = md5(pass+salt) 小写 hex） */
 static void append_auth_ex(char *url, size_t len, const char *user, const char *pass)
@@ -510,7 +512,7 @@ static bool suffix_direct_playable(const char *suffix)
  * ⚠️ 这个阈值是实测出来的，不是拍的：峰值 194 KB/s 留一半余量取 120
  *    （约 960kbps）。BLE 砍掉之后 WiFi 缓冲还能再放大，那时可以往上调 ——
  *    但**别贴着峰值设**，WiFi 抖动是常态，贴着就会周期性卡。 */
-#define DIRECT_PLAY_MAX_KBS  120
+#define DIRECT_PLAY_MAX_KBS  300
 
 static bool bitrate_fits_direct(const sub_song_t *song)
 {
@@ -564,6 +566,7 @@ static esp_err_t stream_url_ex(const sub_song_t *song, int max_kbps, uint32_t of
         snprintf(out + cur, out_len - cur, "&timeOffset=%" PRIu32, offset_s);
     }
     append_auth(out, out_len);
+    s_last_raw = raw;      /* 屏幕/网页显示"直出还是转码"用 */
     return ESP_OK;
 }
 
