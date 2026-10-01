@@ -670,6 +670,8 @@ const char *audio_engine_format_str(void)
 uint8_t audio_engine_bit_depth(void) { return s_bits; }
 
 size_t audio_engine_ring_in_cap(void) { return RING_IN_BYTES; }
+size_t audio_engine_ring_pcm_used(void) { return audio_ring_used(&s_rpcm); }
+size_t audio_engine_ring_pcm_cap(void) { return RING_PCM_BYTES; }
 
 uint32_t audio_engine_position_ms(void)
 {

@@ -256,10 +256,15 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(au, "bits", audio_engine_bit_depth());
     cJSON_AddBoolToObject(au, "raw", subsonic_last_raw());
     cJSON_AddNumberToObject(au, "ring_kb", audio_engine_ring_used_in() / 1024);
-    /* 缓冲占用百分比（前端显示用；分母从引擎取，别在前端硬编码 512）*/
+    /* 缓冲【已用/总量】（分母从引擎取，别在前端硬编码 512）*/
     size_t ring_cap = audio_engine_ring_in_cap();
+    cJSON_AddNumberToObject(au, "ring_cap_kb", ring_cap / 1024);
     cJSON_AddNumberToObject(au, "ring_pct",
                             ring_cap ? (double)audio_engine_ring_used_in() * 100.0 / ring_cap : 0);
+    /* 解码后的 PCM 缓冲（同理）*/
+    size_t pcm_cap = audio_engine_ring_pcm_cap();
+    cJSON_AddNumberToObject(au, "pcm_kb",     audio_engine_ring_pcm_used() / 1024);
+    cJSON_AddNumberToObject(au, "pcm_cap_kb", pcm_cap / 1024);
     cJSON_AddNumberToObject(au, "qual", subsonic_quality_current());   /* 当前音质挡位下标 */
     cJSON_AddNumberToObject(au, "underruns", audio_engine_underruns());
 

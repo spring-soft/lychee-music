@@ -675,17 +675,21 @@ static void play_refresh(void)
         last_bytes = bytes;
         last_ms = now;
 
-        ui_set_text(s_lbl_mode, raw ? "直出" : "转码");
+        /* 上行：模式 + 网络速率。速率是这一屏里唯一"一直在动"的数，
+         * 所以和模式放一行，把整行留给缓冲。 */
+        char mbuf[20];
+        snprintf(mbuf, sizeof(mbuf), "%s %uK", raw ? "直出" : "转码", (unsigned)kbs);
+        ui_set_text(s_lbl_mode, mbuf);
         lv_obj_set_style_text_color(s_lbl_mode,
                                     lv_color_hex(raw ? 0x1B7F3B : 0xC77700), 0);
+        /* 下行：缓冲【占用量 + 占用率】（用户要百分率，但量也留着，两个都在一眼看全）。
+         * ⚠️ 健康时就是 512K / 100% —— 网络供得上，预读一直填满。
+         *    **它掉下来才说明网络跟不上、快欠载了**；一直满反而是好事。 */
+        size_t used = audio_engine_ring_used_in();
+        size_t cap  = audio_engine_ring_in_cap();
         char nbuf[20];
-        /* 速率 + 缓冲占用【百分比】（用户要求：别显示 KB，看百分比更直观）。
-         * 分母取 audio_engine_ring_in_cap() 而不是硬编码 512 —— 那个常量在
-         * audio_engine.c 里，改了这边会自动跟上。
-         * 百分比掉到 0 就是欠载的前兆，能提前看出来。 */
-        size_t cap = audio_engine_ring_in_cap();
-        unsigned pct = cap ? (unsigned)(audio_engine_ring_used_in() * 100 / cap) : 0;
-        snprintf(nbuf, sizeof(nbuf), "%uK %u%%", (unsigned)kbs, pct);
+        snprintf(nbuf, sizeof(nbuf), "%uK %u%%",
+                 (unsigned)(used / 1024), (unsigned)(cap ? used * 100 / cap : 0));
         ui_set_text(s_lbl_net, nbuf);
     }
 
