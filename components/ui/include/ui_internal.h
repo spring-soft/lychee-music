@@ -30,7 +30,7 @@ typedef enum {
     UI_PAGE_SEARCH_IN,    /* M8：输入页（字母格 + 拼音候选字，两种模式共用一页）*/
     UI_PAGE_SEARCH_RES,   /* M8：搜索结果列表 */
     UI_PAGE_SETTINGS,     /* 设置二级菜单（主菜单"设置"那一项按 K3 进来的）*/
-    UI_PAGE_QUALITY,      /* 音质二级菜单（主菜单"音质"那一项按 K3 进来的）*/
+    UI_PAGE_MEM,          /* 内存用量图表（系统信息页长按 K3 进来的）*/
     UI_PAGE_COUNT,
 } ui_page_t;
 
@@ -91,17 +91,13 @@ void ui_srcmenu_activate(void);     /* K3：确定并退回主菜单 */
 void ui_setmenu_open(void);
 void ui_setmenu_move(int delta);
 void ui_setmenu_activate(void);
-/* 开机续播开关（存 NVS，默认开）—— player.c 的续播逻辑要读它 */
-bool ui_resume_enabled(void);
+/* 开机续播已按用户要求取消（不再提供开关，player.c 一律从 0:00 开始放）*/
+
+/* 内存用量图表页：系统信息页长按 K3 进来，只画 PSRAM（flash 基本不变，用户说不用）*/
+void ui_mem_open(void);
 
 /* 离开音量/亮度页时调用：把去抖中的改动立刻落盘（本机是硬断电，没有关机补写的机会）*/
 void ui_vol_commit(void);
-
-/* 音质二级菜单：K1/K2 选挡、K3 确定并退回菜单、K4 返回 */
-void ui_qualmenu_open(void);
-void ui_qualmenu_move(int delta);
-void ui_qualmenu_activate(void);
-const char *ui_quality_name(void);   /* 当前挡位的短名（主菜单那行显示用）*/
 void ui_vol_set_mode(bool brightness);
 void ui_vol_open(bool brightness, bool remote);  /* 打开音量页并记住来路（K4 回上一级）*/
 ui_page_t ui_page_parent(ui_page_t p);           /* K4 短按的"上一级" */

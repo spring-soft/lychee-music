@@ -13,6 +13,8 @@
  */
 #include <string.h>
 #include <inttypes.h>
+#include "esp_heap_caps.h"   /* 内存图表页要读 PSRAM 的总量/余量 */
+#include "esp_timer.h"
 #include "ui.h"
 #include "ui_internal.h"
 #include "assets.h"
@@ -172,7 +174,9 @@ static void build_list_screen(void)
 #define MENU_ROWS  6                       /* 屏上能放 6 行 */
 #define MENU_ROW_H 17
 #define MENU_Y0    22                      /* 对应 bg_menu 的 TOPBAR_H + 2 */
-#define MENU_N     6                       /* 菜单总项数（正好一屏 MENU_ROWS=6） */
+/* 菜单总项数（一屏 MENU_ROWS=6 行，5 项正好）。
+ * 2026-10-01 用户要求简化：删掉"音质"（固定用最高）、删掉"蓝牙控制"（BLE 已编掉）。*/
+#define MENU_N     5
 
 static lv_obj_t *s_scr_menu;
 static lv_obj_t *s_menu_hl;
@@ -184,9 +188,8 @@ static bool      s_menu_dirty = true;
 
 static const char *menu_name(int i)
 {
-    /* 前两项是动态的（当前来源 / 当前音质挡位），文本在这两个静态缓冲里 */
+    /* 只有"来源"那一项的文字是动态的，文本在这个静态缓冲里 */
     static char s_menu_src_lbl[48];
-    static char s_menu_qual_lbl[48];
     switch (i) {
         /* ★ 来源只占【一项】，冒号后面直接显示当前来源；
          *   按 K3 进二级菜单选（K1/K2 选、K3 确定退出）。 */
@@ -194,30 +197,24 @@ static const char *menu_name(int i)
             snprintf(s_menu_src_lbl, sizeof(s_menu_src_lbl), "来源: %s",
                      player_src_name(player_source()));
             return s_menu_src_lbl;
-        /* ★ 音质同样只占一项，冒号后显示当前挡位（用户要求新增）*/
-        case 1:
-            snprintf(s_menu_qual_lbl, sizeof(s_menu_qual_lbl), "音质: %s", ui_quality_name());
-            return s_menu_qual_lbl;
-        case 2: return "搜索";                 /* ★ 取代原来的"播放 / 暂停" */
-        case 3: return "屏幕亮度";
+        case 1: return "搜索";                 /* ★ 取代原来的"播放 / 暂停" */
+        case 2: return "屏幕亮度";
         /* ★ 2026-10-01：这里原来是"重连 WiFi"，用户要求换成"设置"，
          *   重连挪进设置二级菜单（并且在那边加了二次确认）。 */
-        case 4: return "设置";
-        case 5: return "系统信息";
+        case 3: return "设置";
+        case 4: return "系统信息";
         default: return "";
     }
 }
 
 static void menu_render(void)
 {
-    /* 有动态文字的项（来源 / 音质）一变就把菜单标脏，否则要等到用户翻页才刷新
-     * —— 用户会以为"改了但屏幕上没反应"。
-     * （2026-10-01：删掉"蓝牙控制"后是来源一项；加"音质"后是两项。）*/
+    /* 只有"来源"是动态的。它一变就把菜单标脏，否则要等到用户翻页才刷新
+     * —— 用户会以为"换了来源但屏幕上没反应"。 */
     {
         static char prev[64];
         char now[64];
-        snprintf(now, sizeof(now), "%s|%s",
-                 player_src_name(player_source()), ui_quality_name());
+        snprintf(now, sizeof(now), "%s", player_src_name(player_source()));
         if (strcmp(now, prev) != 0) {
             strlcpy(prev, now, sizeof(prev));
             s_menu_dirty = true;
@@ -267,12 +264,12 @@ ui_page_t ui_page_parent(ui_page_t p)
         case UI_PAGE_MENU:        return UI_PAGE_PLAY;
         case UI_PAGE_SRC:         return UI_PAGE_MENU;
         case UI_PAGE_SETTINGS:    return UI_PAGE_MENU;   /* 设置页的上一级 = 菜单 */
-        case UI_PAGE_QUALITY:     return UI_PAGE_MENU;   /* 音质页的上一级 = 菜单 */
         case UI_PAGE_SEARCH_MODE: return UI_PAGE_MENU;
         case UI_PAGE_SEARCH_IN:   return UI_PAGE_SEARCH_MODE;   /* 用户要的：回输入页要先过方式选择 */
         case UI_PAGE_SEARCH_RES:  return UI_PAGE_SEARCH_IN;     /* 用户要的：方便改词重搜 */
         case UI_PAGE_LIST:        return UI_PAGE_PLAY;
         case UI_PAGE_INFO:        return UI_PAGE_MENU;
+        case UI_PAGE_MEM:         return UI_PAGE_INFO;   /* 内存图表页的上一级 = 系统信息 */
         case UI_PAGE_VOL:         return s_vol_back;
         case UI_PAGE_BT:          return UI_PAGE_PLAY;          /* 遥控页的"上一级"= 退出模式 */
         default:                  return UI_PAGE_PLAY;
@@ -353,39 +350,28 @@ void ui_srcmenu_activate(void)
 
 /* ============================================================ 设置二级菜单
  *
- * 用户要求：主菜单原来的"重连 WiFi"换成"设置"，按 K3 进这一页，里面有
- *   1) 开机续播 —— 开/关（存 NVS，player.c 的续播逻辑读同一个键）
- *   2) 重连 WiFi —— ★ 必须二次确认
+ * 用户要求：主菜单原来的"重连 WiFi"换成"设置"，按 K3 进这一页。
+ * （2026-10-01 再简化：删掉"开机续播"——用户不要断点续播了，所以这一页只剩重连 WiFi。）
  *
- * 为什么要确认：重连会把当前连接掐掉、正在放的歌会中断。原来它直接摆在主菜单里
- * 按一下就执行，往上翻菜单很容易误触。现在第一次按 K3 只是把这一行变成
+ * 重连为什么要二次确认：重连会把当前连接掐掉、正在放的歌会中断。原来它直接摆在
+ * 主菜单里按一下就执行，往上翻菜单很容易误触。现在第一次按 K3 只是把这一行变成
  * "重连 WiFi？再按K3确认"，再按一次才真的动网络，K4 随时退出。
- *
- * ⚠️ NVS 键名 "resume_on" 在两处硬编码（这里 + player.c）—— player 是 ui 的
- *    下层，不能反向 include ui，所以没法共用一个宏。改的时候两边一起改。
  */
-#define SET_N  2
+#define SET_N  1
 
 static lv_obj_t *s_scr_set, *s_set_hl, *s_set_lbl[SET_N];
 static int       s_set_sel;
 static int       s_set_r_sel = -1;
 static bool      s_set_confirm;      /* true = 正停在"重连 WiFi"的确认态 */
 
-bool ui_resume_enabled(void) { return settings_get_int("resume_on", 1) != 0; }
-
 static void set_render(void)
 {
-    for (int i = 0; i < SET_N; i++) {
-        char buf[48];
-        if (i == 0) {
-            snprintf(buf, sizeof(buf), "开机续播 %s", ui_resume_enabled() ? "开" : "关");
-        } else {
-            /* 确认态下把提示直接写在行里 —— 这个屏幕上没有独立的弹窗层，
-             * 复用同一行最省事，也不会盖住别的东西。 */
-            snprintf(buf, sizeof(buf), "重连 WiFi%s", s_set_confirm ? "？再按K3确认" : "");
-        }
-        ui_set_text(s_set_lbl[i], buf);
-    }
+    /* 确认态下把提示直接写在行里 —— 这个屏幕上没有独立的弹窗层，
+     * 复用同一行最省事，也不会盖住别的东西。 */
+    char buf[48];
+    snprintf(buf, sizeof(buf), "重连 WiFi%s", s_set_confirm ? "？再按K3确认" : "");
+    ui_set_text(s_set_lbl[0], buf);
+
     int y = MENU_Y0 + s_set_sel * MENU_ROW_H;
     if (s_set_r_sel < 0 || lv_obj_get_y(s_set_hl) != y) {
         ui_anim_slide_obj(s_set_hl, y, 120);
@@ -429,13 +415,6 @@ void ui_setmenu_move(int delta)
 
 void ui_setmenu_activate(void)
 {
-    if (s_set_sel == 0) {
-        bool was = ui_resume_enabled();
-        settings_set_int("resume_on", was ? 0 : 1);
-        ui_toast(was ? "开机续播已关" : "开机续播已开");
-        set_render();
-        return;
-    }
     /* 重连 WiFi：两段式 */
     if (!s_set_confirm) {
         s_set_confirm = true;
@@ -449,81 +428,6 @@ void ui_setmenu_activate(void)
     ui_page_show(UI_PAGE_MENU);     /* 确认后退出，让它自己去连 */
 }
 
-/* ============================================================ 音质二级菜单
- *
- * 用户要求：主菜单加一项"音质"，进去选挡位（K1/K2 选、K3 确认、K4 返回）。
- * 挡位表本身在 subsonic 层 —— 屏幕和网页控制台共用同一套，各写一份必然不一致。
- */
-#define QUAL_N  subsonic_quality_count()
-
-const char *ui_quality_name(void) { return subsonic_quality_name(subsonic_quality_current()); }
-
-static lv_obj_t *s_scr_qual, *s_qual_hl, *s_qual_lbl[6];
-static int       s_qual_sel;
-static int       s_qual_r_sel = -1;
-
-static void qual_render(void)
-{
-    int n = QUAL_N, cur = subsonic_quality_current();
-    for (int i = 0; i < n && i < 6; i++) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "%s%s", subsonic_quality_name(i), (i == cur) ? "（当前）" : "");
-        ui_set_text(s_qual_lbl[i], buf);
-    }
-    int y = MENU_Y0 + s_qual_sel * MENU_ROW_H;
-    if (s_qual_r_sel < 0 || lv_obj_get_y(s_qual_hl) != y) {
-        ui_anim_slide_obj(s_qual_hl, y, 120);
-    }
-    s_qual_r_sel = s_qual_sel;
-}
-
-static void build_qual_screen(void)
-{
-    lv_obj_t *scr = ui_new_screen();
-    s_scr_qual = scr;
-    ui_page_register(UI_PAGE_QUALITY, scr);
-
-    ui_put_img(scr, ASSET_BG_MENU, 0, 0);
-    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
-    ui_put_label_1line(scr, "音质", 20, 2, 134, ui_font_16, 0x1C1C1E);
-
-    s_qual_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
-    int n = QUAL_N;   /* 挡位数来自 subsonic 层，可能是运行时值，用它给 s_qual_lbl 定上界 */
-    if (n > 6) n = 6;
-    for (int i = 0; i < n; i++) {
-        s_qual_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
-                                           136, ui_font_12, 0x1C1C1E);
-    }
-    ESP_LOGI(TAG, "音质二级菜单已建好（%d 挡）", n);
-}
-
-void ui_qualmenu_open(void)
-{
-    s_qual_sel   = subsonic_quality_current();  /* 光标默认停在当前挡位 */
-    s_qual_r_sel = -1;
-    qual_render();
-    ui_page_show(UI_PAGE_QUALITY);
-}
-
-void ui_qualmenu_move(int delta)
-{
-    s_qual_sel = (s_qual_sel + delta + QUAL_N) % QUAL_N;
-    qual_render();
-}
-
-void ui_qualmenu_activate(void)
-{
-    /* 立刻生效并存 NVS(ns "nav")，所以改完不用再点"应用" */
-    if (subsonic_quality_set(s_qual_sel) != ESP_OK) {
-        ui_toast("设置失败");
-        return;
-    }
-    s_menu_dirty = true;             /* 主菜单那行"音质: X"要跟着变 */
-    /* "强制无损" 的副作用要当场说清楚 —— 不然用户会遇到"seek 没反应"却不知道原因 */
-    if (!strcmp(subsonic_transcode(), "raw")) ui_toast("强制无损：seek 会失效");
-    else                                      ui_toast(subsonic_quality_name(s_qual_sel));
-    ui_page_show(UI_PAGE_MENU);      /* 确认并退出（回上级菜单）*/
-}
 
 /* 系统信息整页 —— 一行 toast 放不下这么多事实（IP + 内存 + 欠载 + …），
  * 用户反馈"根本显示不全"。7 行 × 15px，对应 bg_info 的底图。 */
@@ -587,6 +491,110 @@ static void info_render(void)
         info_line(i, buf, sizeof(buf));
         ui_set_text(s_info_lbl[i], buf);      /* 内部先比较，没变就不重绘 */
     }
+}
+
+/* ============================================================ 内存用量图表
+ *
+ * 用户要求：系统信息页【长按 K3】进来，看整机 PSRAM 用量随时间的变化。
+ * （flash 用量基本不动，用户说不需要，所以只画 PSRAM。）
+ *
+ * 画法：一排竖条，每根 = 一次采样（占用率 0~100% 映射成条高）——
+ * 1 秒采一次、30 根 × 5px = 150px 铺满屏宽 → 30 秒历史，像示波器那样从右往左滚。
+ * 为什么不用 LVGL 的 lv_chart：9.x 的 chart API 和 8.x 差别不小，
+ * 而这页只需要最朴素的柱状图，用普通矩形既好控样式、又没有 API 版本风险。
+ */
+#define MEM_BARS   30
+#define MEM_BAR_W  5          /* 其中 1px 留作间隙 */
+#define MEM_X0     5
+#define MEM_Y0     36         /* 图表区上沿 */
+#define MEM_H      60         /* 100% 占用对应的高度 */
+
+static lv_obj_t *s_scr_mem;
+static lv_obj_t *s_mem_bar[MEM_BARS];
+static lv_obj_t *s_mem_txt;
+static uint8_t   s_mem_hist[MEM_BARS];   /* 历史占用率 0..100，[0] 最旧 */
+static int       s_mem_n;                /* 已经填了几根 */
+static int64_t   s_mem_last_ms;          /* 上次采样时刻 */
+
+static uint8_t mem_pct(void)
+{
+    size_t tot = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t fre = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    return tot ? (uint8_t)((tot - fre) * 100 / tot) : 0;
+}
+
+static void mem_render(void)
+{
+    /* 1 秒采一次（ui_pages_tick 跑得比这快，所以在这里限流）*/
+    int64_t now = esp_timer_get_time() / 1000;
+    bool sampled = false;
+    if (s_mem_last_ms == 0) {
+        s_mem_last_ms = now;             /* 刚进来：先记时刻，别立刻采一条 0 */
+    } else if (now - s_mem_last_ms >= 1000) {
+        s_mem_last_ms = now;
+        uint8_t p = mem_pct();
+        if (s_mem_n < MEM_BARS) {
+            s_mem_hist[s_mem_n++] = p;
+        } else {
+            memmove(s_mem_hist, s_mem_hist + 1, MEM_BARS - 1);
+            s_mem_hist[MEM_BARS - 1] = p;
+        }
+        sampled = true;
+    }
+
+    size_t tot = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t fre = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "PSRAM 用 %u / %u KB",
+             (unsigned)((tot - fre) / 1024), (unsigned)(tot / 1024));
+    ui_set_text(s_mem_txt, buf);
+
+    /* 条子只在真的采到新样本时才动 —— 每个 tick 无条件 set_pos/set_size
+     * 会让 LVGL 反复标脏重绘，白吃内部 SRAM 带宽。 */
+    if (!sampled) return;
+    for (int i = 0; i < MEM_BARS; i++) {
+        uint8_t p = (i < s_mem_n) ? s_mem_hist[i] : 0;
+        int h = (int)p * MEM_H / 100;
+        if (h < 1) h = 1;                /* 0% 也留一条底线，看得出"这格有采样" */
+        lv_obj_set_pos(s_mem_bar[i], MEM_X0 + i * MEM_BAR_W, MEM_Y0 + MEM_H - h);
+        lv_obj_set_size(s_mem_bar[i], MEM_BAR_W - 1, h);
+    }
+}
+
+static void build_mem_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    s_scr_mem = scr;
+    ui_page_register(UI_PAGE_MEM, scr);
+
+    ui_put_img(scr, ASSET_BG_INFO, 0, 0);      /* 复用系统信息页的底图，省一套素材 */
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    ui_put_label_1line(scr, "内存用量", 20, 2, 134, ui_font_16, 0x1C1C1E);
+    s_mem_txt = ui_put_label_1line(scr, "", 6, 20, 148, ui_font_12, 0x3C3C40);
+
+    for (int i = 0; i < MEM_BARS; i++) {
+        lv_obj_t *b = lv_obj_create(scr);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x1A73E8), 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_pos(b, MEM_X0 + i * MEM_BAR_W, MEM_Y0 + MEM_H - 1);
+        lv_obj_set_size(b, MEM_BAR_W - 1, 1);
+        s_mem_bar[i] = b;
+    }
+    ESP_LOGI(TAG, "内存图表页已建好（%d 根柱，1 秒一根）", MEM_BARS);
+}
+
+void ui_mem_open(void)
+{
+    s_mem_n       = 0;
+    s_mem_last_ms = 0;       /* 重置计时，进来后第一秒才开始记 */
+    memset(s_mem_hist, 0, sizeof(s_mem_hist));
+    for (int i = 0; i < MEM_BARS; i++) {
+        lv_obj_set_pos(s_mem_bar[i], MEM_X0 + i * MEM_BAR_W, MEM_Y0 + MEM_H - 1);
+        lv_obj_set_size(s_mem_bar[i], MEM_BAR_W - 1, 1);
+    }
+    mem_render();            /* 先把那行数字填上，别空着 */
+    ui_page_show(UI_PAGE_MEM);
 }
 
 /* ============================================================ 蓝牙控制页（M7）
@@ -683,11 +691,10 @@ static void menu_activate(int i)
 {
     switch (i) {
         case 0: ui_srcmenu_open(); break;        /* 来源 → 二级菜单 */
-        case 1: ui_qualmenu_open(); break;       /* 音质 → 二级菜单 */
-        case 2: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
-        case 3: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
-        case 4: ui_setmenu_open(); break;        /* 设置 → 二级菜单 */
-        case 5: ui_page_show(UI_PAGE_INFO); break;
+        case 1: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
+        case 2: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
+        case 3: ui_setmenu_open(); break;        /* 设置 → 二级菜单 */
+        case 4: ui_page_show(UI_PAGE_INFO); break;
         default: break;
     }
 }
@@ -898,7 +905,8 @@ void ui_pages_build(void)
     build_bt_screen();
     build_src_screen();
     build_set_screen();              /* 设置二级菜单（开机续播 / 重连 WiFi）*/
-    build_qual_screen();             /* 音质二级菜单（5 个挡位）*/
+    /* 音质二级菜单已按用户要求删除（固定用最高：无损优先）*/
+    build_mem_screen();              /* 内存用量图表（系统信息页长按 K3 进）*/             /* 音质二级菜单（5 个挡位）*/
     ui_search_build();               /* M8：搜索方式 / 输入 / 结果 三页 */
     vol_render(true);
 }
@@ -975,6 +983,7 @@ void ui_pages_tick(void)
         case UI_PAGE_MENU: menu_render();      break;
         case UI_PAGE_VOL:  vol_render(false);  break;
         case UI_PAGE_INFO: info_render();      break;
+        case UI_PAGE_MEM:  mem_render();       break;
         case UI_PAGE_BT:   bt_render();        break;
         case UI_PAGE_SRC:  src_render();       break;
         case UI_PAGE_SEARCH_MODE:

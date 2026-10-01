@@ -440,17 +440,7 @@ input.sw:checked::after{transform:translateX(18px);}
   <!-- ================= Tab 3：设置 ================= -->
   <section id="pg-set" class="pg" hidden>
 
-    <!-- 音质挡位：和屏幕菜单用的是同一套（挡位表在 subsonic 层），点了立刻生效 -->
-    <div class="card acc-card">
-      <button class="acc" data-pn="pn-qual"><span>音质</span><span class="chev" data-chev></span></button>
-      <div class="panel" id="pn-qual" hidden>
-        <div class="qrow" id="qual-row"></div>
-        <div class="msg" id="qual-msg"></div>
-        <div class="hint">「无损优先」能直出就直出（FLAC/MP3/OGG/AAC/M4A），其余交给服务器转码。
-          「强制无损」绝不转码，但 <b>seek 会失效</b>，且解不了的格式（WMA/APE/DSD）放不出声。</div>
-      </div>
-    </div>
-
+    <!-- 音质挡位卡片已按用户要求删除：固定用最高（无损优先），不再给选项 -->
     <div class="card acc-card">
       <button class="acc" data-pn="pn-nav"><span>Navidrome 服务器</span><span class="chev" data-chev></span></button>
       <div class="panel" id="pn-nav" hidden>
@@ -903,11 +893,8 @@ function renderSong(){
                                           : ((au.fs / 1000).toFixed(1) + 'k');
     var txt = (au.raw ? '无损直出 ' : '转码 ') + au.fmt
             + (rate ? ' ' + rate : '') + (au.bits ? '/' + au.bits : '');
-    /* 听歌缓存占用率 = 已用量 / 全部为播放预留的缓冲（分母由后端算，见 audio_engine.h）。
-     * 只算单个环的话这个数会永远贴着 100%（网络跟得上时环就是满的），没有信息量。 */
-    if(typeof au.cache_pct === 'number')
-      txt += '  ·  听歌缓存 ' + Math.round(au.cache_pct) + '%（'
-           + au.cache_used_kb + '/' + au.cache_cap_kb + 'K）';
+    /* 缓冲百分比不显示了（用户要求删掉）——网络跟得上时它恒为 100%，没有信息量。
+     * 要判断"网络够不够"，看播放页右栏的速率（那个数一直在动）。 */
     if(au.underruns) txt += '  ·  欠载 ' + au.underruns;
     spEl.textContent = txt;
     spEl.className = 'pspec ' + (au.raw ? 'raw' : 'tc');
@@ -2099,34 +2086,8 @@ function bindEvents(){
   });
 
   /* Navidrome */
-  /* ---- 音质挡位 ----
-   * 挡位表和屏幕菜单共用（在 subsonic 层），所以两边显示的名字一定一致。
-   * 点一下立刻生效并存 NVS，不需要再点"保存"。 */
-  function renderQuality(){
-    var box = $('qual-row');
-    if(!box || !S.quals) return;
-    box.innerHTML = '';
-    (S.quals.items || []).forEach(function(nm, i){
-      var b = document.createElement('button');
-      b.className = 'qbtn' + (i === S.quals.i ? ' on' : '');
-      b.textContent = nm;
-      b.onclick = function(){
-        post('/api/quality', {i: i}).then(function(){
-          setMsg('qual-msg', '已切换：' + nm, 'ok');
-          loadQuality();
-        }, function(e){
-          setMsg('qual-msg', '切换失败：' + e.message, 'err');
-        });
-      };
-      box.appendChild(b);
-    });
-  }
-  function loadQuality(){
-    api('/api/quality', {}, 8000).then(function(d){ S.quals = d; renderQuality(); },
-                                      function(){});
-  }
-  S.loadQuality = loadQuality;      /* 切到设置页时拉一次（见页面切换处）*/
-  loadQuality();
+  /* 音质挡位选择已按用户要求删除：固定用最高（无损优先），不再给选项。
+   * 后端 /api/quality 接口保留着（没坏处），只是界面上不再暴露。 */
 
   $('cfg-save').onclick = saveConfig;
   $('cfg-test').onclick = testConfig;

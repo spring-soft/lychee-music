@@ -166,15 +166,6 @@ static void key_short(int k)
             }
             break;
 
-        case UI_PAGE_QUALITY:                   /* 音质二级菜单 */
-            switch (k) {
-                case 0: ui_qualmenu_move(-1); break;
-                case 1: ui_qualmenu_move(+1); break;
-                case 2: ui_qualmenu_activate(); break;  /* 确定并退回主菜单 */
-                default: break;              /* K4 由 k4_navigate 管 */
-            }
-            break;
-
         case UI_PAGE_SETTINGS:                  /* 设置二级菜单 */
             switch (k) {
                 case 0: ui_setmenu_move(-1); break;
@@ -210,6 +201,9 @@ static void key_long(int k)
     if (k4_navigate(k, true)) return;           /* 长按 K4 = 回播放器（除非在播放页）*/
     if (bt_key_long(k)) return;
     if (ui_search_key_long(k)) return;
+    /* ★ 用户要求：系统信息页【长按 K3】进"内存用量图表"。
+     *   必须放在下面那条"非播放页直接 return"之前，否则永远轮不到。 */
+    if (ui_page_current() == UI_PAGE_INFO && k == 2) { ui_mem_open(); return; }
     if (ui_page_current() != UI_PAGE_PLAY) return;   /* 播放页以外的长按没有其它语义 */
     switch (k) {
         case 0: {                                  /* 收藏 / 取消收藏 */

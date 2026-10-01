@@ -233,6 +233,7 @@ const char *ui_page_name(ui_page_t p)
         case UI_PAGE_MENU:        return "菜单";
         case UI_PAGE_VOL:         return "音量页";
         case UI_PAGE_INFO:        return "系统信息";
+        case UI_PAGE_MEM:         return "内存用量";
         case UI_PAGE_BT:          return "蓝牙控制";
         case UI_PAGE_SRC:         return "来源二级";
         case UI_PAGE_SEARCH_MODE: return "搜索方式";
@@ -675,20 +676,17 @@ static void play_refresh(void)
         last_bytes = bytes;
         last_ms = now;
 
-        /* 上行：模式 + 网络速率。速率是这一屏里唯一"一直在动"的数，
-         * 所以和模式放一行，把整行留给缓冲。 */
-        char mbuf[20];
-        snprintf(mbuf, sizeof(mbuf), "%s %uK", raw ? "直出" : "转码", (unsigned)kbs);
-        ui_set_text(s_lbl_mode, mbuf);
+        /* 上行：只有模式（用户要求：把速率挪到下一行，缓存那行删掉）*/
+        ui_set_text(s_lbl_mode, raw ? "直出" : "转码");
         lv_obj_set_style_text_color(s_lbl_mode,
                                     lv_color_hex(raw ? 0x1B7F3B : 0xC77700), 0);
-        /* 下行：听歌缓存的【占用率】—— 已用量 / 全部听歌缓存（见 audio_engine.h 的说明）。
-         * 分母是所有为播放预留的缓冲，不是单个环 —— 只算单个环的话网络跟得上时
-         * 分子分母都贴着满，那个百分比永远 100%、没有任何信息量。 */
-        size_t cu = audio_engine_audio_cache_used();
-        size_t cc = audio_engine_audio_cache_cap();
+
+        /* 下行：网络拉流速率。
+         * ⚠️ 单位写死 "/s" —— 之前只写 "80K"，用户完全看不出这是"速度"还是"用量"，
+         *    以为是缓存被用掉了 80K。速率是这一屏唯一一直在动的数，
+         *    它跟着歌的码率走（1623kbps 的歌显示 206K/s，555kbps 的显示 80K/s）。*/
         char nbuf[20];
-        snprintf(nbuf, sizeof(nbuf), "缓存 %u%%", (unsigned)(cc ? cu * 100 / cc : 0));
+        snprintf(nbuf, sizeof(nbuf), "%uK/s", (unsigned)kbs);
         ui_set_text(s_lbl_net, nbuf);
     }
 
@@ -745,7 +743,10 @@ static void build_play_screen(void)
      * 下沿 56 也刚好不碰播放圆钮（y 58 起）。 */
     s_lbl_mode = ui_put_label(scr, "", 86, 30, 66, ui_font_12, 0x1B7F3B,
                               LV_LABEL_LONG_MODE_CLIP);
-    s_lbl_net  = ui_put_label(scr, "", 86, 44, 66, ui_font_lat, 0x6E6E73,
+    /* ⚠️ 这里必须用 ui_font_12（中文），不能用 ui_font_lat ——
+     * 后者是纯拉丁字体，字库里没有汉字，写"缓存"会渲染成【两个方框】。
+     * （原来这行只显示 "195K/480K" 这种纯数字，所以才用拉丁字体；改成带中文之后必须换。） */
+    s_lbl_net  = ui_put_label(scr, "", 86, 44, 66, ui_font_12, 0x6E6E73,
                               LV_LABEL_LONG_MODE_CLIP);
 
     /* 作者下方：播放状态按钮（32x32 圆钮，居中在卡片里 81..155 → x=102） */
