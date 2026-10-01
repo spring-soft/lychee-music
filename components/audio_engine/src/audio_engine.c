@@ -23,11 +23,21 @@
 static const char *TAG = "ae";
 
 /* ---------------- 缓冲与参数 ---------------- */
-#define RING_IN_BYTES        (128 * 1024)   /* 压缩流预取（沿用实测有效的 128KB） */
-#define RING_PCM_BYTES       (128 * 1024)   /* 解码后 PCM（44.1k/16bit/stereo ≈ 740ms） */
+/* 压缩流预取 —— 抗【网络】抖动的唯一缓冲，直出无损之后这条最关键。
+ * 128KB 在转码 MP3 192k（24KB/s）时代 ≈ 5.3 秒余量，够用；
+ * 但直出 FLAC 后码率翻好几倍：16/44.1 无损一般 800~1000kbps（约 110KB/s）→ 只剩 1.2 秒，
+ * 24/96 更掉到 0.5 秒以下，WiFi 一抖就断供。
+ * 提到 512KB：44.1k ≈ 4.7 秒、96k ≈ 1.7 秒。走 PSRAM，8MB 里占得起。 */
+#define RING_IN_BYTES        (512 * 1024)
+/* 解码后 PCM。解码器比实时快得多，这条不是瓶颈，但 96k 时同样缩水：
+ * 128KB 在 44.1k/16bit 是 740ms，到 96k 只剩 340ms。
+ * 提到 256KB：44.1k ≈ 1.5 秒、96k ≈ 680ms。 */
+#define RING_PCM_BYTES       (256 * 1024)
 /* 起播前先攒多少 PCM。⚠️ 实测 32KB(186ms) 走网络流时不够 —— DMA 里本身就压着 185ms，
- *    网络一抖动就 underrun（实测 MP3 over HTTP 出现 12 次）。96KB ≈ 545ms 才稳。 */
-#define PCM_PREBUFFER_BYTES  (96 * 1024)
+ *    网络一抖动就 underrun（实测 MP3 over HTTP 出现 12 次）。96KB ≈ 545ms 才稳。
+ * 直出无损后网络压力更大，提到 128KB（44.1k ≈ 743ms、96k ≈ 333ms），
+ * 代价只是起播多等约 200ms。 */
+#define PCM_PREBUFFER_BYTES  (128 * 1024)
 #define DEC_STAGE_INIT       (32 * 1024)
 #define DEC_STAGE_MAX        (128 * 1024)   /* FLAC 单帧远大于 MP3，必须能长 */
 #define PCM_OUT_CAP          (256 * 1024)
@@ -544,6 +554,12 @@ esp_err_t audio_engine_init(void)
     if (s_inited) return ESP_OK;
     if (audio_ring_init(&s_rin,  RING_IN_BYTES,  "ring_in")  != ESP_OK) return ESP_ERR_NO_MEM;
     if (audio_ring_init(&s_rpcm, RING_PCM_BYTES, "ring_pcm") != ESP_OK) return ESP_ERR_NO_MEM;
+    /* 缓冲都走 PSRAM。直出无损把 ring_in 提到 512KB 后这一项吃得不轻，
+     * 开机打一行余量，方便回答"是不是内存不够了"。 */
+    ESP_LOGI(TAG, "[mem] ring_in=%uKB + ring_pcm=%uKB；PSRAM 余 %u KB / 内部 SRAM 余 %u KB",
+             (unsigned)(RING_IN_BYTES / 1024), (unsigned)(RING_PCM_BYTES / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     /* ⚠️ 两层都要注册：
      *   1) esp_audio_dec_register_default()    —— 底层真正的 MP3/AAC/FLAC 解码器
      *   2) esp_audio_simple_dec_register_default() —— 上层的解析器包装

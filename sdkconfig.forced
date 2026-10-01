@@ -95,3 +95,42 @@ CONFIG_ESP_WIFI_RX_IRAM_OPT=n
 # 代价是 LVGL 遍历控件树时多走外部 RAM，但实测 lv_timer 最坏 7~16ms，有余量。
 # ⚠️ 这条不是"调优"：不降的话 BLE 直接起不来。
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
+
+# ===== 音乐库里有 99 个 OGG，打开 Vorbis 解码器让它们直出 =====
+#
+# 背景：曲库 781 首里 681 个 FLAC（已直出）、**99 个 Ogg/Vorbis**、1 个 m4a。
+# OggS 的格式嗅探早就有了（audio_engine.c 认魔数），唯独解码器没编进来 ——
+# 于是这 99 首只能让服务端转成 MP3 192k，在 Vorbis 本身的损失上【再叠一层 MP3 损失】。
+#
+# 试过的另一条路走不通：让服务端转 FLAC。两个理由 ——
+#   1) Navidrome 的转码配置里【没有 flac 这一档】，实测请求 format=flac 会被
+#      退回成"直接发原文件"（返回的还是 OggS，不是 FLAC）。
+#   2) 就算支持也不划算：Vorbis 本来就是有损，转 FLAC 只是把有损结果原样存成
+#      无损（音质上限不变），而且 FLAC 比原 OGG 还大 50%+，纯白费 WiFi 带宽。
+#
+# 直接解 Vorbis 才是正解：原文件原样、零额外损失、带宽最省、服务器零负担。
+# 全部 99 个文件实测确认是 Vorbis（不是 Opus/FLAC 装在 Ogg 里），所以不需要开 Opus。
+CONFIG_AUDIO_DECODER_VORBIS_SUPPORT=y
+
+# ===== 补齐其余【音乐类】解码器，目标是插 TF 卡时绝大多数格式都能本地解 =====
+#
+# 这个组件能提供的解码器一共 14 个，按"音乐文件会不会用到"分两类：
+#
+#   ✅ 开（音乐文件常见）：
+#      MP3 / FLAC / AAC / PCM  —— 本来就有（CONFIG_AUDIO_DECODER_*_SUPPORT）
+#      VORBIS                  —— 见上，曲库 99 首 Ogg
+#      OPUS                    —— Ogg 里装 Opus 的越来越多；也是 Navidrome 不带
+#                                 format 时的默认转码目标（本工程显式给了 format 才避开）
+#      ALAC                    —— Apple 无损，装在 m4a 里。开了它 m4a 才两种编码通吃
+#      ADPCM                   —— 少数 WAV 用它
+#
+#   ❌ 不开（语音/蓝牙编码，音乐文件不会有）：
+#      G711 / G722（电话）、AMRNB / AMRWB（手机录音）、SBC / LC3（蓝牙传输）
+#      开了只是白白增加 .text 和格式嗅探时的误判面，没有任何文件会命中。
+#
+# ⚠️ 能力边界（组件里【根本没有】这些解码器，开了配置也解不了）：
+#      WMA、APE(Monkey's Audio)、DSD/DSF
+#    联网时还能靠服务端转码绕过；**脱机插 TF 卡时这些格式就是放不了**，别再找开关。
+CONFIG_AUDIO_DECODER_OPUS_SUPPORT=y
+CONFIG_AUDIO_DECODER_ALAC_SUPPORT=y
+CONFIG_AUDIO_DECODER_ADPCM_SUPPORT=y

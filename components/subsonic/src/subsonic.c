@@ -461,12 +461,16 @@ esp_err_t subsonic_star(const char *song_id, bool on)
  * 判据用 Subsonic 返回的 suffix（sub_song_t.suffix，列表/搜索/单曲接口里都带），
  * 不需要额外发请求。
  *
- * ⚠️ 只列【本固件确实解得了、且后缀无歧义】的两种：
+ * ⚠️ 只列【本固件确实解得了】的常见音乐后缀（解码器见 sdkconfig.forced）：
  *     mp3  → MP3 解码器
  *     flac → FLAC 解码器
- * 故意不含 m4a / ogg：m4a 容器里可能是 ALAC、ogg 里可能是 Vorbis，
- * 这两种解码器本工程都没开（见 sdkconfig 的 CONFIG_AUDIO_DECODER_*）。
- * 直出了解不了 = 直接没声音，比转码一声道还糟。拿不准就交给服务端转码。
+ *     ogg  → Vorbis 解码器（曲库 99 首）
+ *     aac  → AAC 解码器（裸 ADTS）
+ *     m4a  → AAC 或 ALAC 解码器（两个都开了，所以 m4a 不再是歧义后缀）
+ *
+ * ⚠️ 组件里【根本没有】WMA / APE / DSD 的解码器 —— 这些后缀无论怎么配都解不了，
+ *    必须交给服务端转码（脱机插 TF 卡时就是放不了，不是配置问题）。
+ *    直出了解不了 = 直接没声音，比转码一条声道还糟，所以宁缺毋滥。
  *
  * ⚠️ 已知代价：FLAC 直出会丢最后一个 block（约 89ms）—— 流式 FLAC parser 需要
  *    "下一帧同步字"来定当前帧边界，末尾没有下一帧就冲不出来（详见开发记录）。
@@ -474,7 +478,11 @@ esp_err_t subsonic_star(const char *song_id, bool on)
 static bool suffix_direct_playable(const char *suffix)
 {
     if (!suffix || !suffix[0]) return false;
-    return !strcasecmp(suffix, "mp3") || !strcasecmp(suffix, "flac");
+    return !strcasecmp(suffix, "mp3")  ||
+           !strcasecmp(suffix, "flac") ||
+           !strcasecmp(suffix, "ogg")  ||
+           !strcasecmp(suffix, "aac")  ||
+           !strcasecmp(suffix, "m4a");
 }
 
 /* offset_s = 0 时不带 timeOffset */
