@@ -62,6 +62,22 @@ esp_err_t subsonic_init(void)
         }
         nvs_close(h);
     }
+    /* ★ 强制转码设置 = auto（2026-10-01）
+     *
+     * 界面上那个"音质"二级菜单已经按用户要求删掉了（固定用最高），
+     * **但 NVS 里可能残留旧值** —— 实测踩到过：残留 "raw" 会让【所有】格式都直出，
+     * 包括 OGG。而 OGG(Vorbis) 直出在这个固件上会卡死（解码器能打开、能解出首批
+     * PCM，随后停止消费、ring_in 涨满、欠载飙升），那正是当初回退掉的东西。
+     *
+     * 现在界面不再提供选择，所以这里直接把它钉死成 auto ——
+     * auto = 能直出的（mp3/flac/aac/m4a）无损直出，其余交给服务端转码，既无损又不卡。
+     * 码率上限用 Kconfig 的默认值（320）。 */
+    if (strcmp(s_transcode, "auto") != 0) {
+        ESP_LOGW(TAG, "NVS 里的转码设置是 \"%s\"，强制改回 auto（界面已不提供音质选项）",
+                 s_transcode);
+        (void)subsonic_set_config(NULL, NULL, NULL, "auto", 320);
+    }
+
     ESP_LOGI(TAG, "配置来源: %s  host=%s user=%s 转码=%s %d kbps（密码%s）",
              from_nvs ? "NVS" : "Kconfig", s_host, s_user, s_transcode, s_max_kbps,
              s_pass[0] ? "已设" : "空");
