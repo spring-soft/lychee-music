@@ -493,72 +493,62 @@ static void info_render(void)
     }
 }
 
-/* ============================================================ 内存用量图表
+/* ============================================================ 内存用量
  *
- * 用户要求：系统信息页【长按 K3】进来，看整机 PSRAM 用量随时间的变化。
- * （flash 用量基本不动，用户说不需要，所以只画 PSRAM。）
+ * 用户要求：系统信息页【长按 K3】进来，**像播放页的进度条那样画两条横条** ——
+ * 一条 PSRAM、一条 内部 SRAM。
+ * （flash 用量基本不变，用户说不需要。）
  *
- * 画法：一排竖条，每根 = 一次采样（占用率 0~100% 映射成条高）——
- * 1 秒采一次、30 根 × 5px = 150px 铺满屏宽 → 30 秒历史，像示波器那样从右往左滚。
- * 为什么不用 LVGL 的 lv_chart：9.x 的 chart API 和 8.x 差别不小，
- * 而这页只需要最朴素的柱状图，用普通矩形既好控样式、又没有 API 版本风险。
+ * 样式直接照抄播放页那条进度条：槽透明、指示条圆角、颜色区分两块内存。
+ * 为什么不画成历史曲线：用户要的就是"两条进度条"这种一眼看懂的形式，
+ * 不需要时间轴。
  */
-#define MEM_BARS   30
-#define MEM_BAR_W  5          /* 其中 1px 留作间隙 */
-#define MEM_X0     5
-#define MEM_Y0     36         /* 图表区上沿 */
-#define MEM_H      60         /* 100% 占用对应的高度 */
+#define MEM_BAR_X   5
+#define MEM_BAR_W   150
+#define MEM_BAR_H   12
 
 static lv_obj_t *s_scr_mem;
-static lv_obj_t *s_mem_bar[MEM_BARS];
-static lv_obj_t *s_mem_txt;
-static uint8_t   s_mem_hist[MEM_BARS];   /* 历史占用率 0..100，[0] 最旧 */
-static int       s_mem_n;                /* 已经填了几根 */
-static int64_t   s_mem_last_ms;          /* 上次采样时刻 */
+static lv_obj_t *s_mem_lbl_psram, *s_mem_lbl_sram;   /* 两行的文字 */
+static lv_obj_t *s_mem_bar_psram, *s_mem_bar_sram;   /* 两条进度条 */
 
-static uint8_t mem_pct(void)
+/* 按播放页那条进度条的样式造一条：槽不画（底图上有），只画圆角填充 */
+static lv_obj_t *mem_make_bar(lv_obj_t *scr, int y, uint32_t color)
 {
-    size_t tot = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    size_t fre = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    return tot ? (uint8_t)((tot - fre) * 100 / tot) : 0;
+    lv_obj_t *b = lv_bar_create(scr);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_pos(b, MEM_BAR_X, y);
+    lv_obj_set_size(b, MEM_BAR_W, MEM_BAR_H);
+    lv_bar_set_range(b, 0, 100);
+    lv_bar_set_value(b, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, LV_PART_MAIN);          /* 槽透明 */
+    lv_obj_set_style_bg_color(b, lv_color_hex(color), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    return b;
 }
 
 static void mem_render(void)
 {
-    /* 1 秒采一次（ui_pages_tick 跑得比这快，所以在这里限流）*/
-    int64_t now = esp_timer_get_time() / 1000;
-    bool sampled = false;
-    if (s_mem_last_ms == 0) {
-        s_mem_last_ms = now;             /* 刚进来：先记时刻，别立刻采一条 0 */
-    } else if (now - s_mem_last_ms >= 1000) {
-        s_mem_last_ms = now;
-        uint8_t p = mem_pct();
-        if (s_mem_n < MEM_BARS) {
-            s_mem_hist[s_mem_n++] = p;
-        } else {
-            memmove(s_mem_hist, s_mem_hist + 1, MEM_BARS - 1);
-            s_mem_hist[MEM_BARS - 1] = p;
-        }
-        sampled = true;
-    }
-
+    /* PSRAM：8MB 那块（音频缓冲、LVGL、WiFi 都在这里）*/
     size_t tot = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     size_t fre = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t use = tot - fre;
+    unsigned pct = tot ? (unsigned)(use * 100 / tot) : 0;
     char buf[48];
-    snprintf(buf, sizeof(buf), "PSRAM 用 %u / %u KB",
-             (unsigned)((tot - fre) / 1024), (unsigned)(tot / 1024));
-    ui_set_text(s_mem_txt, buf);
+    snprintf(buf, sizeof(buf), "PSRAM  %u/%u KB  %u%%",
+             (unsigned)(use / 1024), (unsigned)(tot / 1024), pct);
+    ui_set_text(s_mem_lbl_psram, buf);
+    if (lv_bar_get_value(s_mem_bar_psram) != pct) lv_bar_set_value(s_mem_bar_psram, pct, LV_ANIM_OFF);
 
-    /* 条子只在真的采到新样本时才动 —— 每个 tick 无条件 set_pos/set_size
-     * 会让 LVGL 反复标脏重绘，白吃内部 SRAM 带宽。 */
-    if (!sampled) return;
-    for (int i = 0; i < MEM_BARS; i++) {
-        uint8_t p = (i < s_mem_n) ? s_mem_hist[i] : 0;
-        int h = (int)p * MEM_H / 100;
-        if (h < 1) h = 1;                /* 0% 也留一条底线，看得出"这格有采样" */
-        lv_obj_set_pos(s_mem_bar[i], MEM_X0 + i * MEM_BAR_W, MEM_Y0 + MEM_H - h);
-        lv_obj_set_size(s_mem_bar[i], MEM_BAR_W - 1, h);
-    }
+    /* 内部 SRAM：308KB 那块（整机最紧的资源，蓝牙当初就是被它挤死的）*/
+    tot = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    fre = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    use = tot - fre;
+    pct = tot ? (unsigned)(use * 100 / tot) : 0;
+    snprintf(buf, sizeof(buf), "SRAM   %u/%u KB  %u%%",
+             (unsigned)(use / 1024), (unsigned)(tot / 1024), pct);
+    ui_set_text(s_mem_lbl_sram, buf);
+    if (lv_bar_get_value(s_mem_bar_sram) != pct) lv_bar_set_value(s_mem_bar_sram, pct, LV_ANIM_OFF);
 }
 
 static void build_mem_screen(void)
@@ -570,30 +560,20 @@ static void build_mem_screen(void)
     ui_put_img(scr, ASSET_BG_INFO, 0, 0);      /* 复用系统信息页的底图，省一套素材 */
     ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
     ui_put_label_1line(scr, "内存用量", 20, 2, 134, ui_font_16, 0x1C1C1E);
-    s_mem_txt = ui_put_label_1line(scr, "", 6, 20, 148, ui_font_12, 0x3C3C40);
 
-    for (int i = 0; i < MEM_BARS; i++) {
-        lv_obj_t *b = lv_obj_create(scr);
-        lv_obj_remove_style_all(b);
-        lv_obj_set_style_bg_color(b, lv_color_hex(0x1A73E8), 0);
-        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
-        lv_obj_set_pos(b, MEM_X0 + i * MEM_BAR_W, MEM_Y0 + MEM_H - 1);
-        lv_obj_set_size(b, MEM_BAR_W - 1, 1);
-        s_mem_bar[i] = b;
-    }
-    ESP_LOGI(TAG, "内存图表页已建好（%d 根柱，1 秒一根）", MEM_BARS);
+    /* 两块内存各一行字 + 一条进度条。PSRAM 蓝、SRAM 橙 —— 颜色区分开，
+     * 不然两条长得一样，一眼分不清哪条是哪条。 */
+    s_mem_lbl_psram = ui_put_label_1line(scr, "", 6, 26, 150, ui_font_12, 0x3C3C40);
+    s_mem_bar_psram = mem_make_bar(scr, 42, 0x1A73E8);
+    s_mem_lbl_sram  = ui_put_label_1line(scr, "", 6, 66, 150, ui_font_12, 0x3C3C40);
+    s_mem_bar_sram  = mem_make_bar(scr, 82, 0xC77700);
+
+    ESP_LOGI(TAG, "内存用量页已建好（PSRAM + 内部 SRAM 两条进度条）");
 }
 
 void ui_mem_open(void)
 {
-    s_mem_n       = 0;
-    s_mem_last_ms = 0;       /* 重置计时，进来后第一秒才开始记 */
-    memset(s_mem_hist, 0, sizeof(s_mem_hist));
-    for (int i = 0; i < MEM_BARS; i++) {
-        lv_obj_set_pos(s_mem_bar[i], MEM_X0 + i * MEM_BAR_W, MEM_Y0 + MEM_H - 1);
-        lv_obj_set_size(s_mem_bar[i], MEM_BAR_W - 1, 1);
-    }
-    mem_render();            /* 先把那行数字填上，别空着 */
+    mem_render();            /* 先把两条填上，别进去空一下 */
     ui_page_show(UI_PAGE_MEM);
 }
 
