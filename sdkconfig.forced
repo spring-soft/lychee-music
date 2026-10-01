@@ -134,3 +134,21 @@ CONFIG_AUDIO_DECODER_VORBIS_SUPPORT=y
 CONFIG_AUDIO_DECODER_OPUS_SUPPORT=y
 CONFIG_AUDIO_DECODER_ALAC_SUPPORT=y
 CONFIG_AUDIO_DECODER_ADPCM_SUPPORT=y
+
+# ===== 放大 TCP 接收窗口：直出无损后吞吐不够了 =====
+#
+# 2026-10-01 实机踩到：播 FLAC（源 24bit/44.1k，文件码率 1576kbps ≈ 197 KB/s）时，
+# 网络取流稳定在 179~180 KB/s —— 【正好差一点点】，缓冲被一路抽干，
+# 4 分钟里攒了 33 次欠载。
+#
+# 根因不是 WiFi 不行（RSSI -56dBm、信道干净），是 **TCP 接收窗口太小**：
+#     吞吐 ≈ 窗口 ÷ 往返延迟
+# 默认窗口 CONFIG_LWIP_TCP_WND_DEFAULT=8192，按 RTT 45ms 算就是 182 KB/s
+# —— 和实测的 179~180 几乎一模一样。
+#
+# 提到 32768（4 倍）→ 同条件下上限约 700 KB/s，对 197 KB/s 的 FLAC 有 3 倍余量。
+#
+# ⚠️ 窗口内存不占内部 SRAM：CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y 已经开着，
+#    WiFi/lwIP 的分配会先走 PSRAM（现在还有 5.2MB 空闲）。别把那条关掉，
+#    关了以后这个窗口会把内部 SRAM（只剩 13KB）撑爆。
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
