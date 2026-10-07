@@ -61,5 +61,31 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.local" OR EXISTS "${CMAKE_CURRENT
     endif()
 endif()
 
+# ===== ccache（加速重复的全量编译）=====
+#
+# 实测（2026-10-07，本机 Windows + E 盘）：
+#   改一个 .c 再 build      30.9 秒（大部分是链接 2.5MB ELF + 生成镜像）
+#   什么都没改再 build       1.9 秒
+#   全量（无 ccache）        181 秒
+#   全量（ccache 热）        122 秒（省 33%）
+#   全量（ccache 冷）        305 秒（首次要多写缓存，之后就赚回来）
+# ccache 只省得下"编译"那一段；剩下的链接 + 生成镜像 + configure 约 120 秒是地板，
+# 所以别指望更快了。命中率实测：热构建 1926/1928 ≈ 100%。
+#
+# ⚠️⚠️ 这里【不能】用 set(CCACHE_ENABLE 1 CACHE BOOL ...) —— 试过，无效：
+#     idf.py 每次都传命令行 -DCCACHE_ENABLE=<0|1>（tools.py 里
+#     `args.define_cache_entry.append('CCACHE_ENABLE=%d' % args.ccache)`），
+#     命令行的 -D 优先级高于 CMakeLists 里的 set(... CACHE ...)，会被压掉，
+#     结果是"以为开了、其实没开"（实测过一轮才发现）。
+#     正确开关是环境变量 IDF_CCACHE_ENABLE（见 idf_py_actions/core_ext.py 的 envvar），
+#     所以它写在 env/idf.sh 与 E:\Espressif\idf.sh 里。
+#     留这段注释就是为了让下一个想在这儿设的人少走一遍这个弯路。
+#
+# 另一个坑：ccache 的默认缓存目录在 Windows 上落在 %LOCALAPPDATA% / 家目录，而本机
+# 用户名是中文「春软」—— 这个工程当初就因为 xtensa 工具链在中文路径下报 ???? 才把
+# 工具链挪到 E:\Espressif，所以 CCACHE_DIR 也钉到了 E:\Espressif\ccache（同样在 idf.sh）。
+#
+# 想清缓存重来：删掉 CCACHE_DIR 整个目录即可，不影响源码。
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(esp-music)
