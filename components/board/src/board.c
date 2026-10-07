@@ -19,6 +19,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/pulse_cnt.h"
+#include "driver/spi_master.h"   /* board_spi_bus_init()：屏幕 + TF 卡共用 SPI2 */
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "soc/soc_caps.h"       /* SOC_I2S_SUPPORTS_APLL */
@@ -200,6 +201,51 @@ esp_err_t board_i2c_init(void)
         ESP_LOGE(TAG, "添加 ES8388 设备失败: %s", esp_err_to_name(err));
         return err;
     }
+    return ESP_OK;
+}
+
+/* ============================================================== 共享 SPI 总线
+ *
+ * 屏幕（ST7735）和 TF 卡共用 SPI2：CLK=IO4、MOSI=IO5，各用自己的 CS。
+ * 原来这两行在 ui_display.c 里；搬到这里只为了让"总线归谁"有个说法，
+ * 配置和调用时机基本未动，唯一的差异是 MISO（见下面 .miso_io_num 处的说明）。
+ *
+ * 幂等：第二次调用直接返回 ESP_OK。
+ * 为什么非要幂等：裸 spi_bus_initialize 对同一主机重复调用返回
+ * ESP_ERR_INVALID_STATE，而 ui_display.c 用的是 ESP_ERROR_CHECK ——
+ * 一旦将来谁先建了总线，另一方就会直接 abort。
+ */
+static bool s_spi_bus_ready;
+
+esp_err_t board_spi_bus_init(void)
+{
+    if (s_spi_bus_ready) return ESP_OK;
+
+    spi_bus_config_t bus = {
+        .mosi_io_num = BOARD_PIN_LCD_MOSI,
+        /* ⚠️ 与搬过来之前唯一的差异：原来是 st7735_PANEL_BUS_SPI_CONFIG()
+         *    宏里写死的 .miso_io_num = -1。屏幕是只写设备，本来用不到 MISO；
+         *    而 SDSPI 必须有 MISO，所以这里接上 TF 的 MISO(IO13)。
+         *    GPIO13 在本工程里没有任何其它外设占用（I2C 1/2、I2S 39~42、
+         *    LCD 4/5/6/7/15/16、按键 3/8/17/18/38），不会撞车。
+         *    其余字段（SCLK/MOSI/max_transfer_sz/DMA 通道）与原来完全一致。 */
+        .miso_io_num = BOARD_PIN_TF_MISO,
+        .sclk_io_num = BOARD_PIN_LCD_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        /* 单次传输上限：与搬过来之前 ui_display.c 用的 BUF_BYTES 完全一致。
+         * TF 卡一次最多一个 512B 扇区，这个值早就够。 */
+        .max_transfer_sz = BOARD_SPI_MAX_TRANSFER,
+    };
+    esp_err_t err = spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI2 总线初始化失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_spi_bus_ready = true;
+    ESP_LOGI(TAG, "SPI2 总线就绪（SCLK=%d MOSI=%d MISO=%d，max_transfer=%d）",
+             BOARD_PIN_LCD_SCLK, BOARD_PIN_LCD_MOSI, BOARD_PIN_TF_MISO,
+             BOARD_SPI_MAX_TRANSFER);
     return ESP_OK;
 }
 

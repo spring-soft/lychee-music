@@ -41,6 +41,10 @@ typedef struct {
     uint32_t queue_gen;      /* 队列内容变化计数：列表页靠它决定要不要重建行 */
     char     source[20];     /* 来源名（"最近播放" / "我的收藏" / "随机 30 首"） */
     char     song_id[48];    /* 当前歌 id，收藏/网页控制要用 */
+
+    /* 在线/离线模式（0=在线 1=离线）。UI 和网页据此显示"模式: X"、
+     * 以及决定"扫描 TF 卡 / 同步收藏到离线"该显示哪一个。 */
+    uint8_t  mode;
 } player_status_t;
 
 void player_status_init(void);
@@ -61,6 +65,8 @@ void player_status_set_queue(int index, int count, const char *source, bool cont
 
 void player_status_set_starred(bool starred);
 void player_status_set_volume(int vol);
+/* 在线/离线模式（0=在线 1=离线）。真相源在 player，这里只是给 UI/网页的快照。 */
+void player_status_set_mode(int mode);
 
 #ifdef __cplusplus
 }

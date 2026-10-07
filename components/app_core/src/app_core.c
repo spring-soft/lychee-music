@@ -90,3 +90,11 @@ void player_status_set_volume(int vol)
     s_st.volume = vol;
     xSemaphoreGive(s_lock);
 }
+
+void player_status_set_mode(int mode)
+{
+    if (s_lock == NULL) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_st.mode = (uint8_t)mode;
+    xSemaphoreGive(s_lock);
+}

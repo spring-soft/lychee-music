@@ -5,6 +5,7 @@
  * 不碰 LVGL、不碰音频引擎内部。所以"网页点下一首"和"按键按下一首"走的是同一条路。
  */
 #include <string.h>
+#include <strings.h>          /* strcasecmp：mode 参数要大小写不敏感 */
 #include <stdlib.h>
 #include <inttypes.h>
 #include "web_console.h"
@@ -17,6 +18,8 @@
 #include "app_core.h"
 #include "audio_engine.h"
 #include "player.h"
+#include "musiclib.h"
+#include "sd_card.h"
 #include "subsonic.h"
 #include "net_mgr.h"
 #include "settings.h"
@@ -162,6 +165,13 @@ static bool query_str(httpd_req_t *req, const char *key, char *out, size_t len)
     return true;
 }
 
+/* 模式的外部 slug（"online"/"offline"）。给前端比字符串用；
+ * 中文名走 player_mode_name() —— 名字只在 player 里定义一次，网页不要自己再映射一遍。 */
+static const char *mode_slug(player_mode_t m)
+{
+    return (m == PLAYER_MODE_OFFLINE) ? "offline" : "online";
+}
+
 /* 往数组里加一首歌（多种接口共用同一形状，前端只写一套渲染） */
 static void add_song(cJSON *arr, int i, const sub_song_t *s, int playing_index)
 {
@@ -242,6 +252,21 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddBoolToObject(o, "muted", player_is_muted());
     cJSON_AddNumberToObject(o, "bright", player_brightness());
     cJSON_AddNumberToObject(o, "gen", st.gen);      /* ★ 每次换歌 +1，前端靠它对账 */
+
+    /* M9：在线 / 离线双模式 + TF 卡曲库。
+     * 前端靠 mode 决定设置页给"扫卡"还是"同步收藏"，靠 lib 显示"曲库 N 首"。
+     * ⚠️ 卡没挂上时 count=0 / index_ok=false 是【正常状态】不是错误 ——
+     *    在线模式平时就是卸载状态（见 sd_card.h 的内存账），前端不要弹错。
+     * mode_name 是给浏览器看的中文名，不用前端自己映射（player 是唯一真相源）。 */
+    cJSON_AddStringToObject(o, "mode", mode_slug(player_mode()));
+    cJSON_AddStringToObject(o, "mode_name", player_mode_name());
+    cJSON *lib = cJSON_AddObjectToObject(o, "lib");
+    int lib_n = musiclib_count();
+    cJSON_AddNumberToObject(lib, "count", lib_n);
+    cJSON_AddBoolToObject(lib, "scan_busy", musiclib_scan_busy());
+    cJSON_AddNumberToObject(lib, "scan_found", musiclib_scan_found());
+    cJSON_AddNumberToObject(lib, "scanned", musiclib_scan_scanned());
+    cJSON_AddBoolToObject(lib, "index_ok", lib_n > 0);   /* 索引里有没有东西 */
 
     cJSON *song = cJSON_AddObjectToObject(o, "song");
     cJSON_AddStringToObject(song, "id", st.song_id);
@@ -392,11 +417,23 @@ static esp_err_t h_search(httpd_req_t *req)
     sub_song_t *songs = heap_caps_malloc(SUB_SONGS_MAX * sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
     if (songs == NULL) return fail(req, "500 Internal Server Error", "内存不足");
     int got = 0;
-    esp_err_t err = subsonic_search(q, songs, SUB_SONGS_MAX, &got);
+    esp_err_t err;
+    /* ★ 离线模式必须搜本地曲库，不能直连 Navidrome：
+     *   ① 离线模式的契约就是"只用 TF 卡曲库，不碰网络"；
+     *   ② 更要紧的是 —— 在线搜出来的歌没有本地路径，点它会走 HTTP，
+     *      于是"离线模式"下放出了网络流，而且它会被排进本地队列让"下一首"串台。 */
+    const bool offline = (player_mode() == PLAYER_MODE_OFFLINE);
+    if (offline) {
+        got = musiclib_search(q, songs, SUB_SONGS_MAX);
+        err = ESP_OK;                       /* 离线 0 条 = 没找到，不是错误 */
+    } else {
+        err = subsonic_search(q, songs, SUB_SONGS_MAX, &got);
+    }
     cJSON *o = cJSON_CreateObject();
     cJSON *items = cJSON_AddArrayToObject(o, "items");
     for (int i = 0; i < got; i++) add_song(items, -1, &songs[i], -1);
     cJSON_AddNumberToObject(o, "total", got);
+    cJSON_AddBoolToObject(o, "local", offline);   /* 真机排障时一眼看出这次搜的是哪边 */
     heap_caps_free(songs);
     if (err != ESP_OK && got == 0) {
         cJSON_Delete(o);
@@ -648,6 +685,163 @@ static esp_err_t h_star(httpd_req_t *req)
         player_star_song(idbuf, on);
     }
     return ok_json(req);
+}
+
+/* ============================================================ 在线 / 离线 与 TF 卡曲库 */
+
+/* 模式参数解析：接受 online / offline（大小写不敏感）和 0 / 1。
+ * 两种写法都收是刻意的 —— 网页表单发字符串更好读，命令行 curl 敲 0/1 更省事。 */
+static bool parse_mode(const char *s, player_mode_t *out)
+{
+    if (s == NULL || s[0] == 0) return false;
+    if (strcasecmp(s, "online") == 0 || strcmp(s, "0") == 0) {
+        *out = PLAYER_MODE_ONLINE;
+        return true;
+    }
+    if (strcasecmp(s, "offline") == 0 || strcmp(s, "1") == 0) {
+        *out = PLAYER_MODE_OFFLINE;
+        return true;
+    }
+    return false;
+}
+
+/* 在线 / 离线模式：GET 读、POST 写（同一个处理器按 method 分支，同 /api/quality）。
+ *
+ * ⚠️ 切换是【异步】的（player_set_mode 只往命令队列塞一条），真做完要
+ *    停播 → 挂/卸 SD → 重建列表 → 写 NVS，实测几百毫秒。
+ *    所以这里立刻返回，**不等切换完成** —— httpd 的 recv/send 超时都是 5 秒，
+ *    在这里等就等于把网页卡住。前端要看结果就轮询 /api/status 的 mode
+ *    （切换期间它可能还是旧值，这是刻意的）。 */
+static esp_err_t h_mode(httpd_req_t *req)
+{
+    player_mode_t cur = player_mode();
+
+    if (req->method == HTTP_GET) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "mode", mode_slug(cur));
+        cJSON_AddStringToObject(o, "mode_name", player_mode_name());
+        return send_json(req, o);
+    }
+
+    /* mode 两处都收：JSON 体（网页）和 query（curl / 书签更顺手）。体优先 ——
+     * 带了体说明调用方是按 POST 的契约来的。体解析不了就当没带，退回 query。 */
+    char mbuf[16] = {0};
+    cJSON *b = read_body(req);
+    if (b != NULL) {
+        cJSON *mi = cJSON_GetObjectItem(b, "mode");
+        if (mi && cJSON_IsString(mi) && mi->valuestring[0]) {
+            strlcpy(mbuf, mi->valuestring, sizeof(mbuf));
+        } else if (mi && cJSON_IsNumber(mi)) {
+            /* {"mode":0} 也认：前端可能直接透传 /api/status 的数字形式 */
+            snprintf(mbuf, sizeof(mbuf), "%d", (int)mi->valuedouble);
+        }
+        cJSON_Delete(b);
+    }
+    if (mbuf[0] == 0) query_str(req, "mode", mbuf, sizeof(mbuf));
+
+    player_mode_t want;
+    if (!parse_mode(mbuf, &want)) {
+        return fail(req, "400 Bad Request", "mode 只认 online / offline / 0 / 1");
+    }
+
+    bool changed = (want != cur);
+    if (changed) player_set_mode(want);
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddStringToObject(o, "mode", mode_slug(want));
+    cJSON_AddBoolToObject(o, "changed", changed);
+    return send_json(req, o);
+}
+
+/* TF 卡曲库扫描：POST 起一次扫描，GET 查进度（同一个处理器按 method 分支，同 /api/quality）。
+ *
+ * ⚠️ 扫描是【后台任务】（上千首要几秒），这个处理器绝不等它扫完 —— 同上，
+ *    httpd 的超时是 5 秒，等下去前端只会拿到超时。想知道扫完没有，轮询 GET。
+ *
+ * ⚠️ musiclib_scan_start() 对"正在扫"和"卡没挂上"返回的是【同一个】
+ *    ESP_ERR_INVALID_STATE（见 musiclib.c 开头那两行判断），而网页要把这两种
+ *    说清楚（"稍等"和"去插卡"是两回事），所以这里事后自己判一次：
+ *    顺序刻意跟 musiclib 里的判断一致 —— 先看是不是在扫，再看卡。 */
+static esp_err_t h_scan(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddBoolToObject(o, "busy", musiclib_scan_busy());
+        cJSON_AddNumberToObject(o, "scanned", musiclib_scan_scanned());
+        cJSON_AddNumberToObject(o, "found", musiclib_scan_found());
+        cJSON_AddNumberToObject(o, "count", musiclib_count());
+        /* last_err 是【上一次扫描】的结果码，不是"当前这次"的（扫描中它还是旧值）。
+         * 这里刻意用 scan_result() 而不是 musiclib_last_err()：后者还包含 load 的错，
+         * 对"扫完了没、扫成功没"这个问题不够准，卡状态留给 /api/debug。 */
+        cJSON_AddNumberToObject(o, "last_err", (int)musiclib_scan_result());
+        return send_json(req, o);
+    }
+
+    /* 先记下"调之前是不是就在扫"：调用返回 INVALID_STATE 后状态可能刚好翻掉，
+     * 只看事后状态会把"你点的太急了"误报成"卡没插"。 */
+    bool was_busy = musiclib_scan_busy();
+    esp_err_t err = musiclib_scan_start();
+
+    /* why 是给前端直接显示的短标识，四种"没扫起来"刻意分开：
+     *   started     = 已经在后台扫了
+     *   busy        = 本来就在扫（这次点击是多余的，不需要用户做任何事）
+     *   no_card     = 卡检测脚（CD）说没插卡 → 让用户去插
+     *   not_mounted = 卡在、但驱动没挂上（接触不良 / 卡上文件系统认不出）→ 让用户重插
+     * 其余错误码直接给 esp_err_to_name()（例如 ESP_ERR_NO_MEM = PSRAM 不够）。 */
+    const char *why;
+    bool started = false;
+    if (err == ESP_OK) {
+        why = "started";
+        started = true;
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        if (was_busy || musiclib_scan_busy()) why = "busy";
+        else if (!sd_card_present())         why = "no_card";
+        else if (!sd_card_mounted())         why = "not_mounted";
+        /* 卡在、也没在扫，却报"状态不对"：只能是状态刚被别的路径（模式切换）动过。
+         * 报 busy 最不误导 —— 让前端过一会儿重试，而不是让用户去动卡。 */
+        else                                 why = "busy";
+        ESP_LOGW(TAG, "扫描没起来: %s（present=%d mounted=%d）",
+                 why, (int)sd_card_present(), (int)sd_card_mounted());
+    } else {
+        why = esp_err_to_name(err);
+        ESP_LOGE(TAG, "扫描起不来: %s", why);
+    }
+
+    /* 刻意不用 fail()：这是"业务上没起来"而不是"请求不合法"，前端要读 why
+     * 才能显示对应的提示，所以依旧 200 + 结构化结果（同 h_wifi_scan 的思路）。 */
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", started);
+    cJSON_AddBoolToObject(o, "started", started);
+    cJSON_AddBoolToObject(o, "busy", musiclib_scan_busy());
+    cJSON_AddStringToObject(o, "why", why);
+    cJSON_AddNumberToObject(o, "count", musiclib_count());
+    cJSON_AddNumberToObject(o, "found", musiclib_scan_found());
+    return send_json(req, o);
+}
+
+/* 收藏同步进度：POST / GET 共用（GET 只是不发命令），省得前端写两套解析。
+ * ⚠️ err 给的是【整数错误码】而不是字符串：前端拿它跟 0 比就行，
+ *    想知道名字去看 /api/debug（那边给的是 esp_err_to_name）。 */
+static void sync_fill(cJSON *o)
+{
+    cJSON_AddBoolToObject(o, "busy", player_sync_offline_busy());
+    cJSON_AddBoolToObject(o, "done", player_sync_offline_done());
+    cJSON_AddNumberToObject(o, "synced", player_sync_offline_synced());
+    cJSON_AddNumberToObject(o, "skipped", player_sync_offline_skipped());
+    cJSON_AddNumberToObject(o, "err", (int)player_sync_offline_err());
+}
+
+/* 在线收藏 → 离线收藏。POST 起一次同步，GET 查进度。
+ * 同步要临时挂卡 + 读索引，是几百毫秒到几秒的活，所以同样立刻返回、只轮询进度。 */
+static esp_err_t h_sync_offline(httpd_req_t *req)
+{
+    if (req->method != HTTP_GET) player_sync_to_offline();
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);   /* 只是"命令收到了"，不表示已经同步完 */
+    sync_fill(o);
+    return send_json(req, o);
 }
 
 /* ============================================================ 配置 */
@@ -906,6 +1100,25 @@ static esp_err_t h_debug(httpd_req_t *req)
     cJSON_AddNumberToObject(fs, "last_errno", store_last_errno());
     cJSON_AddNumberToObject(fs, "recent", player_recent_count());
 
+    /* M9：TF 卡 + 离线曲库。"离线模式里一首歌都没有"这类问题基本就在这两块：
+     *   present=卡检测脚怎么说（低电平=有卡）、mounted=驱动挂上没、
+     *   mount_count=累计挂成功几次（能看出是不是反复挂/卸，比如卡接触不良）。
+     * ⚠️ 在线模式平时就是**卸载**状态，那时 mounted=false 是正常的。 */
+    cJSON *sd = cJSON_AddObjectToObject(o, "sd");
+    cJSON_AddBoolToObject(sd, "present", sd_card_present());
+    cJSON_AddBoolToObject(sd, "mounted", sd_card_mounted());
+    cJSON_AddNumberToObject(sd, "mount_count", sd_card_mount_count());
+    cJSON_AddStringToObject(sd, "last_err", esp_err_to_name(sd_card_last_err()));
+
+    /* 索引状态。count=0 只说明"索引里没歌"（没扫过 / 卡换了 / 索引文件校验不过），
+     * 不等于出错 —— 真出错看 last_err。 */
+    cJSON *ml = cJSON_AddObjectToObject(o, "musiclib");
+    cJSON_AddNumberToObject(ml, "count", musiclib_count());
+    cJSON_AddBoolToObject(ml, "scan_busy", musiclib_scan_busy());
+    cJSON_AddNumberToObject(ml, "scanned", musiclib_scan_scanned());
+    cJSON_AddNumberToObject(ml, "found", musiclib_scan_found());
+    cJSON_AddStringToObject(ml, "last_err", esp_err_to_name(musiclib_last_err()));
+
     cJSON *bt = cJSON_AddObjectToObject(o, "hid");
     hid_fill(bt);
     return send_json(req, o);
@@ -926,7 +1139,13 @@ esp_err_t web_console_start(void)
     cfg.max_open_sockets   = 6;
     cfg.lru_purge_enable   = true;      /* 满了就踢最久没动的连接，别拒绝新请求 */
     cfg.stack_size         = 4096;
-    cfg.max_uri_handlers   = 32;
+    /* ⚠️ 这是"最多能注册多少条 uri_handler"，而 httpd 是【同一个 uri 的每种 method
+     * 各占一条】的（/api/quality、/api/wifi、/api/hid 都是 GET+POST 两条）。
+     * 加 M9 三个接口前，表里已经正好 33 条 —— 超了 32，最后注册的 /api/hid/send
+     * 一直在静默失败（只在串口留一行 warn，网页那边就是 404）。
+     * 所以这里放到 40：32 条太紧，而且每条只是一个指针 + 一个几十字节的结构
+     * （hd_calls 存的是指针数组，4B/条），放宽这点换"接口不会莫名其妙 404"很划算。 */
+    cfg.max_uri_handlers   = 40;
     cfg.recv_wait_timeout  = 5;
     cfg.send_wait_timeout  = 5;
 
@@ -973,6 +1192,17 @@ esp_err_t web_console_start(void)
         { .uri = "/api/hid",             .method = HTTP_GET,  .handler = h_hid },
         { .uri = "/api/hid",             .method = HTTP_POST, .handler = h_hid_set },
         { .uri = "/api/hid/send",        .method = HTTP_GET,  .handler = h_hid_send },
+        /* M9：在线/离线模式、TF 卡扫描、收藏同步。
+         * ⚠️ httpd 是【按 method 分别占槽】的（同一个 uri 注册 GET+POST 就是两条，
+         *    见 httpd_register_uri_handler），所以这三个接口要占 6 个槽，不是 3 个。
+         *    槽位不够时后面的注册会静默失败（只在日志里留一行），接口直接 404 ——
+         *    所以下面 max_uri_handlers 跟着放宽了，改这几行时记得一起数。 */
+        { .uri = "/api/mode",            .method = HTTP_GET,  .handler = h_mode },
+        { .uri = "/api/mode",            .method = HTTP_POST, .handler = h_mode },
+        { .uri = "/api/scan",            .method = HTTP_GET,  .handler = h_scan },
+        { .uri = "/api/scan",            .method = HTTP_POST, .handler = h_scan },
+        { .uri = "/api/sync_offline",    .method = HTTP_GET,  .handler = h_sync_offline },
+        { .uri = "/api/sync_offline",    .method = HTTP_POST, .handler = h_sync_offline },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         esp_err_t e = httpd_register_uri_handler(srv, &uris[i]);

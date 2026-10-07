@@ -53,6 +53,25 @@ extern "C" {
 #  define BOARD_PIN_KEY1     38   /* ⚠️ GPIO3 是 strapping 脚，上电被拉低会进 JTAG */
 #endif
 
+/* ---- 板型派生的新硬件开关（旋转编码器 / TF 卡）----
+ * 为什么由板型【派生】而不是各给一个 Kconfig bool：
+ *   sdkconfig 里一旦写进过值，Kconfig 的 default 就不会再跟着
+ *   BOARD_VARIANT_BREADBOARD 重新求值 —— 换了板型会留下"面包板变体 + 硬件开关=开"
+ *   这种自相矛盾的状态。派生就没有这个状态：改 sdkconfig.local 里那一行板型，
+ *   两个开关一起跟着变。
+ * 调试覆盖：CONFIG_BOARD_FORCE_ENCODER / CONFIG_BOARD_FORCE_TF
+ *   （见 main/Kconfig.projbuild；只在面包板上临时接线验证时才需要）。*/
+#if CONFIG_BOARD_VARIANT_BREADBOARD && !CONFIG_BOARD_FORCE_ENCODER
+#  define BOARD_HAS_ENCODER  0
+#else
+#  define BOARD_HAS_ENCODER  1
+#endif
+#if CONFIG_BOARD_VARIANT_BREADBOARD && !CONFIG_BOARD_FORCE_TF
+#  define BOARD_HAS_TF       0
+#else
+#  define BOARD_HAS_TF       1
+#endif
+
 #define BOARD_PIN_LCD_SCLK  4
 #define BOARD_PIN_LCD_MOSI  5
 #define BOARD_PIN_LCD_RST   6
@@ -63,6 +82,21 @@ extern "C" {
 #define BOARD_PIN_KEY2      8
 #define BOARD_PIN_KEY3      18
 #define BOARD_PIN_KEY4      17
+
+/* ---------------- V2 新增硬件（旋转编码器 / TF 卡）----------------
+ * 引脚来源：pcb/接线表与引脚定义.md。
+ * 面包板变体下这些宏仍然定义着（方便对照/临时接线调试），但驱动组件按
+ * BOARD_HAS_ENCODER / BOARD_HAS_TF 条件编译，不会真的去碰这些脚。
+ *
+ * ⚠️ TF 卡与屏幕【共用 SPI2】：CLK=IO4、MOSI=IO5，靠 CS 区分（屏 IO15 / 卡 IO12）。
+ *    DAT1/DAT2 悬空 → 只能 SPI 模式，不是 SD 1-bit 模式。 */
+#define BOARD_PIN_ENC_A     9
+#define BOARD_PIN_ENC_B     10
+#define BOARD_PIN_ENC_SW    11    /* 编码器按下；低电平有效（与 K1-K4 一致） */
+
+#define BOARD_PIN_TF_CS     12
+#define BOARD_PIN_TF_MISO   13
+#define BOARD_PIN_TF_CD     14    /* 卡检测；低电平 = 有卡 */
 
 #define BOARD_ES8388_ADDR   0x11 /* 7 位；8 位形式是 0x22 */
 
@@ -80,6 +114,24 @@ esp_err_t board_init(void);
 
 /* 仅初始化 I2C 总线（供屏幕校准等早期诊断用） */
 esp_err_t board_i2c_init(void);
+
+/* ---------------- 共享 SPI 总线（屏幕 + TF 卡）----------------
+ * 这条总线原来只在 ui_display.c 里初始化。提到 board 只是给它一个明确归属，
+ * **初始化时机完全没变**（仍是 ui_start → ui_display_init 里第一次调用时建），
+ * 目的是让新增的 TF 卡驱动有一个正当的"总线已就绪"入口，而不是反过来依赖 ui。
+ *
+ * 幂等：重复调用返回 ESP_OK（不会像裸 spi_bus_initialize 那样返回
+ * ESP_ERR_INVALID_STATE，再被 ESP_ERROR_CHECK 直接 abort）。
+ *
+ * ⚠️ 顺序要求：先有总线，才能挂 SD —— esp_vfs_fat_sdspi_mount() 内部的
+ *    sdspi_host_init_device() 要求总线已初始化（见 IDF 的 driver/sdspi_host.h）。
+ *    开机第 3 步 ui_start() 已经建好总线，而 SD 是用户触发、远在其后，所以天然满足。 */
+esp_err_t board_spi_bus_init(void);
+
+/* SPI 总线的单次传输上限（字节）。取值 = 屏幕的 DMA 局部缓冲 160×16×2 = 5120，
+ * 与搬到 board.c 之前【完全一致】—— 不要为了 TF 卡调大：SD 一次最多一个
+ * 512B 扇区，5120 已经远超需要。 */
+#define BOARD_SPI_MAX_TRANSFER  5120
 
 /* ---------------- 诊断（M0 的核心价值：把硬件"看得见"） ---------------- */
 /* 检查 SDA/SCL 空闲电平；返回 0=总线空闲  -1=有引脚被拉低 */

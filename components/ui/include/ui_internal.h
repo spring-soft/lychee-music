@@ -76,7 +76,10 @@ void ui_pages_enter(ui_page_t p);   /* 切进页面时强制刷新一次 */
 void ui_pages_tick(void);           /* 当前页面可见时的周期刷新（UI 任务里调） */
 /* 让页面跟随"蓝牙控制模式"（模式是状态源，网页也能改它）。
  * ⚠️ 必须由 ui.c 无条件调用 —— 别塞进 ui_pages_tick()，那个在播放页不跑。 */
+/* 蓝牙控制模式 / 在线离线模式切换后，把页面跟过去。
+ * ⚠️ 两个都必须由 ui.c 的 tick 无条件调用（不能塞进 ui_pages_tick）。 */
 void ui_bt_mode_follow(void);
+void ui_mode_follow(void);
 
 /* ---------------- 各页面内的按键动作（ui_keys.c 调） ---------------- */
 void ui_list_move(int delta);
@@ -129,6 +132,9 @@ bool ui_search_key_hold(int k);
 
 /* ---------------- ui_keys.c ---------------- */
 void ui_keys_init(void);
+/* 旋转编码器（仅 V2 板；面包板变体下是空实现，调用方不需要 #if）。
+ * 与 ui_keys_init 分开是为了让"按键"和"编码器"各自有明确的初始化点。 */
+void ui_keys_encoder_init(void);
 /* 注入按键事件（k: 0..3 = K1..K4；kind: 0=短按 1=长按 2=保持）。
  * 只给开机自检用 —— 走的是和真实按键完全相同的分发路径。 */
 void ui_keys_inject(int k, int kind);

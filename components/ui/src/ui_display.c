@@ -207,10 +207,11 @@ void ui_display_set_bgr(bool bgr)
 
 esp_err_t ui_display_init(void)
 {
-    /* ---- SPI 总线 ---- */
-    spi_bus_config_t bus = st7735_PANEL_BUS_SPI_CONFIG(BOARD_PIN_LCD_SCLK, BOARD_PIN_LCD_MOSI,
-                                                       BUF_BYTES);
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
+    /* ---- SPI 总线 ----
+     * 总线现在归 board 管（屏幕和 TF 卡共用 SPI2，见 board_spi_bus_init 的说明）。
+     * 这里仍是【开机第一次调用】的地方，所以引脚配置时机和以前完全一样；
+     * 区别只是换成幂等版本 —— 屏幕不再独占这条总线，将来谁先建都不会 abort。 */
+    ESP_ERROR_CHECK(board_spi_bus_init());
 
     /* ---- 面板 IO ---- */
     esp_lcd_panel_io_spi_config_t io_cfg =

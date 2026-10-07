@@ -16,6 +16,8 @@
 #include "audio_engine.h"
 #include "board.h"
 #include "settings.h"
+#include "sd_card.h"
+#include "musiclib.h"
 #include "store.h"
 #include "cJSON.h"
 #include "esp_log.h"
@@ -38,6 +40,13 @@ static const char *TAG = "player";
 #define F_RECENT  "RECENT.RC"
 #define F_STAR    "STAR.SC"
 #define F_PEND    "PEND.OP"
+/* 离线模式的对应两个列表。刻意分成两份文件：两种模式的歌单是【分开的】，
+ * 混在一起会出现"在线收藏里混进卡上的歌"。命名沿用 8.3（store 会强校验）。 */
+#define F_RECENT_OFF "RECOF.RC"
+#define F_STAR_OFF   "STAROF.SC"
+
+/* NVS(ns "cfg") 里存在线/离线模式的键 */
+#define NVS_MODE_KEY "mode"
 
 /* 序列化缓冲：64 首 × 最坏 ~560 字节 ≈ 36KB，留点余量。
  * 读和写共用一份（都在 player 任务里，天然串行）。 */
@@ -55,6 +64,8 @@ typedef enum {
     CMD_SEEK, CMD_PLAY_ID, CMD_STAR_ID,
     CMD_RESUME, CMD_STAR_REFRESH,
     CMD_SEARCH,               /* M8：屏上搜索 */
+    CMD_SET_MODE,             /* 在线 / 离线 切换 */
+    CMD_SYNC_OFFLINE,         /* 收藏：在线 → 离线 */
 } cmd_kind_t;
 
 typedef struct {
@@ -75,6 +86,16 @@ static int               s_count;
 static int               s_index = -1;
 static uint32_t          s_queue_gen;
 static player_src_t      s_src = PLAYER_SRC_RANDOM;
+/* 当前模式（在线/离线）。开机从 NVS 恢复，切换时立即落盘。
+ * ⚠️ 单一真相源就在这里 —— UI/网页只读 player_mode()，不要各自缓存一份。 */
+static player_mode_t     s_mode = PLAYER_MODE_ONLINE;
+
+/* 收藏同步（在线 → 离线）的状态。UI 轮询它显示结果（同步要挂卡+读索引，有几百毫秒）。 */
+static volatile int      s_sync_offline_busy;
+static volatile int      s_sync_offline_done;
+static volatile int      s_sync_offline_synced;
+static volatile int      s_sync_offline_skipped;
+static volatile int      s_sync_offline_err;
 
 /* 最近播放：环形缓冲，[0] 是最新的 */
 static sub_song_t       *s_recent;
@@ -135,6 +156,12 @@ static volatile int      s_bright_target = 100;
 /* 临时静音解开时，要恢复成"用户是否静音"而不是无条件解开 */
 static void restore_mute(void) { board_es8388_mute(board_es8388_is_muted()); }
 
+/* 模式名。只在这里拼一次 —— UI 菜单、日志、网页都用它，避免三处各写一遍。 */
+static const char *mode_name(player_mode_t m)
+{
+    return (m == PLAYER_MODE_OFFLINE) ? "离线" : "在线";
+}
+
 const char *player_src_name(player_src_t s)
 {
     switch (s) {
@@ -144,6 +171,19 @@ const char *player_src_name(player_src_t s)
         default:                 return "?";
     }
 }
+
+const char *player_mode_name(void) { return mode_name(s_mode); }
+
+/* 落盘文件名随模式切换：在线用 RECENT.RC / STAR.SC，离线用 RECOF.RC / STAROF.SC。
+ *
+ * 这样"两种模式的歌单分开"就不需要在内存里常驻两份列表 —— 切换模式时把旧模式的
+ * 存下去、把新模式的读上来即可（见 handle_set_mode）。好处：
+ *   - 省约 75KB PSRAM（50 条最近 + 64 条收藏 × 两模式 × 660B）
+ *   - 收藏/最近播放那套代码一行都不用分叉（它们只管 s_recent/s_starred）
+ * ⚠️ 前提：调用它们的时候 s_mode 已经是【正确的模式】——
+ *    切换模式时必须"先存旧、再改 s_mode、最后载新"，顺序不能反。 */
+static const char *f_recent(void) { return (s_mode == PLAYER_MODE_OFFLINE) ? F_RECENT_OFF : F_RECENT; }
+static const char *f_star(void)   { return (s_mode == PLAYER_MODE_OFFLINE) ? F_STAR_OFF   : F_STAR; }
 
 /* ============================================================ 落盘（cache 分区）
  *
@@ -165,6 +205,9 @@ static void song_to_json(cJSON *arr, const sub_song_t *s)
     if (s->size)        cJSON_AddNumberToObject(o, "z", (double)s->size);
     if (s->suffix[0])   cJSON_AddStringToObject(o, "x", s->suffix);
     if (s->starred)     cJSON_AddBoolToObject(o, "s", true);
+    /* p = 本地文件路径（离线曲库的歌才有）。不写的话重启后离线列表
+     * 就变成"有歌名但放不了"，且从 JSON 恢复的 song 会被当成在线歌。 */
+    if (s->path[0])     cJSON_AddStringToObject(o, "p", s->path);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -180,6 +223,12 @@ static bool song_from_json(const cJSON *o, sub_song_t *s)
     GETSTR("t", title);  GETSTR("a", artist); GETSTR("b", album);
     GETSTR("c", cover);  GETSTR("x", suffix);
     #undef GETSTR
+    /* p = 本地文件路径。单独取是因为 GETSTR 的宏在上面已 undo，
+     * 而且它必须用 path 自己的长度上限。 */
+    {
+        const cJSON *_p = cJSON_GetObjectItem(o, "p");
+        if (cJSON_IsString(_p)) strlcpy(s->path, _p->valuestring, sizeof(s->path));
+    }
 
     const cJSON *j = cJSON_GetObjectItem(o, "d");
     if (cJSON_IsNumber(j)) s->duration_s = (uint32_t)j->valuedouble;
@@ -253,7 +302,7 @@ static void recent_save(void)
     s_recent_dirty = false;
     xSemaphoreGive(s_lock);
 
-    if (list_save(F_RECENT, s_snap, n)) {
+    if (list_save(f_recent(), s_snap, n)) {
         ESP_LOGI(TAG, "最近播放已落盘（%d 条）", n);
     }
 }
@@ -286,7 +335,7 @@ static void starred_save(void)
     s_starred_dirty = false;
     xSemaphoreGive(s_lock);
 
-    if (list_save(F_STAR, s_snap, n)) ESP_LOGI(TAG, "收藏已落盘（%d 首）", n);
+    if (list_save(f_star(), s_snap, n)) ESP_LOGI(TAG, "收藏已落盘（%d 首）", n);
 }
 
 static void starred_save_tick(void)
@@ -404,6 +453,9 @@ static void pend_flush(void)
 
 static void pend_retry_tick(void)
 {
+    /* 待重试的都是"要推给 Navidrome 的在线收藏操作"——离线模式不该发这些请求。
+     * 队列不清空：切回在线模式后自然会继续补发。 */
+    if (s_mode == PLAYER_MODE_OFFLINE) return;
     if (s_pend_n == 0) return;
     int64_t now = esp_timer_get_time() / 1000;
     if (now - s_pend_try_ms < PEND_RETRY_MS) return;
@@ -472,6 +524,10 @@ static bool starred_refresh(void)
 /* 需要的话对一次。⚠️ 先补发本地改动再拉，否则拉回来的列表会把本地刚收藏的"吞掉" */
 static void starred_ensure(bool force)
 {
+    /* 离线模式没有服务器可对账：直接返回（调用点也已经分模式了，这里是第二道保险，
+     * 免得以后有人别处调它，离线状态下白白发一次网络请求）。 */
+    if (s_mode == PLAYER_MODE_OFFLINE) return;
+
     int64_t now = esp_timer_get_time() / 1000;
     bool stale = (s_starred_ok_ms < 0) || (now - s_starred_ok_ms > STAR_REFRESH_MS);
     if (!force && !stale && player_starred_pending() == 0) return;
@@ -626,6 +682,20 @@ static void fill_missing_suffix(sub_song_t *v, int n);   /* 定义在下面，�
 void player_sync_library(void)
 {
     if (s_lock == NULL) return;
+
+    /* 离线模式：没有服务器可对账，也不该发任何网络请求。
+     * 但**必须在这里把卡挂上、把索引载进来** —— 第 8 步 player_resume() 会
+     * 马上按来源建列表，那时曲库得是就绪的（开机就在离线模式的情况）。 */
+    if (s_mode == PLAYER_MODE_OFFLINE) {
+        if (!sd_card_mounted() && sd_card_mount() != ESP_OK) {
+            ESP_LOGW(TAG, "离线模式开机，但 TF 卡没挂上：曲库为空，可到「设置 → 扫描 TF 卡」重试");
+        } else {
+            musiclib_load();
+            ESP_LOGI(TAG, "同步曲库（离线模式）：TF 卡曲库 %d 首（不联网）", musiclib_count());
+        }
+        return;
+    }
+
     /* 不在这里判"有没有网" —— player 不该反向依赖 net_mgr（分层约定），
      * 而且没网时下面的取数本来就会快速失败，不影响启动。 */
 
@@ -696,6 +766,8 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
 
     int got = 0;
     esp_err_t err;
+    const bool offline = (s_mode == PLAYER_MODE_OFFLINE);
+
     if (src == PLAYER_SRC_RECENT) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         int n = s_recent_n;
@@ -703,19 +775,40 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
         xSemaphoreGive(s_lock);
         got = n;
         err = n > 0 ? ESP_OK : ESP_FAIL;
-        fill_missing_suffix(tmp, got);
-        ESP_LOGI(TAG, "来源「最近播放」: %d 首", n);
+        /* 只有在线模式才需要回源补后缀：离线曲目的后缀来自文件名，本来就是全的，
+         * 而且离线模式下根本不该发网络请求。 */
+        if (!offline) fill_missing_suffix(tmp, got);
+        ESP_LOGI(TAG, "来源「最近播放」(%s): %d 首", mode_name(s_mode), n);
     } else if (src == PLAYER_SRC_STARRED) {
-        /* 切到"我的收藏"= 用户想看最新的，强制跟服务器对一次；
-         * 对不上（没网）就用本地镜像 —— M6 之前这里会直接失败，收藏来源变空。 */
-        starred_ensure(true);
-        bool synced = false;
-        got = starred_copy(tmp, PLAYER_QUEUE_MAX, &synced);
-        err = got > 0 ? ESP_OK : ESP_FAIL;
-        fill_missing_suffix(tmp, got);
-        ESP_LOGI(TAG, "来源「我的收藏」: %d 首%s", got, synced ? "" : "（本地镜像，未与服务器对上）");
+        if (offline) {
+            /* 离线收藏是本地列表，不跟服务器对账（两种模式的收藏本来就是分开的） */
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            got = s_starred_n;
+            if (got > 0) memcpy(tmp, s_starred, (size_t)got * sizeof(sub_song_t));
+            xSemaphoreGive(s_lock);
+            err = got > 0 ? ESP_OK : ESP_FAIL;
+            ESP_LOGI(TAG, "来源「我的收藏」(离线): %d 首", got);
+        } else {
+            /* 切到"我的收藏"= 用户想看最新的，强制跟服务器对一次；
+             * 对不上（没网）就用本地镜像 —— M6 之前这里会直接失败，收藏来源变空。 */
+            starred_ensure(true);
+            bool synced = false;
+            got = starred_copy(tmp, PLAYER_QUEUE_MAX, &synced);
+            err = got > 0 ? ESP_OK : ESP_FAIL;
+            fill_missing_suffix(tmp, got);
+            ESP_LOGI(TAG, "来源「我的收藏」: %d 首%s", got, synced ? "" : "（本地镜像，未与服务器对上）");
+        }
     } else {
-        err = subsonic_get_random(tmp, 30, &got);
+        if (offline) {
+            /* 离线"随机 30 首" = 从 TF 卡曲库里随机抽 */
+            got = musiclib_pick_random(tmp, 30);
+            err = got > 0 ? ESP_OK : ESP_FAIL;
+            if (got <= 0) {
+                ESP_LOGW(TAG, "离线曲库是空的 —— 到「设置 → 扫描 TF 卡」扫一次");
+            }
+        } else {
+            err = subsonic_get_random(tmp, 30, &got);
+        }
     }
 
     if (err != ESP_OK || got <= 0) {
@@ -762,19 +855,36 @@ static void start_index_from(int idx, uint32_t from_ms)
     ae_source_t *old = s_cur_src;
     s_cur_src = NULL;
 
-    char url[768];
     uint32_t off_s = from_ms / 1000;
-    if (off_s > 0) {
-        subsonic_stream_url_at(&song, 0, off_s, url, sizeof(url));
+    ae_source_t *src = NULL;
+
+    if (song.path[0]) {
+        /* ★ 本地文件（离线模式）：直接开文件，不拼 URL、不走网络。
+         * ⚠️ 离线不支持 seek：ae_source_t 只有 open/read/close，没有 seek；
+         *    压缩流也没法把"毫秒"换算成文件偏移（不解码就不知道第 90 秒在第几字节）。
+         *    所以这里把 seek 降级成"从头播"。真要做需要 decode-and-discard，
+         *    已列为后续项（见 audio_source_file.c 顶部说明）。 */
+        if (off_s > 0) {
+            ESP_LOGW(TAG, "离线模式不支持快进：这首从头播");
+            off_s   = 0;
+            from_ms = 0;
+        }
+        src = ae_source_file_new(song.path);
     } else {
-        subsonic_stream_url(&song, 0, url, sizeof(url));
+        char url[768];
+        if (off_s > 0) {
+            subsonic_stream_url_at(&song, 0, off_s, url, sizeof(url));
+        } else {
+            subsonic_stream_url(&song, 0, url, sizeof(url));
+        }
+        src = ae_source_http_new(url);
     }
-    ae_source_t *src = ae_source_http_new(url);
+
     if (src == NULL) {
-        ESP_LOGE(TAG, "创建 HTTP 源失败");
+        ESP_LOGE(TAG, "创建音频源失败（%s）", song.path[0] ? "本地文件" : "HTTP");
         restore_mute();
         s_active = false;
-        if (old) ae_source_http_free(old);
+        if (old) ae_source_free(old);
         return;
     }
 
@@ -790,7 +900,7 @@ static void start_index_from(int idx, uint32_t from_ms)
     if (from_ms > 0) audio_engine_set_pos_base(from_ms);
     restore_mute();
 
-    if (old) ae_source_http_free(old);        /* 旧源现在才能安全释放 */
+    if (old) ae_source_free(old);             /* 旧源现在才能安全释放 */
     if (from_ms == 0) {
         recent_push(&song);                   /* seek 不算"又听了一遍新歌" */
         resume_reset(song.id);                /* 换歌了：续播位置归零，别把上一首的位置带过来 */
@@ -826,7 +936,16 @@ static void play_song_id(const char *id)
     xSemaphoreGive(s_lock);
 
     sub_song_t song;
-    if (subsonic_get_song(id, &song) != ESP_OK) {
+    memset(&song, 0, sizeof(song));
+    /* ★ 离线模式：id 是本地曲目的（"L" + 路径哈希），不能去 Navidrome 查 ——
+     *   那是另一套 id 空间，查也是白查一次网络。直接在 TF 卡曲库里找。 */
+    if (s_mode == PLAYER_MODE_OFFLINE) {
+        if (!musiclib_find_by_id(id, &song)) {
+            ESP_LOGW(TAG, "离线曲库里找不到 id=%s（是不是换过卡/重扫过？）", id);
+            return;
+        }
+        ESP_LOGI(TAG, "离线点播：%s - %s", song.title, song.artist);
+    } else if (subsonic_get_song(id, &song) != ESP_OK) {
         ESP_LOGE(TAG, "取不到歌曲 %s（网络？）", id);
         return;
     }
@@ -923,6 +1042,29 @@ static void star_song_id(const char *id, bool on)
         if (!found) ESP_LOGW(TAG, "收藏的 %s 不在队列/收藏里，只有 id（元数据等刷新时从服务器补）", id);
     }
 
+    /* ★ 离线模式：收藏是【纯本地行为】—— 写离线收藏列表，不推服务器、不进待重试队列。
+     *   两种模式的收藏本来就是分开的；离线时去改在线收藏是错的。
+     *   ⚠️ 离线曲目必须带 path，否则存进去也播不了（上方元数据解析已经拿到它）。 */
+    if (s_mode == PLAYER_MODE_OFFLINE) {
+        if (song.path[0] == 0) {
+            /* 上面的元数据是从状态快照/队列里凑的，可能没带 path
+             * （典型场景：网页控制台收藏"当前正在放"的那首，快照里没有路径）。
+             * 到曲库里按 id 补一次，补不到才放弃。 */
+            sub_song_t ls;
+            if (musiclib_find_by_id(id, &ls)) {
+                song = ls;
+            } else {
+                ESP_LOGW(TAG, "离线收藏的这首歌既不在队列、曲库里也没有（id=%s），跳过", id);
+                return;
+            }
+        }
+        starred_local_apply(&song, on);   /* 同一份镜像，落盘自动走 STAROF.SC（见 f_star） */
+        starred_save();
+        ESP_LOGW(TAG, "%s离线收藏：%s", on ? "已" : "已取消",
+                 song.title[0] ? song.title : id);
+        return;
+    }
+
     /* 2) 本地镜像先落实（界面立刻对），3) 再推服务器 */
     starred_local_apply(&song, on);
     starred_save();
@@ -976,6 +1118,201 @@ static void handle_set_source(int src, bool autoplay)
     }
 }
 
+/* ★ 在线 / 离线 模式切换。
+ *
+ * 整个动作都放在 player 任务里做（命令队列进来），因为"停播 → 卸载/挂载 SD →
+ * 按新来源重建列表"这三步必须串行，而且要和"下一首/换来源"这类命令互斥 ——
+ * 走队列天然满足，不用再加一把锁。
+ *
+ * ⚠️ 不自动播：两种模式的曲库不一样，当前这首在另一种模式里未必存在。
+ *    切完让用户自己按播放。 */
+static void handle_set_mode(int mode)
+{
+    if (mode < 0 || mode > (int)PLAYER_MODE_OFFLINE) return;
+    player_mode_t m = (player_mode_t)mode;
+    if (m == s_mode) return;
+
+    ESP_LOGW(TAG, "===== 模式切换：%s → %s =====", mode_name(s_mode), mode_name(m));
+
+    /* ① 先停播。切换要换一整套数据源，边放边换没意义；
+     *    而且卸载 SD 必须等"没有文件正在读"—— audio_engine_stop() 内部会等
+     *    三个任务退出，这一步过了才是安全的。 */
+    s_active = false;
+    audio_engine_stop();
+
+    /* ② ⚠️ 顺序关键：必须【先按旧模式存盘】，再改 s_mode。
+     *    f_recent()/f_star() 是按 s_mode 选文件名的 —— 顺序反了就会把在线列表
+     *    写进离线文件，两种模式的歌单就串了。 */
+    recent_save();
+    starred_save();
+
+    /* ③ 换模式 + 落盘。
+     *    ⚠️ 用立即落盘（不是 lazy）：这是"设置"，用户切完可能马上就断电，
+     *       而 lazy 有 2 秒窗口，掉了就回到旧模式，看起来像没生效。 */
+    s_mode = m;
+    settings_set_int(NVS_MODE_KEY, (int)m);
+    player_status_set_mode((int)m);
+
+    /* ④ SD 卡与曲库：进离线才挂载/装载，回在线就清空/卸载。
+     *    卸载的意义：SDSPI/SDMMC 的内部缓冲占【内部 SRAM】，而在线模式起播后
+     *    只剩 10~15KB —— 不能被一个用不到的驱动白占着。
+     *    这就是"两条线互不干扰"在内存上的落地。 */
+    if (m == PLAYER_MODE_OFFLINE) {
+        if (sd_card_mount() == ESP_OK) {
+            musiclib_load();            /* 没有索引也不致命：提示去扫描 */
+        } else {
+            ESP_LOGW(TAG, "TF 卡没挂上：离线模式可用，但曲库会是空的");
+        }
+    } else {
+        musiclib_clear();
+        sd_card_unmount();
+    }
+
+    /* ⑤ 清队列，丢掉【上一个模式】的内存列表，再从新模式的落盘文件恢复。
+     *    列表是"每个模式一份文件"，内存里只留当前模式那一份（省约 75KB PSRAM）。 */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_count     = 0;
+    s_index     = -1;
+    s_queue_gen++;
+    s_recent_n  = 0;
+    s_starred_n = 0;
+    xSemaphoreGive(s_lock);
+    player_status_set_queue(-1, 0, player_src_name(s_src), true);
+
+    s_recent_loaded = false;
+    s_starred_ok_ms = -1;        /* "跟服务器对上过"这个状态换了模式就不适用了 */
+    s_starred_gen++;
+
+    if (store_ready() && s_persist_ok) {
+        int n = list_load(f_recent(), s_recent, PLAYER_RECENT_MAX);
+        if (n > 0) { s_recent_n = n; s_recent_loaded = true; }
+        n = list_load(f_star(), s_starred, PLAYER_STAR_MAX);
+        if (n > 0) { s_starred_n = n; s_starred_gen++; }
+        ESP_LOGW(TAG, "%s模式的列表已恢复：最近播放 %d 条 / 收藏 %d 首",
+                 mode_name(m), s_recent_n, s_starred_n);
+    }
+
+    /* ⑥ 按【新模式的】当前来源重建列表（不自动播） */
+    int first = 0;
+    if (load_source_chain(s_src, &first)) {
+        ESP_LOGI(TAG, "已切到%s模式：来源「%s」共 %d 首",
+                 mode_name(m), player_src_name(s_src), player_queue_count());
+    } else {
+        ESP_LOGW(TAG, "已切到%s模式：来源「%s」暂时取不到歌",
+                 mode_name(m), player_src_name(s_src));
+    }
+}
+
+/* ★ 收藏同步：在线 → 离线。设计说明见 player.h。 */
+static void handle_sync_to_offline(void)
+{
+    s_sync_offline_busy    = 1;
+    s_sync_offline_done    = 0;
+    s_sync_offline_synced  = 0;
+    s_sync_offline_skipped = 0;
+    s_sync_offline_err     = ESP_OK;
+
+    if (s_mode != PLAYER_MODE_ONLINE) {
+        ESP_LOGW(TAG, "收藏同步只在在线模式下有意义（现在是%s）", mode_name(s_mode));
+        s_sync_offline_err = ESP_ERR_INVALID_STATE;
+        goto out;
+    }
+
+    /* 两块快照缓冲复用（在线收藏/离线收藏各自最多 PLAYER_STAR_MAX 首） */
+    static sub_song_t *src_snap;
+    static sub_song_t *off;
+    if (src_snap == NULL) {
+        src_snap = heap_caps_malloc(PLAYER_STAR_MAX * sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
+        off      = heap_caps_malloc(PLAYER_STAR_MAX * sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
+    }
+    if (src_snap == NULL || off == NULL) {
+        ESP_LOGE(TAG, "同步缓冲分配失败");
+        s_sync_offline_err = ESP_ERR_NO_MEM;
+        goto out;
+    }
+
+    /* ① 在线收藏的快照 */
+    int n;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    n = s_starred_n;
+    if (n > PLAYER_STAR_MAX) n = PLAYER_STAR_MAX;
+    if (n > 0) memcpy(src_snap, s_starred, (size_t)n * sizeof(sub_song_t));
+    xSemaphoreGive(s_lock);
+    if (n <= 0) {
+        ESP_LOGW(TAG, "在线收藏是空的，没什么可同步的");
+        goto out;
+    }
+
+    /* ② 临时挂卡 + 载索引。
+     *    在线模式平时是【卸载】状态的（内部 SRAM 账，见 sd_card.h）——
+     *    同步要读曲库，所以这里临时挂上，结束时还原。 */
+    bool we_mounted = false;
+    if (!sd_card_mounted()) {
+        if (sd_card_mount() != ESP_OK) {
+            ESP_LOGE(TAG, "同步失败：TF 卡没挂上");
+            s_sync_offline_err = ESP_ERR_NOT_FOUND;
+            goto out;
+        }
+        we_mounted = true;
+    }
+    musiclib_load();
+    if (musiclib_count() <= 0) {
+        ESP_LOGW(TAG, "离线曲库是空的 —— 先切到离线模式扫一次卡");
+        s_sync_offline_err = ESP_ERR_NOT_FOUND;
+        goto out_unmount;
+    }
+
+    /* ③ 现存的离线收藏。⚠️ 这里显式用 F_STAR_OFF 而不是 f_star()：
+     *    此刻 s_mode 还是"在线"，f_star() 会返回在线文件名 —— 而我们要写的
+     *    恰恰是离线那一份。 */
+    int off_n = 0;
+    if (store_ready() && s_persist_ok) {
+        off_n = list_load(F_STAR_OFF, off, PLAYER_STAR_MAX);
+        if (off_n < 0) off_n = 0;
+    }
+
+    /* ④ 逐首匹配；已经收藏过的跳过（重复点同步不该重复添加） */
+    int synced = 0, skipped = 0;
+    for (int i = 0; i < n; i++) {
+        char paths[1][SUB_SONG_PATH_MAX];
+        int hit = musiclib_match(src_snap[i].title, src_snap[i].artist, paths, 1);
+        sub_song_t ls;
+        if (hit <= 0 || !musiclib_find_by_path(paths[0], &ls)) { skipped++; continue; }
+
+        bool dup = false;
+        for (int j = 0; j < off_n; j++) {
+            if (off[j].path[0] && strcmp(off[j].path, ls.path) == 0) { dup = true; break; }
+        }
+        if (dup || off_n >= PLAYER_STAR_MAX) { skipped++; continue; }
+
+        ls.starred = true;
+        off[off_n++] = ls;
+        synced++;
+    }
+
+    /* ⑤ 只写离线收藏文件；在线收藏一个字节都不动 */
+    esp_err_t err = ESP_OK;
+    if (synced > 0) {
+        if (!store_ready() || !s_persist_ok) {
+            err = ESP_ERR_INVALID_STATE;      /* cache 分区没挂上，结果存不下来 */
+        } else if (!list_save(F_STAR_OFF, off, off_n)) {
+            err = ESP_FAIL;
+        }
+    }
+    s_sync_offline_synced  = synced;
+    s_sync_offline_skipped = skipped;
+    s_sync_offline_err     = err;
+    ESP_LOGW(TAG, "收藏同步到离线：已同步 %d 首，跳过 %d 首（卡上没有/已经收藏过）",
+             synced, skipped);
+
+out_unmount:
+    musiclib_clear();                    /* 索引放掉，回到在线模式的内存占用 */
+    if (we_mounted) sd_card_unmount();   /* 自己挂的自己卸 */
+out:
+    s_sync_offline_busy = 0;
+    s_sync_offline_done = 1;
+}
+
 /* 开机：沿用上次来源，并且**接着上次那首、那个位置放**（M6：重启恢复上次曲目与位置）。
  * 上次那首不在恢复出来的队列里（换了来源、收藏被清空）才退回第一首。 */
 static void handle_resume(void)
@@ -1022,10 +1359,20 @@ static void do_search(const char *q)
     s_found_busy = true;
     xSemaphoreGive(s_lock);
 
-    ESP_LOGW(TAG, "搜索 \"%s\"…", q);
+    ESP_LOGW(TAG, "搜索 \"%s\"…（%s）", q, mode_name(s_mode));
     int got = 0;
-    esp_err_t err = s_found_tmp ? subsonic_search(q, s_found_tmp, SUB_SONGS_MAX, &got)
-                                : ESP_ERR_NO_MEM;
+    esp_err_t err;
+    if (s_found_tmp == NULL) {
+        err = ESP_ERR_NO_MEM;
+    } else if (s_mode == PLAYER_MODE_OFFLINE) {
+        /* 离线搜索 = 在 TF 卡曲库里做子串匹配。
+         * 不需要拼音索引：屏上拼音输入法输出的已经是汉字（见 ui_search.c），
+         * 所以这里按 UTF-8 子串比就行。0 条 = 没找到，不是错误。 */
+        got = musiclib_search(q, s_found_tmp, SUB_SONGS_MAX);
+        err = ESP_OK;
+    } else {
+        err = subsonic_search(q, s_found_tmp, SUB_SONGS_MAX, &got);
+    }
 
     /* 搜完了整体换过去（持锁只做 memcpy）*/
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -1084,6 +1431,12 @@ static void handle_cmd(const player_cmd_t *c)
         case CMD_SET_SOURCE:
             handle_set_source(c->iarg, c->barg);
             break;
+        case CMD_SET_MODE:
+            handle_set_mode(c->iarg);
+            break;
+        case CMD_SYNC_OFFLINE:
+            handle_sync_to_offline();
+            break;
         case CMD_RESUME:
             handle_resume();
             break;
@@ -1105,8 +1458,14 @@ static void handle_cmd(const player_cmd_t *c)
             break;
         case CMD_PLAY_ID:
             s_active = true;
-            if (c->meta.id[0]) play_song_meta(&c->meta);
-            else               play_song_id(c->sid);
+            /* ★ 离线模式：**不信任前端带来的元数据**。
+             *   网页控制台点歌时会把歌的元数据一起发过来（本意是省一次 getSong 往返），
+             *   但那份元数据里没有本地路径 —— 直接用它就会落进 HTTP 分支，于是
+             *   "离线模式"下放出来的是网络流，而且它会被排进本地队列，下一首直接串。
+             *   本地路径是权威的，所以离线时一律回曲库按 id 重查。 */
+            if (s_mode == PLAYER_MODE_OFFLINE) play_song_id(c->sid);
+            else if (c->meta.id[0])            play_song_meta(&c->meta);
+            else                               play_song_id(c->sid);
             break;
         case CMD_SEEK: {
             int idx = player_queue_index();
@@ -1255,6 +1614,19 @@ esp_err_t player_init(void)
     s_q = xQueueCreate(8, sizeof(player_cmd_t));
     if (s_q == NULL) return ESP_FAIL;
 
+    /* ★ 这两个 sizeof 一定要打出来：命令队列是【内部 SRAM】的固定开销，而
+     *   sub_song_t 在 M9 加了 path[SUB_SONG_PATH_MAX] 之后从 468B 涨到 660B ——
+     *   8 条命令就是 +1.5KB 内部 SRAM。内部 SRAM 是这个工程最紧的资源
+     *   （起播后只剩 10~15KB），所以换板/加字段之后要能看到这个数。
+     *   余量告急时的降法（按代价从小到大）：
+     *     ① 把 SUB_SONG_PATH_MAX 从 192 降到 128 → 省 64×8 = 512B
+     *     ② 命令队列深度 8 → 6 → 省约 1.6KB（只影响"瞬间猛按按键"的缓冲）
+     *     ③ 把 meta 从命令体里挪出去（改成 PSRAM 暂存 + 只带指针）—— 改动最大 */
+    ESP_LOGW(TAG, "尺寸：sub_song_t=%u B（path 占 %u）｜ player_cmd_t=%u B ｜ "
+                  "命令队列 8 条 = %u B（内部 SRAM）",
+             (unsigned)sizeof(sub_song_t), (unsigned)SUB_SONG_PATH_MAX,
+             (unsigned)sizeof(player_cmd_t), (unsigned)(8 * sizeof(player_cmd_t)));
+
     /* 大队列全进 PSRAM（内部 SRAM 只留给协议栈/任务栈/DMA） */
     s_queue = heap_caps_calloc(PLAYER_QUEUE_MAX, sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
     s_recent = heap_caps_calloc(PLAYER_RECENT_MAX, sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
@@ -1300,11 +1672,17 @@ esp_err_t player_init(void)
     int src = settings_get_int("src", (int)PLAYER_SRC_RANDOM);
     if (src >= 0 && src < PLAYER_SRC_COUNT) s_src = (player_src_t)src;
 
+    /* 在线/离线模式（同样存在 NVS 的 "cfg"）。P4/P6 会在离线模式下额外
+     * 挂载 SD、改从卡上的索引恢复列表。 */
+    int md = settings_get_int(NVS_MODE_KEY, (int)PLAYER_MODE_ONLINE);
+    if (md >= 0 && md <= (int)PLAYER_MODE_OFFLINE) s_mode = (player_mode_t)md;
+    player_status_set_mode((int)s_mode);
+
     /* ---- M6：从 cache 分区恢复。store 没挂上就跳过，一切照旧（只是重启后为空）---- */
     if (store_ready() && s_persist_ok) {
-        int n = list_load(F_RECENT, s_recent, PLAYER_RECENT_MAX);
+        int n = list_load(f_recent(), s_recent, PLAYER_RECENT_MAX);
         if (n > 0) { s_recent_n = n; s_recent_loaded = true; }
-        n = list_load(F_STAR, s_starred, PLAYER_STAR_MAX);
+        n = list_load(f_star(), s_starred, PLAYER_STAR_MAX);
         if (n > 0) { s_starred_n = n; s_starred_gen++; }
         pend_load();
         ESP_LOGW(TAG, "cache 恢复到内存：最近播放 %d 条%s / 收藏 %d 首 / 待重试收藏 %d 条",
@@ -1332,6 +1710,15 @@ static void post(cmd_kind_t kind, int iarg, bool barg)
 }
 
 void player_set_source(player_src_t src, bool autoplay) { post(CMD_SET_SOURCE, (int)src, autoplay); }
+void player_set_mode(player_mode_t m)                   { post(CMD_SET_MODE, (int)m, false); }
+player_mode_t player_mode(void) { return s_mode; }
+
+void      player_sync_to_offline(void)      { post(CMD_SYNC_OFFLINE, 0, false); }
+int       player_sync_offline_busy(void)    { return s_sync_offline_busy; }
+int       player_sync_offline_done(void)    { return s_sync_offline_done; }
+int       player_sync_offline_synced(void)  { return s_sync_offline_synced; }
+int       player_sync_offline_skipped(void) { return s_sync_offline_skipped; }
+esp_err_t player_sync_offline_err(void)     { return (esp_err_t)s_sync_offline_err; }
 void player_set_source_next(int dir, bool autoplay)
 {
     int n = (int)player_source() + (dir >= 0 ? 1 : PLAYER_SRC_COUNT - 1);

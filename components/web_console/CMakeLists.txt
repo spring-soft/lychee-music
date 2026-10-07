@@ -6,6 +6,8 @@ idf_component_register(
         app_core
         audio_engine
         player
+        musiclib
+        sd_card
         subsonic
         net_mgr
         settings

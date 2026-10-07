@@ -30,15 +30,23 @@ typedef enum {
     AE_STATE_ERROR,
 } ae_state_t;
 
-/* 音频源抽象：M1 用内存，M2 换成 HTTP 流，引擎其余部分不变 */
+/* 音频源抽象：M1 用内存，M2 换成 HTTP 流，离线模式再换成本地文件，引擎其余部分不变 */
 typedef struct ae_source {
     esp_err_t (*open)(struct ae_source *s, const char *uri);   /* uri 可为 NULL = 用创建时的 */
     /* 返回读到的字节数；0 = 流结束(EOF)；<0 = 错误 */
     int       (*read)(struct ae_source *s, uint8_t *buf, size_t want);
     void      (*close)(struct ae_source *s);
+    /* 释放整个源（ctx + uri + 自身）。可选，但每个新源都该实现。
+     * 为什么要它：player 换歌时要释放"上一首的源"，而源的类型是运行时才知道的
+     * （在线=HTTP、离线=本地文件）—— 以前 player 直接调 ae_source_http_free()，
+     * 加了文件源之后那样写就会用错释放函数。 */
+    void      (*free)(struct ae_source *s);
     void       *ctx;
-    const char *uri;      /* 创建时带的 URL/标识（HTTP 源用） */
+    const char *uri;      /* 创建时带的 URL/标识（HTTP/文件源用） */
 } ae_source_t;
+
+/* 通用释放：转调 s->free（没有就兜底放掉 ctx/uri/自身）。任何源都能用它。 */
+void       ae_source_free(ae_source_t *s);
 
 esp_err_t  audio_engine_init(void);
 esp_err_t  audio_engine_play(ae_source_t *src);
@@ -97,6 +105,13 @@ void         ae_source_memory_free(ae_source_t *s);
 /* ---------------- HTTP 流式源（M2 起） ---------------- */
 ae_source_t *ae_source_http_new(const char *url);
 void         ae_source_http_free(ae_source_t *s);
+
+/* ---------------- 本地文件源（离线模式） ----------------
+ * path 是 VFS 路径，如 "/sdcard/音乐/周杰伦 - 稻香.flac"。
+ * 读盘是阻塞的，只应在 audio_engine 的 fetch 任务（core 0、低优先级）里被调用。
+ * ⚠️ 不支持 seek（见 audio_source_file.c 顶部说明）。 */
+ae_source_t *ae_source_file_new(const char *path);
+void         ae_source_file_free(ae_source_t *s);
 
 /* 内嵌测试音频（⚠️ M1 专用，M2 接上 Navidrome 后连同 audio/ 目录一起删掉） */
 const uint8_t *ae_embed_test_audio(bool flac, size_t *len);

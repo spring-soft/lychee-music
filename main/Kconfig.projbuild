@@ -17,6 +17,34 @@ menu "ESP-Music 配置"
             ⚠️ 换板型后请 `idf.py fullclean` 再编译 —— 引脚宏影响多个组件的条件编译，
                增量编译容易留下旧目标文件。
 
+    config BOARD_FORCE_ENCODER
+        bool "面包板上也启用旋转编码器（仅调试用）"
+        default n
+        help
+            编码器与 TF 卡的开关【不】各自做成 Kconfig bool，而是由板型在
+            board.h 里派生：
+              面包板（BOARD_VARIANT_BREADBOARD=y） → 两个都不编译
+              自制 PCB V2                          → 两个都编译
+
+            为什么不用独立开关：sdkconfig 里一旦写进过值，Kconfig 的 default
+            就不会再跟着板型重新求值 —— 换了板型必然留下"面包板变体 +
+            硬件开关=开"这种自相矛盾的状态。这个工程已经在这条路上踩过一次
+            （见 sdkconfig.forced 顶部关于 SDKCONFIG_DEFAULTS 的说明）。
+
+            ⚠️ 只能用 sdkconfig.local 覆盖（sdkconfig.forced 是静态的，没法按板型分支）：
+               临时在面包板上接一个 EC11 模块先把编码器逻辑跑通时，加一行
+               CONFIG_BOARD_FORCE_ENCODER=y
+
+    config BOARD_FORCE_TF
+        bool "面包板上也启用 TF 卡（仅调试用）"
+        default n
+        help
+            同上。面包板上临时接 microSD 模块时，往 sdkconfig.local 里加
+            CONFIG_BOARD_FORCE_TF=y。
+
+            ⚠️ 驱动用的仍是 V2 的引脚 IO12/CS、IO13/MISO、IO14/CD，而屏幕占着
+               IO4/CLK 与 IO5/MOSI —— 两者共用 SPI2，接线时别撞车。
+
     config APP_WIFI_SSID
         string "WiFi SSID（仅作首次开机的 NVS 默认值）"
         default ""

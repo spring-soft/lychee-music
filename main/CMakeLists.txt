@@ -10,6 +10,8 @@ idf_component_register(
         player
         settings
         store
+        sd_card
+        musiclib
         hid_remote
         web_console
         ui

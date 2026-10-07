@@ -159,18 +159,44 @@ static size_t ae_normalize(const uint8_t *src, size_t bytes, uint8_t bits, uint8
     uint8_t in_bytes = bits / 8;
     if ((bits == 24 || bits == 32) && (ch == 1 || ch == 2)) {
         size_t frames = bytes / (in_bytes * ch);
-        size_t off = in_bytes - 2;            /* 取高 16 位 */
+        size_t off = in_bytes - 2;            /* 高 16 位在每采样里的偏移（数据是小端） */
         for (size_t i = 0; i < frames; i++) {
             const uint8_t *f = src + i * in_bytes * ch;
             if (out + 4 > dst_cap) break;
-            dst[out++] = f[off];
-            dst[out++] = f[off + 1];
+
+            /* ★ 四舍五入，而不是直接截断。
+             *
+             * 为什么：直接丢弃低位会留下 **0.5 LSB 的系统性负偏移**，而且误差与信号
+             * 相关 —— 在低电平处表现为谐波失真，不只是"多一点噪声"。舍入把偏移去掉、
+             * 峰值误差减半（RMS 量级不变，但不再有那个恒定偏移）。
+             *
+             * 怎么舍：看被丢掉的那些字节里【权重最高的那个】（f[off-1]）的最高位 ——
+             * ≥0x80 就往前进 1。这样只用字节运算，不需要把 24/32bit 拼成 int32，
+             * 也不用碰符号扩展。
+             *
+             * ⚠️ 唯一的溢出点：正满幅 0x7FFF（0x7FFFFF ~ 0x7FFFFF 这类）进位会变成
+             *    0x8000 = -32768，那是"最大正峰瞬间跳到最大负峰"的一声爆音，
+             *    所以必须夹住。负方向不会溢出（0xFFFF+1 截断回 0，正好是 -0.5 舍入成 0）。
+             *
+             * 注：这里刻意【不加抖动】。TPDF 抖动能把"相关失真"变成不相关噪声，
+             * 但代价是噪声地板抬高约 3dB；而在这块板上那层失真本来就在模拟噪声地板
+             * （codec + 开关电源 + MCLK 抖动）之下，听不出来。真要加，等有测量手段
+             * 证明有必要再说。 */
+            uint16_t hi = (uint16_t)(f[off] | ((uint16_t)f[off + 1] << 8));
+            if (f[off - 1] >= 0x80 && hi != 0x7FFF) hi++;
+
+            dst[out++] = (uint8_t)(hi & 0xFF);
+            dst[out++] = (uint8_t)(hi >> 8);
             if (ch == 2) {
-                dst[out++] = f[in_bytes + off];
-                dst[out++] = f[in_bytes + off + 1];
+                uint16_t hi2 = (uint16_t)(f[in_bytes + off] |
+                                          ((uint16_t)f[in_bytes + off + 1] << 8));
+                if (f[in_bytes + off - 1] >= 0x80 && hi2 != 0x7FFF) hi2++;
+                dst[out++] = (uint8_t)(hi2 & 0xFF);
+                dst[out++] = (uint8_t)(hi2 >> 8);
             } else {
-                dst[out++] = f[off];
-                dst[out++] = f[off + 1];
+                /* 单声道 → 复制成双声道 */
+                dst[out++] = (uint8_t)(hi & 0xFF);
+                dst[out++] = (uint8_t)(hi >> 8);
             }
         }
         return out;
@@ -755,6 +781,7 @@ ae_source_t *ae_source_memory_new(const uint8_t *data, size_t len)
     s->open = mem_open;
     s->read = mem_read;
     s->close = mem_close;
+    s->free = ae_source_memory_free;      /* 让 player 能用统一的 ae_source_free() */
     return s;
 }
 
@@ -762,6 +789,18 @@ void ae_source_memory_free(ae_source_t *s)
 {
     if (!s) return;
     if (s->ctx) heap_caps_free(s->ctx);
+    heap_caps_free(s);
+}
+
+/* 通用释放：转调源自己的 free。player 换歌时用它释放"上一首" —— 源类型
+ * 是运行时才知道的（在线 HTTP / 离线本地文件），所以不能让调用方自己挑函数。 */
+void ae_source_free(ae_source_t *s)
+{
+    if (!s) return;
+    if (s->free) { s->free(s); return; }
+    /* 兜底：理论上到不了（每个源都设了 free），但真到了也别漏内存 */
+    if (s->ctx) heap_caps_free(s->ctx);
+    if (s->uri) heap_caps_free((void *)s->uri);
     heap_caps_free(s);
 }
 

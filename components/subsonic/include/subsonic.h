@@ -21,6 +21,10 @@ extern "C" {
 
 #define SUB_SONGS_MAX 64
 
+/* 本地文件路径上限（离线曲库的歌）。UTF-8：中文名一个字 3 字节，
+ * 所以 192 大约能放 60 个汉字 + 目录层级，够用。 */
+#define SUB_SONG_PATH_MAX 192
+
 typedef struct {
     char     id[48];
     char     title[160];
@@ -31,6 +35,13 @@ typedef struct {
     uint32_t size;
     char     suffix[8];
     bool     starred;
+    /* ★ 非空 = 本地文件（VFS 路径，如 "/sdcard/音乐/周杰伦 - 稻香.flac"），
+     *   空 = Navidrome 上的歌。
+     *   离线模式的歌全部非空；在线模式的歌永远为空。
+     *   player 靠它决定"拼 URL 走 HTTP" 还是 "直接开文件"。
+     *   ⚠️ 它会被一起落盘（JSON 键 "p"），否则重启后离线列表变成
+     *      "有歌名但放不了"。 */
+    char     path[SUB_SONG_PATH_MAX];
 } sub_song_t;
 
 /* 从 NVS(ns "nav") 读配置，Kconfig 兜底 */

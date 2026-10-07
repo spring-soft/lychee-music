@@ -8,6 +8,8 @@ idf_component_register(
         subsonic
         settings
         store
+        sd_card
+        musiclib
         json
         freertos
         esp_hw_support

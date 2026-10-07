@@ -23,6 +23,7 @@
 #include "player.h"
 #include "app_core.h"
 #include "board.h"
+#include "encoder.h"
 #include "hid_remote.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -278,6 +279,104 @@ void ui_keys_init(void)
     ESP_LOGI(TAG, "K1-K4 就绪（GPIO %d/%d/%d/%d，长按 700ms，连滚 %dms）",
              k_pins[0], k_pins[1], k_pins[2], k_pins[3], HOLD_REPEAT_MS);
 }
+
+/* ============================================================ 旋转编码器（仅 V2 板）
+ *
+ * ⚠️ 与 K4 同一条教训：**规则只能写在一处**。所以旋转和按下都在下面这两个函数里
+ *    映射一次，各页面自己不要再散着处理编码器 —— 否则"某个页面的编码器忘了改"
+ *    会重演当年 K4 那个坑（见上面 k4_navigate 的说明）。
+ *
+ * 键位表（顺时针 CW = 界面里的"向下 / 向右"）：
+ *   播放页         转 = 下一首 / 上一首      ｜ 按 = 播放暂停
+ *   列表页         转 = 上下移行            ｜ 按 = 播放选中
+ *   菜单/来源/设置  转 = 上下移             ｜ 按 = 确认（含两段确认状态机）
+ *   音量页         转 = 音量 ±5（顺时针=加） ｜ 按 = 静音切换
+ *   搜索方式/结果页 转 = 上下移             ｜ 按 = 确认
+ *   搜索输入页     转 = 光标向右 / 向左      ｜ 按 = 输入该字母
+ *   蓝牙遥控页     转 = 对端上一首/下一首     ｜ 按 = 对端播放暂停
+ *   系统信息/内存页 转 = 无                 ｜ 按 = 无
+ *   任意页长按     = 回播放器（= 长按 K4 的语义）
+ *
+ * ⚠️ 搜索输入页是**横向**光标（用户指定 K1=向右），所以"顺时针 → K1"和列表页相反。
+ *    这里按页面显式映射，不要试图找一条统一规律。
+ *
+ * 面包板变体下这一整段不编译（BOARD_HAS_ENCODER=0），K1/K2/K3 语义一字不改。
+ */
+#if BOARD_HAS_ENCODER
+
+static void enc_rotate_one(bool down)
+{
+    /* 遥控模式：转 = 切歌、按 = 播放暂停。没连上时 bt_key_short 会 toast 并吞掉，
+     * 于是"旋钮绝不会偷偷控制本机播放"这条规则自动成立，不用重写。 */
+    if (in_bt_mode()) {
+        bt_key_short(down ? 0 : 2);          /* 0 = 下一首, 2 = 上一首 */
+        return;
+    }
+
+    switch (ui_page_current()) {
+        /* 搜索三页：旋转翻成"虚拟按键"交给既有分派，UI 那边一行都不用改 */
+        case UI_PAGE_SEARCH_IN:   ui_search_key_short(down ? 0 : 1); return;  /* K1=向右 */
+        case UI_PAGE_SEARCH_MODE:
+        case UI_PAGE_SEARCH_RES:  ui_search_key_short(down ? 1 : 0); return;
+
+        case UI_PAGE_PLAY:     if (down) player_next(); else player_prev(); break;
+        case UI_PAGE_LIST:     ui_list_move(down ? +1 : -1);                break;
+        case UI_PAGE_MENU:     ui_menu_move(down ? +1 : -1);                break;
+        case UI_PAGE_SRC:      ui_srcmenu_move(down ? +1 : -1);             break;
+        case UI_PAGE_SETTINGS: ui_setmenu_move(down ? +1 : -1);             break;
+        case UI_PAGE_VOL:      ui_vol_step(down ? +5 : -5);                 break;  /* 顺时针=加 */
+        default: break;       /* 系统信息 / 内存图表页：旋钮不做事 */
+    }
+}
+
+static void enc_press_short(void)
+{
+    if (in_bt_mode()) { bt_key_short(1); return; }        /* 1 = 播放/暂停 */
+
+    switch (ui_page_current()) {
+        case UI_PAGE_PLAY:       player_toggle();         break;
+        case UI_PAGE_LIST:       ui_list_play_selected(); break;
+        case UI_PAGE_MENU:       ui_menu_activate();      break;
+        case UI_PAGE_SRC:        ui_srcmenu_activate();   break;
+        case UI_PAGE_SETTINGS:   ui_setmenu_activate();   break;
+        case UI_PAGE_VOL:        ui_vol_toggle_mute();    break;
+        case UI_PAGE_SEARCH_MODE:
+        case UI_PAGE_SEARCH_IN:
+        case UI_PAGE_SEARCH_RES: ui_search_key_short(2);  break;
+        default: break;       /* 系统信息 / 内存图表页 */
+    }
+}
+
+/* 编码器回调。⚠️ 跑在 esp_timer 任务里 —— 和 K1-K4 的按键回调同一个上下文
+ * （iot_button 也是 ESP_TIMER_TASK 调度），所以这里能做的事和按键回调完全一样。 */
+static void enc_on_rotate(int dir, int steps)
+{
+    bool down = (dir == ENCODER_DIR_CW);
+    /* 连转多格就一格格走。步数已被 encoder.c 夹在 20 以内，不会卡死。 */
+    for (int i = 0; i < steps; i++) enc_rotate_one(down);
+}
+
+static void enc_on_press(int kind)
+{
+    switch (kind) {
+        case ENCODER_PRESS_SHORT: enc_press_short();       break;
+        /* 长按 = 回播放器。直接复用 K4 的统一出口，连"离开遥控页要关模式"、
+         * "离开音量页要立刻落盘"这些副作用一起继承，不在这里重写一遍。 */
+        case ENCODER_PRESS_LONG:  k4_navigate(3, true);    break;
+        default: break;          /* HOLD：不做连发，吞掉 */
+    }
+}
+
+void ui_keys_encoder_init(void)
+{
+    encoder_init(enc_on_rotate, enc_on_press);
+}
+
+#else   /* !BOARD_HAS_ENCODER —— 面包板：没有编码器可初始化 */
+
+void ui_keys_encoder_init(void) { /* 空实现 */ }
+
+#endif  /* BOARD_HAS_ENCODER */
 
 /* 注入一个按键事件（只给开机自检用，见 K4_SELFTEST）。
  * 走的是和真实按键**完全相同**的分发函数 —— 否则自检就失去意义了。 */
