@@ -24,6 +24,7 @@
 #include "soc/soc_caps.h"       /* SOC_I2S_SUPPORTS_APLL */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"          /* board_measure_ws_hz 用实际经过时间算窗口 */
 
 static const char *TAG = "board";
 
@@ -475,9 +476,19 @@ static clk_plan_t clk_plan_for(uint32_t fs, int slot_bits)
     /* bclk_div = mclk_multiple / (2 × 槽位宽)（立体声 2 槽），必须整除：
      *   16bit 槽 → 256/32 = 8（单速）、128/32 = 4（双速）
      *   32bit 槽 → 256/64 = 4（单速）、128/64 = 2（双速）
-     * ⚠️ 槽位宽改了而这里没跟着改，WS 就会变成 0.5×/2× —— 表现是半速变调，
-     *    而且不报任何错。所以槽位宽是【参数】而不是常量。 */
-    p.bclk_div = p.mclk_multiple / (2 * (uint32_t)slot_bits);
+     *
+     * ⚠️ 这个值本身是【给日志和对数用的】：master 角色下 IDF 会忽略 clk_cfg.bclk_div
+     *    自己按 "bclk = rate × total_slot × slot_bits" 重算（见 i2s_reconfig 里的顺序说明）。
+     *    把它算出来是为了：① 打进日志便于核对；② 不整除时当场报错 —— 不整除意味着
+     *    采样率必然不准，而 IDF 只会打一句很容易被淹掉的 WARNING。
+     *    24bit 槽就是这种情况（256/48 非整数），所以我们只用 16/32 槽。 */
+    const uint32_t denom = 2u * (uint32_t)slot_bits;
+    p.bclk_div = p.mclk_multiple / denom;
+    if (p.mclk_multiple % denom != 0) {
+        ESP_LOGE(TAG, "[clk] MCLK(%" PRIu32 ") 不能被 2×槽位宽(%d) 整除 —— "
+                      "采样率会不准。别用 24bit 槽（该用 32bit 槽 + MSB 左对齐）",
+                 p.mclk_multiple, slot_bits);
+    }
     return p;
 }
 
@@ -573,9 +584,23 @@ static esp_err_t i2s_reconfig(uint32_t sample_rate_hz, board_audio_fmt_t fmt)
     i2s_std_config_t cfg;
     i2s_fill_cfg(&cfg, sample_rate_hz, fp.slot_bits);
     i2s_channel_disable(s_tx);
-    esp_err_t err = i2s_channel_reconfig_std_clock(s_tx, &cfg.clk_cfg);
+    /* ⚠️⚠️ 这里顺序【不能反】：必须先 slot、后 clock。
+     *
+     * IDF 在 master 角色下是这么算时钟的（i2s_std.c 的 i2s_std_calculate_clock）：
+     *     clk_info->bclk = rate × total_slot × slot_bits;      ← slot_bits 取自 handle->mode_info
+     *     clk_info->bclk_div = mclk / bclk;                    ← IDF 自己算
+     * 也就是说 master 角色下 clk_cfg.bclk_div 是【被忽略的】（头文件原话：
+     * "only take effect for slave role"），BCLK 完全由 handle->mode_info 里那份
+     * slot 配置推出来。而那份 slot 配置只有 reconfig_std_slot 之后才更新。
+     *
+     * 所以如果先配 clock：它会拿【旧的 16bit 槽】算 → bclk = 32fs、分频 8；
+     * 之后槽再改成 32 → WS = BCLK/(2×32) = fs/2。
+     * 实测就是这样：期望 48000，实测 WS=24080（半速变调）。
+     * 而 IDF 既不报错、也不打 WARNING、返回值还是 ESP_OK —— 只能靠"实测 WS"发现。
+     * （24bit 槽那种 256/48 不整除的情况 IDF 会打一句 WARNING，见 clk_plan_for。） */
+    esp_err_t err = i2s_channel_reconfig_std_slot(s_tx, &cfg.slot_cfg);
     if (err == ESP_OK) {
-        err = i2s_channel_reconfig_std_slot(s_tx, &cfg.slot_cfg);
+        err = i2s_channel_reconfig_std_clock(s_tx, &cfg.clk_cfg);
     }
     if (err == ESP_OK) {
         s_fs  = sample_rate_hz;
@@ -648,16 +673,29 @@ int board_measure_ws_hz(int window_ms)
                                  PCNT_CHANNEL_EDGE_ACTION_HOLD);
     pcnt_unit_enable(unit);
     pcnt_unit_clear_count(unit);
+    int64_t t0 = esp_timer_get_time();
     pcnt_unit_start(unit);
     vTaskDelay(pdMS_TO_TICKS(window_ms));
     int c = 0;
     pcnt_unit_get_count(unit, &c);
+    int64_t t1 = esp_timer_get_time();
     pcnt_unit_stop(unit);
     pcnt_unit_disable(unit);
     pcnt_del_channel(chan);
     pcnt_del_unit(unit);
-    /* WS 每个采样周期一个完整方波 → 边沿数 = 频率 × 2 × 窗口秒数 / 2 = 频率 × 窗口秒数 */
-    return (int)((int64_t)c * 1000 / window_ms);
+
+    /* ⚠️⚠️ 必须除以【实际经过的时间】，不能除以请求的 window_ms。
+     *
+     * vTaskDelay 只保证"至少"睡够 window_ms，系统忙的时候（切格式 + HTTP + WiFi +
+     * LVGL 一起上来）实际窗口能多跑几十毫秒。而这里原来除以的是请求值，于是频率被
+     * 系统性算【高】—— 实测踩到：44100 Hz 的 WS 被算成 57510（+30.4%），
+     * 正好对应"窗口多跑了 30.4ms"。这种假错误出现在一个专门用来判断"时钟对不对"
+     * 的函数里特别危险：会让人去追一个根本不存在的时钟 bug。
+     * WS 每个采样周期一个上升沿（edge_action 只对上升沿 INCREASE）→
+     * 频率 = 上升沿数 / 实际秒数。 */
+    int64_t us = t1 - t0;
+    if (us <= 0) return -1;
+    return (int)((int64_t)c * 1000000 / us);
 }
 
 /* ============================================================== 测试音 */

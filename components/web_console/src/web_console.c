@@ -260,6 +260,11 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(au, "fmt", audio_engine_format_str());
     cJSON_AddNumberToObject(au, "fs", audio_engine_sample_rate());
     cJSON_AddNumberToObject(au, "bits", audio_engine_bit_depth());
+    /* ★ 源位深与实际输出位深是两个数，现在它们可以不一样 —— 这正是重点：
+     *   bits     = 源文件位深（解码器报的）
+     *   out_bits = 实际送进 I2S 的位深（16 / 24）
+     * 24bit 源正常时两个都是 24；若 bits=24 而 out_bits=16，说明格式没切过去。 */
+    cJSON_AddNumberToObject(au, "out_bits", audio_engine_out_bits());
     cJSON_AddBoolToObject(au, "raw", subsonic_last_raw());
     cJSON_AddNumberToObject(au, "ring_kb", audio_engine_ring_used_in() / 1024);
     /* 缓冲【已用/总量】（分母从引擎取，别在前端硬编码 512）*/
@@ -895,6 +900,8 @@ static esp_err_t h_debug(httpd_req_t *req)
     cJSON_AddNumberToObject(o, "settings_pending", settings_pending_count());
     cJSON_AddNumberToObject(o, "uptime_s", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddStringToObject(o, "format", audio_engine_format_str());
+    cJSON_AddNumberToObject(o, "bit_depth", audio_engine_bit_depth());
+    cJSON_AddNumberToObject(o, "out_bits", audio_engine_out_bits());
 
     /* M6：cache 分区（最近播放/收藏/封面缓存）*/
     cJSON *fs = cJSON_AddObjectToObject(o, "cache_fs");
