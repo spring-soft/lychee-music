@@ -22,6 +22,15 @@
 
 static const char *TAG = "ae";
 
+/* ---------------- 24bit 输出总开关（一行回退） ----------------
+ * 1 = 允许 >16bit 的源（24bit FLAC / 32bit 源）走 24bit 输出（32bit 槽 + MSB 左对齐）
+ * 0 = 一律压到 16bit —— 完全等于本次改动之前的行为（新分支成为死代码）
+ *
+ * 出问题想立刻回到老路，把这里改成 0 重编即可，不用回滚提交。
+ * 注意：置 0 时 ae_normalize() 的 24bit 目标分支不会被调用，但代码仍在（编译器会
+ * 保留，因为 out_fmt 是运行期参数）—— 这不影响正确性，只多几百字节。 */
+#define AUDIO_OUT_ALLOW_24BIT 1
+
 /* ---------------- 缓冲与参数 ---------------- */
 /* 压缩流预取 —— 抗【网络】抖动的唯一缓冲，直出无损之后这条最关键。
  * 128KB 在转码 MP3 192k（24KB/s）时代 ≈ 5.3 秒余量，够用；
@@ -29,19 +38,27 @@ static const char *TAG = "ae";
  * 24/96 更掉到 0.5 秒以下，WiFi 一抖就断供。
  * 提到 512KB：44.1k ≈ 4.7 秒、96k ≈ 1.7 秒。走 PSRAM，8MB 里占得起。 */
 #define RING_IN_BYTES        (512 * 1024)
-/* 解码后 PCM。解码器比实时快得多，这条不是瓶颈，但 96k 时同样缩水：
- * 128KB 在 44.1k/16bit 是 740ms，到 96k 只剩 340ms。
- * 提到 256KB：44.1k ≈ 1.5 秒、96k ≈ 680ms。 */
-#define RING_PCM_BYTES       (256 * 1024)
+/* 解码后 PCM。解码器比实时快得多，这条不是瓶颈，但 96k 时同样缩水，
+ * 而且【每帧字节数随输出格式变】：16bit 立体声 4 字节/帧、24bit 是 8 字节/帧。
+ *   256KB @16bit/44.1k ≈ 1.45 秒，但 256KB @24bit 只剩 ≈ 0.73 秒 —— 24bit 无损的
+ *   码率本来就高（曲库里那首 1576kbps），这里缩水会重新引入欠载。
+ *   所以提到 512KB：两种格式都保持 ≈ 1.45 秒 @44.1k，抗抖动余量与改动前一致。 */
+#define RING_PCM_BYTES       (512 * 1024)
 /* 起播前先攒多少 PCM。⚠️ 实测 32KB(186ms) 走网络流时不够 —— DMA 里本身就压着 185ms，
  *    网络一抖动就 underrun（实测 MP3 over HTTP 出现 12 次）。96KB ≈ 545ms 才稳。
- * 直出无损后网络压力更大，提到 128KB（44.1k ≈ 743ms、96k ≈ 333ms），
- * 代价只是起播多等约 200ms。 */
-#define PCM_PREBUFFER_BYTES  (128 * 1024)
+ * 直出无损后网络压力更大 ——
+ * ⚠️ 同样是"按字节数给"，24bit 下时长减半，所以跟 PCM 环一起放大到 256KB，
+ *    保证两种格式的起播缓冲时长一致（44.1k ≈ 743ms、96k ≈ 333ms @16bit）。 */
+#define PCM_PREBUFFER_BYTES  (256 * 1024)
 #define DEC_STAGE_INIT       (32 * 1024)
 #define DEC_STAGE_MAX        (128 * 1024)   /* FLAC 单帧远大于 MP3，必须能长 */
+/* ⚠️ 这个必须能装下【单次解码输出展开到目标格式】的最大量：
+ *    DEC_STAGE_MAX(128KB) 的 24bit 立体声输入 = 128K/6 ≈ 21845 帧，
+ *    展开成 32bit 槽（8 字节/帧）≈ 175KB < 256KB ✓ */
 #define PCM_OUT_CAP          (256 * 1024)
 #define SILENCE_CHUNK_MS     10
+/* ⚠️ 欠载时补的静音块。按最大每帧字节数（8）算，否则 24bit 下只有一半时长 */
+#define SILENCE_CHUNK_BYTES  (SILENCE_CHUNK_MS * 44100 / 1000 * 8)
 #define TASK_STACK_FETCH     6144
 #define TASK_STACK_DECODE    8192
 #define TASK_STACK_OUT       4096
@@ -103,6 +120,15 @@ static volatile uint32_t           s_underruns;
 static volatile uint32_t           s_fs = 44100;
 static volatile uint8_t            s_ch = 2;
 static volatile uint8_t            s_bits = 16;
+/* s_bits 是【源】位深（解码器报的，UI 显示用）；s_out_fmt / s_out_frame_bytes 是
+ * 【实际送给 I2S】的格式。16bit 及以下的源走 FMT_16（与改动前逐字节相同），
+ * >16bit 的源走 FMT_24（32bit 槽 + MSB 左对齐）。两者由本文件顶部
+ * AUDIO_OUT_ALLOW_24BIT 决定是否允许后者。 */
+static volatile board_audio_fmt_t  s_out_fmt = BOARD_AUDIO_FMT_16;
+/* 目标格式下每帧的字节数：16bit 立体声 = 4、24bit（装在 32bit 槽里）= 8。
+ * ⚠️ 引擎里所有"帧数 = 字节数 / N"的地方都必须用它 —— 写死 4 的话，
+ *    24bit 下帧数会翻倍，直接表现为进度条和 seek 位置全错。 */
+static volatile uint8_t            s_out_frame_bytes = 4;
 static volatile esp_audio_simple_dec_type_t s_type = ESP_AUDIO_SIMPLE_DEC_TYPE_NONE;
 
 /* eos 冲尾时 len=0，但 buffer 不能传 NULL（FLAC parser 会报 Invalid argument） */
@@ -134,76 +160,97 @@ static esp_audio_simple_dec_type_t ae_sniff(const uint8_t *b, size_t n)
     return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
 }
 
-/* ==================================================== PCM 归一化到 16bit 立体声 */
+/* ==================================================== PCM 归一化到目标输出格式 */
+
+/* 目标格式下每帧字节数（立体声）：16bit → 4、24bit（装在 32bit 槽里）→ 8 */
+static uint8_t ae_frame_bytes(board_audio_fmt_t fmt)
+{
+    return (fmt == BOARD_AUDIO_FMT_24) ? 8 : 4;
+}
+
+/* 把一个小端、n 字节、二补码的采样读成【MSB 对齐到 32bit】的无符号位型。
+ *
+ * 为什么统一到 32bit：MSB 对齐之后 16/24/32bit 三种源落在同一把标尺上
+ * （满量程 = 0x7FFFFFFF），后面按目标格式"往下舍"就是同一段逻辑。这也正是 DAC
+ * 看数据的方式 —— 它的满量程基准就是 MSB。
+ *   n=2（16bit 源）→ 左移 16（低 16 位补 0，与改动前 memcpy 的结果等价）
+ *   n=3（24bit 源）→ 左移 8
+ *   n=4（32bit 源）→ 原样
+ * ⚠️ 用【无符号】左移：负数左移在有符号里是 UB，无符号是明确定义的。 */
+static inline uint32_t ae_msb32(const uint8_t *p, int n)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < n; i++) v |= (uint32_t)p[i] << (8 * i);   /* 小端拼装 */
+    return v << (8 * (4 - n));
+}
 
 static size_t ae_normalize(const uint8_t *src, size_t bytes, uint8_t bits, uint8_t ch,
-                           uint8_t *dst, size_t dst_cap)
+                           uint8_t *dst, size_t dst_cap, board_audio_fmt_t out_fmt)
 {
-    size_t out = 0;
-    if (bits == 16 && ch == 2) {
+    /* ---- 快路径：16bit 立体声源 → 16bit 输出。原样 memcpy，与改动前的实现
+     *      【逐字节相同】（本工程绝大多数内容走这条，零回归面）。 ---- */
+    if (bits == 16 && ch == 2 && out_fmt == BOARD_AUDIO_FMT_16) {
         if (bytes > dst_cap) bytes = dst_cap;
         memcpy(dst, src, bytes);
         return bytes;
     }
-    if (bits == 16 && ch == 1) {
-        size_t frames = bytes / 2;
-        for (size_t i = 0; i < frames; i++) {
-            if (out + 4 > dst_cap) break;
-            dst[out++] = src[i * 2];
-            dst[out++] = src[i * 2 + 1];
-            dst[out++] = src[i * 2];
-            dst[out++] = src[i * 2 + 1];
-        }
-        return out;
+
+    if (bits != 16 && bits != 24 && bits != 32) {
+        ESP_LOGW(TAG, "[pcm] 暂不支持 %u bit 的归一化，丢弃 %u 字节",
+                 bits, (unsigned)bytes);
+        return 0;
     }
-    uint8_t in_bytes = bits / 8;
-    if ((bits == 24 || bits == 32) && (ch == 1 || ch == 2)) {
-        size_t frames = bytes / (in_bytes * ch);
-        size_t off = in_bytes - 2;            /* 高 16 位在每采样里的偏移（数据是小端） */
-        for (size_t i = 0; i < frames; i++) {
-            const uint8_t *f = src + i * in_bytes * ch;
-            if (out + 4 > dst_cap) break;
+    if (ch != 1 && ch != 2) {
+        ESP_LOGW(TAG, "[pcm] 暂不支持 %u 声道的归一化，丢弃 %u 字节",
+                 ch, (unsigned)bytes);
+        return 0;
+    }
 
-            /* ★ 四舍五入，而不是直接截断。
-             *
-             * 为什么：直接丢弃低位会留下 **0.5 LSB 的系统性负偏移**，而且误差与信号
-             * 相关 —— 在低电平处表现为谐波失真，不只是"多一点噪声"。舍入把偏移去掉、
-             * 峰值误差减半（RMS 量级不变，但不再有那个恒定偏移）。
-             *
-             * 怎么舍：看被丢掉的那些字节里【权重最高的那个】（f[off-1]）的最高位 ——
-             * ≥0x80 就往前进 1。这样只用字节运算，不需要把 24/32bit 拼成 int32，
-             * 也不用碰符号扩展。
-             *
-             * ⚠️ 唯一的溢出点：正满幅 0x7FFF（0x7FFFFF ~ 0x7FFFFF 这类）进位会变成
-             *    0x8000 = -32768，那是"最大正峰瞬间跳到最大负峰"的一声爆音，
-             *    所以必须夹住。负方向不会溢出（0xFFFF+1 截断回 0，正好是 -0.5 舍入成 0）。
-             *
-             * 注：这里刻意【不加抖动】。TPDF 抖动能把"相关失真"变成不相关噪声，
-             * 但代价是噪声地板抬高约 3dB；而在这块板上那层失真本来就在模拟噪声地板
-             * （codec + 开关电源 + MCLK 抖动）之下，听不出来。真要加，等有测量手段
-             * 证明有必要再说。 */
-            uint16_t hi = (uint16_t)(f[off] | ((uint16_t)f[off + 1] << 8));
-            if (f[off - 1] >= 0x80 && hi != 0x7FFF) hi++;
+    const int    in_bytes  = bits / 8;
+    const size_t in_frame  = (size_t)in_bytes * ch;
+    const size_t out_frame = ae_frame_bytes(out_fmt);
+    const size_t frames    = bytes / in_frame;
+    const bool   to24      = (out_fmt == BOARD_AUDIO_FMT_24);
+    size_t       out       = 0;
 
-            dst[out++] = (uint8_t)(hi & 0xFF);
-            dst[out++] = (uint8_t)(hi >> 8);
-            if (ch == 2) {
-                uint16_t hi2 = (uint16_t)(f[in_bytes + off] |
-                                          ((uint16_t)f[in_bytes + off + 1] << 8));
-                if (f[in_bytes + off - 1] >= 0x80 && hi2 != 0x7FFF) hi2++;
-                dst[out++] = (uint8_t)(hi2 & 0xFF);
-                dst[out++] = (uint8_t)(hi2 >> 8);
+    for (size_t i = 0; i < frames; i++) {
+        if (out + out_frame > dst_cap) break;
+        const uint8_t *f = src + i * in_frame;
+
+        /* 两声道的 MSB 对齐值（单声道源复制成两声道） */
+        uint32_t u[2];
+        u[0] = ae_msb32(f, in_bytes);
+        u[1] = (ch == 2) ? ae_msb32(f + in_bytes, in_bytes) : u[0];
+
+        for (int c = 0; c < 2; c++) {
+            uint32_t v = u[c];
+            if (to24) {
+                /* 落成 24bit，MSB 对齐放在 32bit 字的 [31:8]（低 8 位补 0）。
+                 * 被丢掉的 bit[7:0] 要【四舍五入】：直接截断会带来 0.5 LSB 的系统性
+                 * 负偏移，而且误差与信号相关（低电平处表现为谐波失真，不只是噪声）。
+                 * ⚠️ 进位会把正满幅顶成 0x80000000（= 负满幅，一声爆音），必须夹住。 */
+                uint32_t w = v & 0xFFFFFF00u;
+                if ((v & 0x80u) && w != 0x7FFFFF00u) w += 0x100u;
+                /* 小端写：I2S 外设按位从 MSB 开始串出，所以内存里低字节在前是对的 */
+                dst[out + 0] = (uint8_t)(w);
+                dst[out + 1] = (uint8_t)(w >> 8);
+                dst[out + 2] = (uint8_t)(w >> 16);
+                dst[out + 3] = (uint8_t)(w >> 24);
+                out += 4;
             } else {
-                /* 单声道 → 复制成双声道 */
-                dst[out++] = (uint8_t)(hi & 0xFF);
-                dst[out++] = (uint8_t)(hi >> 8);
+                /* 落成 16bit：同样四舍五入 + 夹住正满幅。
+                 * 16bit 源走到这里时 v 的低 16 位是 0，所以 v & 0x8000 == 0，
+                 * 不进位 —— 结果与改动前的 memcpy 逐字节相同。
+                 * 这套舍入规则由 tools/check_pcm_24bit.py 覆盖（20 万样本）。 */
+                uint32_t w = v >> 16;
+                if ((v & 0x8000u) && w != 0x7FFFu) w++;
+                dst[out + 0] = (uint8_t)(w);
+                dst[out + 1] = (uint8_t)(w >> 8);
+                out += 2;
             }
         }
-        return out;
     }
-    ESP_LOGW(TAG, "[pcm] 暂不支持 %u bit / %u ch 的归一化，丢弃 %u 字节",
-             bits, ch, (unsigned)bytes);
-    return 0;
+    return out;
 }
 
 /* ================================================================== 任务 */
@@ -412,27 +459,43 @@ static void decode_task(void *arg)
                     s_fs   = info.sample_rate;
                     s_ch   = info.channel;
                     s_bits = info.bits_per_sample;
-                    ESP_LOGI(TAG, "[dec] 格式: %" PRIu32 " Hz / %u ch / %u bit / %" PRIu32 " bps / 帧 %" PRIu32,
+
+                    /* ★ 决定输出格式：>16bit 的源（24bit FLAC / 32bit 源）走 24bit 输出，
+                     *   16bit 及以下的源走 16bit（= 改动前的行为）。
+                     *   ⚠️ 这一步必须在【第一帧 PCM 送进 ring 之前】完成 —— 它同时改了
+                     *      I2S 槽位宽和 ES8388 的字长寄存器，晚了数据就已经按旧格式发出去了。 */
+#if AUDIO_OUT_ALLOW_24BIT
+                    board_audio_fmt_t want_fmt = (info.bits_per_sample > 16)
+                                                 ? BOARD_AUDIO_FMT_24 : BOARD_AUDIO_FMT_16;
+#else
+                    board_audio_fmt_t want_fmt = BOARD_AUDIO_FMT_16;
+#endif
+                    ESP_LOGI(TAG, "[dec] 格式: %" PRIu32 " Hz / %u ch / %u bit / %" PRIu32
+                                  " bps / 帧 %" PRIu32 " → 输出 %dbit",
                              info.sample_rate, info.channel, info.bits_per_sample,
-                             info.bitrate, info.frame_size);
-                    if (board_i2s_get_rate() != info.sample_rate) {
-                        /* 换 I2S 时钟（同时会切 ES8388 的单速/双速档），不做重采样。
-                         * ★ 失败必须停：那是"采样率超出 ES8388 的 8k–96k"，继续下去
-                         *   就会拿旧时钟去放，表现是变调/怪声 —— 比明确报错难查得多。 */
-                        if (board_i2s_set_rate(info.sample_rate) != ESP_OK) {
-                            ESP_LOGE(TAG, "[dec] 采样率 %" PRIu32 " Hz 不受支持，停止播放",
-                                     info.sample_rate);
-                            /* ⚠️ 必须【两个都设】：循环靠 s_state 退出，只设 s_error
-                             *   会一直重试同一个错误 → 日志刷屏，而且继续按错误时钟放。 */
-                            s_error = true;
-                            s_state = AE_STATE_ERROR;
-                            continue;
-                        }
+                             info.bitrate, info.frame_size,
+                             (want_fmt == BOARD_AUDIO_FMT_24) ? 24 : 16);
+
+                    /* ★ 采样率【和】格式一起传：16bit 44.1k 与 24bit 44.1k 的采样率
+                     *   完全相同，只比采样率的话 24bit 数据会被当成 16bit 解释。
+                     * ★ 失败必须停：那是"采样率超出 ES8388 的 8k–96k"，继续下去就会拿旧
+                     *   时钟去放，表现是变调/怪声 —— 比明确报错难查得多。 */
+                    if (board_i2s_set_format(info.sample_rate, want_fmt) != ESP_OK) {
+                        ESP_LOGE(TAG, "[dec] 采样率 %" PRIu32 " Hz 不受支持，停止播放",
+                                 info.sample_rate);
+                        /* ⚠️ 必须【两个都设】：循环靠 s_state 退出，只设 s_error
+                         *   会一直重试同一个错误 → 日志刷屏，而且继续按错误时钟放。 */
+                        s_error = true;
+                        s_state = AE_STATE_ERROR;
+                        continue;
                     }
+                    /* 只有整个切换真的成功了，才更新引擎侧的格式记录 */
+                    s_out_fmt         = want_fmt;
+                    s_out_frame_bytes = ae_frame_bytes(s_out_fmt);
                 }
             }
             size_t pcm_bytes = ae_normalize(stage, out.decoded_size, s_bits, s_ch,
-                                            pcm_out, PCM_OUT_CAP);
+                                            pcm_out, PCM_OUT_CAP, s_out_fmt);
             if (pcm_bytes) {
                 /* ★ 关键：ring_pcm 由 out 任务【按实时速度】消费，解码器比实时快得多，
                  *   所以这里必须一直等到写完为止 —— 绝不能超时就丢掉解码好的 PCM
@@ -453,7 +516,7 @@ static void decode_task(void *arg)
                         break;
                     }
                 }
-                s_frames_decoded += pcm_bytes / 4;   /* 16bit stereo */
+                s_frames_decoded += pcm_bytes / s_out_frame_bytes;
             }
         }
         if (eos && raw.consumed == 0 && out.decoded_size == 0) {
@@ -464,7 +527,9 @@ static void decode_task(void *arg)
     }
 }
 
-static uint8_t s_silence[SILENCE_CHUNK_MS * 44100 / 1000 * 4];   /* 10ms @44.1k 立体声 16bit */
+/* 欠载/静音时补的静音块。⚠️ 按【最大】每帧字节数（8，即 24bit 装在 32bit 槽里）算，
+ * 否则 24bit 下这段静音只有一半时长。全 0 就是静音，两种格式通用。 */
+static uint8_t s_silence[SILENCE_CHUNK_BYTES];
 
 static void out_task(void *arg)
 {
@@ -562,7 +627,7 @@ static void out_task(void *arg)
             /* ★ 即使返回错误也要 commit 已写进去的部分！
              *   否则下一轮会把同样的 PCM 再写一遍 → 波形重复一小段 = 咔哒声 */
             audio_ring_read_commit(&s_rpcm, w);
-            s_frames_out += w / 4;               /* 16bit stereo → 每帧 4 字节 */
+            s_frames_out += w / s_out_frame_bytes;
         }
         if (e != ESP_OK || w < n) {
             s_underruns++;
@@ -694,6 +759,11 @@ const char *audio_engine_format_str(void)
 }
 
 uint8_t audio_engine_bit_depth(void) { return s_bits; }
+
+int audio_engine_out_bits(void)
+{
+    return (s_out_fmt == BOARD_AUDIO_FMT_24) ? 24 : 16;
+}
 
 size_t audio_engine_ring_in_cap(void) { return RING_IN_BYTES; }
 size_t audio_engine_ring_pcm_used(void) { return audio_ring_used(&s_rpcm); }
