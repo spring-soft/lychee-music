@@ -241,7 +241,7 @@ static size_t ae_normalize(const uint8_t *src, size_t bytes, uint8_t bits, uint8
                 /* 落成 16bit：同样四舍五入 + 夹住正满幅。
                  * 16bit 源走到这里时 v 的低 16 位是 0，所以 v & 0x8000 == 0，
                  * 不进位 —— 结果与改动前的 memcpy 逐字节相同。
-                 * 这套舍入已由 tools/check_pcm_round.py 在 54 万样本上验证过。 */
+                 * 这套舍入规则由 tools/check_pcm_24bit.py 覆盖（20 万样本）。 */
                 uint32_t w = v >> 16;
                 if ((v & 0x8000u) && w != 0x7FFFu) w++;
                 dst[out + 0] = (uint8_t)(w);
