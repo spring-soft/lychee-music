@@ -66,6 +66,38 @@ static uint32_t                s_fs  = 48000;
 /* 硬件上 ES8388 寄存器 0x18 当前的值（单速 0x02 / 双速 0x20）。
  * 跨档换采样率时要靠它判断需不需要重写，避免每次都多一轮 I2C。 */
 static int                     s_es_dacctrl2 = 0x02;
+/* 硬件上 ES8388 寄存器 0x17 当前的值（16bit = 0x18 / 24bit = 0x00）。
+ * 它跟着输出格式走：16bit 源和 24bit 源的采样率可能完全相同（都是 44.1k），
+ * 所以判断"要不要重配"必须把格式一起看，光看采样率会漏掉切换。 */
+static int                     s_es_dacctrl1 = 0x18;
+/* 当前输出格式。默认 16bit = 本次改动之前的行为。 */
+static board_audio_fmt_t       s_fmt = BOARD_AUDIO_FMT_16;
+/* 输出格式 → (ES8388 0x17 值, I2S 槽位宽) 的唯一映射表。
+ *
+ * 0x17 的字长编码来自官方驱动 espressif__esp_codec_dev（es8388.c 的
+ * `| (bits << 3)` + es_common.h 的枚举）：
+ *     BIT_LENGTH_16BITS = 0x03 → 0x18
+ *     BIT_LENGTH_24BITS = 0x00 → 0x00
+ * 槽位宽为什么 24bit 必须用 32：见 board.h 里 board_audio_fmt_t 的注释（整除约束）。
+ *
+ * 放在这里（而不是跟 clk_plan 一起）是因为 board_es8388_check_critical() 要用它拼
+ * 期望值，而那个函数在前面。 */
+typedef struct {
+    int      dacctrl1;    /* 写进 ES8388 寄存器 0x17 */
+    int      slot_bits;   /* I2S 槽位宽：16 或 32 */
+} fmt_plan_t;
+
+static fmt_plan_t fmt_plan_for(board_audio_fmt_t fmt)
+{
+    fmt_plan_t p;
+    switch (fmt) {
+        case BOARD_AUDIO_FMT_24: p.dacctrl1 = 0x00; p.slot_bits = 32; break;
+        case BOARD_AUDIO_FMT_16:
+        default:                 p.dacctrl1 = 0x18; p.slot_bits = 16; break;
+    }
+    return p;
+}
+
 static int                     s_i2c_retries = 0;
 static int                     s_es_init_fails = 0;
 static int                     s_vol_percent = 40;   /* 默认 40%：70% 时用户反馈"音量太大且底噪明显" */
@@ -251,7 +283,11 @@ void board_es8388_check_critical(void)
         printed += snprintf(line + printed, sizeof(line) - printed, "%02X=%02X ",
                             k_critical[i], v < 0 ? 0xFF : v);
     }
-    ESP_LOGI(TAG, "[es8388] 关键寄存器复查: %s（期望 08=00 17=18 18=02）", line);
+    /* ⚠️ 期望值必须动态取 —— 0x17 是随输出格式变的（16bit=0x18 / 24bit=0x00）。
+     *   写死"期望 17=18"的话，播 24bit 曲目时这行日志会把人误导向假故障。 */
+    fmt_plan_t fp = fmt_plan_for(s_fmt);
+    ESP_LOGI(TAG, "[es8388] 关键寄存器复查: %s（期望 08=00 17=%02X 18=%02X，当前输出 %dbit）",
+             line, fp.dacctrl1, s_es_dacctrl2, board_i2s_out_bits());
 }
 
 void board_es8388_dump(void)
@@ -287,9 +323,12 @@ static int es8388_init(void)
     if (v >= 0 && board_es8388_write_verified(R_DACCONTROL3, v & ~0x04) != ESP_OK) {
         fails++;
     }
-    /* 初始化表里 0x18 写的是 0x02（单速 / MCLK/fs=256），之后没有任何一条再动它。
-     * 把软件侧的记录同步过来 —— 否则上一首 96k 留下的 0x20 会让下次判断出错。 */
+    /* 初始化表里 0x18 写的是 0x02（单速 / MCLK/fs=256）、0x17 写的是 0x18（16bit），
+     * 之后没有任何一条再动它们。把软件侧的记录同步过来 —— 否则上一首 24bit / 96k
+     * 留下的 0x00 / 0x20 会让下次"要不要重配"的判断出错。 */
     s_es_dacctrl2 = 0x02;
+    s_es_dacctrl1 = 0x18;
+    s_fmt         = BOARD_AUDIO_FMT_16;
     s_es_init_fails = fails;
     ESP_LOGI(TAG, "[es8388] 初始化完成：失败 %d 项，I2C 累计重试 %d 次", fails, s_i2c_retries);
     return fails;
@@ -418,12 +457,12 @@ bool board_es8388_is_muted(void) { return s_user_muted; }
 #define BOARD_FS_MID       50000     /* 单速/双速分界 */
 
 typedef struct {
-    int      dacctrl2;        /* 写进 ES8388 寄存器 0x18 */
+    int      dacctrl2;        /* 写进 ES8388 寄存器 0x18（MCLK/fs 比值） */
     uint32_t mclk_multiple;   /* I2S_MCLK_MULTIPLE_xxx */
     uint32_t bclk_div;
 } clk_plan_t;
 
-static clk_plan_t clk_plan_for(uint32_t fs)
+static clk_plan_t clk_plan_for(uint32_t fs, int slot_bits)
 {
     clk_plan_t p;
     if (fs > BOARD_FS_MID) {
@@ -433,11 +472,16 @@ static clk_plan_t clk_plan_for(uint32_t fs)
         p.dacctrl2      = 0x02;   /* bit5=0 单速 + ratio 00010(=256) */
         p.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     }
-    p.bclk_div = p.mclk_multiple / (2 * 16);   /* 16bit 数据 / 16bit 槽 / 立体声 */
+    /* bclk_div = mclk_multiple / (2 × 槽位宽)（立体声 2 槽），必须整除：
+     *   16bit 槽 → 256/32 = 8（单速）、128/32 = 4（双速）
+     *   32bit 槽 → 256/64 = 4（单速）、128/64 = 2（双速）
+     * ⚠️ 槽位宽改了而这里没跟着改，WS 就会变成 0.5×/2× —— 表现是半速变调，
+     *    而且不报任何错。所以槽位宽是【参数】而不是常量。 */
+    p.bclk_div = p.mclk_multiple / (2 * (uint32_t)slot_bits);
     return p;
 }
 
-static void i2s_fill_cfg(i2s_std_config_t *cfg, uint32_t fs)
+static void i2s_fill_cfg(i2s_std_config_t *cfg, uint32_t fs, int slot_bits)
 {
     memset(cfg, 0, sizeof(*cfg));
     cfg->clk_cfg.sample_rate_hz = fs;
@@ -447,14 +491,24 @@ static void i2s_fill_cfg(i2s_std_config_t *cfg, uint32_t fs)
      *   所以 MCLK 只能从 160MHz 分数分频得到：48k 时 160/12.288 = 13.0208 不是整数，
      *   瞬时周期有抖动。XTAL(40MHz) 更差（40/12.288 = 3.255，抖动达 ±25ns）。
      *   结论：S3 上没法把 MCLK 做成整数分频，这条优化路径不存在。 */
-    clk_plan_t plan = clk_plan_for(fs);
+    clk_plan_t plan = clk_plan_for(fs, slot_bits);
     cfg->clk_cfg.clk_src        = I2S_CLK_SRC_DEFAULT;   /* = PLL_F160M */
     cfg->clk_cfg.mclk_multiple  = plan.mclk_multiple;
     cfg->clk_cfg.bclk_div       = plan.bclk_div;
+
+    /* ⚠️ 24bit 档刻意声明成 32bit data + 32bit slot，【不】用 I2S_DATA_BIT_WIDTH_24BIT：
+     *   24bit 数据在 DMA 缓冲里怎么摆，IDF 有自己的约定；而我们的摆放是由
+     *   audio_engine 的 ae_normalize() 自己保证的（MSB 左对齐到 32bit 字）。
+     *   声明成 32bit 就完全绕开了那个约定 —— 摆错了是我们自己的错，好定位。 */
+    i2s_data_bit_width_t data_bits = (slot_bits == 32) ? I2S_DATA_BIT_WIDTH_32BIT
+                                                      : I2S_DATA_BIT_WIDTH_16BIT;
     cfg->slot_cfg = (i2s_std_slot_config_t)
-        I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
-    cfg->slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
-    cfg->slot_cfg.ws_width       = 16;
+        I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(data_bits, I2S_SLOT_MODE_STEREO);
+    cfg->slot_cfg.slot_bit_width = (slot_bits == 32) ? I2S_SLOT_BIT_WIDTH_32BIT
+                                                     : I2S_SLOT_BIT_WIDTH_16BIT;
+    /* ⚠️ ws_width 必须跟着槽位宽：Philips I2S 的 WS 是 50% 占空比，
+     *   槽位 32 而 ws_width 还写 16 的话 WS 脉宽就不对了。 */
+    cfg->slot_cfg.ws_width       = slot_bits;
     cfg->gpio_cfg.mclk = BOARD_PIN_I2S_MCLK;
     cfg->gpio_cfg.bclk = BOARD_PIN_I2S_BCLK;
     cfg->gpio_cfg.ws   = BOARD_PIN_I2S_WS;
@@ -478,23 +532,25 @@ static esp_err_t i2s_init(uint32_t fs)
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
     if (err != ESP_OK) return err;
     i2s_std_config_t cfg;
-    i2s_fill_cfg(&cfg, fs);
+    i2s_fill_cfg(&cfg, fs, 16);   /* 开机固定 16bit（= 改动前的默认），播放时按源位深切 */
     err = i2s_channel_init_std_mode(s_tx, &cfg);
     if (err != ESP_OK) return err;
     return i2s_channel_enable(s_tx);
 }
 
-/* 真正动时钟的那一段（不看缓存）——board_i2s_set_rate 和换时钟源都用它 */
-static esp_err_t i2s_reconfig(uint32_t sample_rate_hz)
+/* 真正动时钟/格式的那一段（不看缓存）——board_i2s_set_format 用它 */
+static esp_err_t i2s_reconfig(uint32_t sample_rate_hz, board_audio_fmt_t fmt)
 {
     /* ★ 必须先静音再动时钟：DAC 还在输出时重配 I2S 时钟会"咔"一声 */
     board_es8388_mute(true);
     vTaskDelay(pdMS_TO_TICKS(30));      /* 让 ES8388 的静音真的生效（内部有去加重/软斜坡） */
 
+    fmt_plan_t fp = fmt_plan_for(fmt);
+    clk_plan_t plan = clk_plan_for(sample_rate_hz, fp.slot_bits);
+
     /* ★ 先让 ES8388 知道该按哪个 MCLK/fs 比值解，再改 ESP32 的时钟。
      *   跨档（≤50k ↔ >50k）时必须重写 0x18，否则 ES8388 还按旧比值解新时钟
      *   —— 表现是没声音或严重失真，而且不报任何错。 */
-    clk_plan_t plan = clk_plan_for(sample_rate_hz);
     if (s_es_dacctrl2 != plan.dacctrl2) {
         if (board_es8388_write_verified(R_DACCONTROL2, plan.dacctrl2) == ESP_OK) {
             s_es_dacctrl2 = plan.dacctrl2;
@@ -503,16 +559,27 @@ static esp_err_t i2s_reconfig(uint32_t sample_rate_hz)
                           " Hz 可能失真（单速/双速没切过去）", plan.dacctrl2, sample_rate_hz);
         }
     }
+    /* 同理：字长（0x17）必须在数据格式换过去【之前】写好，否则 ES8388 会按旧的
+     * 字长去解新数据 —— 16bit 被当 24bit 解，表现是噪音/极小声，同样不报错。 */
+    if (s_es_dacctrl1 != fp.dacctrl1) {
+        if (board_es8388_write_verified(R_DACCONTROL1, fp.dacctrl1) == ESP_OK) {
+            s_es_dacctrl1 = fp.dacctrl1;
+        } else {
+            ESP_LOGE(TAG, "[clk] ES8388 0x17 写 0x%02X 失败 —— %dbit 输出可能噪音",
+                     fp.dacctrl1, board_i2s_out_bits());
+        }
+    }
 
     i2s_std_config_t cfg;
-    i2s_fill_cfg(&cfg, sample_rate_hz);
+    i2s_fill_cfg(&cfg, sample_rate_hz, fp.slot_bits);
     i2s_channel_disable(s_tx);
     esp_err_t err = i2s_channel_reconfig_std_clock(s_tx, &cfg.clk_cfg);
     if (err == ESP_OK) {
         err = i2s_channel_reconfig_std_slot(s_tx, &cfg.slot_cfg);
     }
     if (err == ESP_OK) {
-        s_fs = sample_rate_hz;
+        s_fs  = sample_rate_hz;
+        s_fmt = fmt;
     }
     i2s_channel_enable(s_tx);
     vTaskDelay(pdMS_TO_TICKS(50));      /* 新时钟稳定 + DMA 缓冲先填上静音 */
@@ -520,16 +587,21 @@ static esp_err_t i2s_reconfig(uint32_t sample_rate_hz)
     es_mute_apply();                    /* 用户静音要保持，不能在这里被解开 */
     /* 用 100ms 窗口量才准（20ms 窗口的量化误差能到几百 Hz，会误判成"时钟不准"） */
     int ws = board_measure_ws_hz(100);
-    ESP_LOGW(TAG, "[clk] 采样率切到 %" PRIu32 " Hz（%s档, MCLK/fs=%" PRIu32 "）: %s，实测 WS=%d（偏差 %d Hz / %d‰）",
-             sample_rate_hz, plan.dacctrl2 == 0x20 ? "双速" : "单速",
-             plan.mclk_multiple / sample_rate_hz,
-             esp_err_to_name(err), ws,
+    /* ⚠️ 实测 WS 是验证这次改动【最关键】的一项：槽位宽从 16 改到 32 时，
+     *   bclk_div 必须跟着从 /32 变成 /64，否则 WS 会变成一半（听感就是半速变调）。
+     *   所以把槽位宽和它对应的理论 bclk_div 都打进日志，便于一眼核对。 */
+    ESP_LOGW(TAG, "[clk] 输出格式切到 %dbit（%dbit 槽, bclk_div=%" PRIu32
+                  ", ES8388 0x17=%02X, 0x18=%02X, MCLK/fs=%" PRIu32 "）: %s，"
+                  "实测 WS=%d / 期望 %" PRIu32 "（偏差 %d Hz / %d‰）",
+             board_i2s_out_bits(), fp.slot_bits, plan.bclk_div,
+             fp.dacctrl1, plan.dacctrl2, plan.mclk_multiple / sample_rate_hz,
+             esp_err_to_name(err), ws, sample_rate_hz,
              ws - (int)sample_rate_hz,
              (int)((int64_t)(ws - (int)sample_rate_hz) * 1000 / (int)sample_rate_hz));
     return err;
 }
 
-esp_err_t board_i2s_set_rate(uint32_t sample_rate_hz)
+esp_err_t board_i2s_set_format(uint32_t sample_rate_hz, board_audio_fmt_t fmt)
 {
     if (s_tx == NULL) return ESP_ERR_INVALID_STATE;
     /* ES8388 只支持 8k–96k（官方手册，不是 192k）。超出范围就【拒绝】而不是
@@ -539,8 +611,21 @@ esp_err_t board_i2s_set_rate(uint32_t sample_rate_hz)
                  sample_rate_hz, BOARD_FS_MIN, BOARD_FS_MAX);
         return ESP_ERR_INVALID_ARG;
     }
-    if (sample_rate_hz == s_fs) return ESP_OK;
-    return i2s_reconfig(sample_rate_hz);
+    /* ★ 必须把【格式】也纳入判断。只比采样率的话，16bit 44.1k → 24bit 44.1k
+     *   会因为"采样率没变"而直接返回，24bit 数据就被当成 16bit 解释了。 */
+    if (sample_rate_hz == s_fs && fmt == s_fmt) return ESP_OK;
+    return i2s_reconfig(sample_rate_hz, fmt);
+}
+
+esp_err_t board_i2s_set_rate(uint32_t sample_rate_hz)
+{
+    /* 保持当前输出格式（老调用方的语义不变） */
+    return board_i2s_set_format(sample_rate_hz, s_fmt);
+}
+
+int board_i2s_out_bits(void)
+{
+    return (s_fmt == BOARD_AUDIO_FMT_24) ? 24 : 16;
 }
 
 esp_err_t board_i2s_write(const void *data, size_t bytes, size_t *written, TickType_t timeout)

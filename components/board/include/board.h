@@ -124,9 +124,39 @@ int  board_vol_get(void);
 /* ---------------- 播放控制 ---------------- */
 void      board_pa_enable(bool on);
 esp_err_t board_i2s_write(const void *data, size_t bytes, size_t *written, TickType_t timeout);
-/* 改变采样率（重配时钟，不做重采样；S3 无硬件 ASRC） */
+
+/* ---------------- 音频输出格式（位深） ----------------
+ *
+ * 两档。它同时决定三件事：I2S 槽位宽、`bclk_div`、ES8388 的字长寄存器 0x17。
+ *
+ *   FMT_16 → 16bit 数据 / 16bit 槽 / 0x17 = 0x18   ← 改动前的行为，一字不动
+ *   FMT_24 → 24bit 数据放进 32bit 槽、MSB 左对齐 / 0x17 = 0x00
+ *
+ * ⚠️ 为什么 24bit 不用 24bit 槽：`bclk_div = mclk_multiple / (2 × 槽位宽)` 必须整除。
+ *    24bit 槽 → 256/48 = 5.33 ✗、128/48 = 2.67 ✗，做不出来。
+ *    32bit 槽 → 256/64 = 4 ✓、128/64 = 2 ✓。
+ *
+ * ⚠️ 数据一律 MSB 对齐，这是这套方案能成立的关键：DAC 的满量程基准就是 MSB，
+ *    所以对齐之后不管 ES8388 按 16 还是 24bit 解读，模拟输出的【数值】都是对的。
+ *    16bit 源放到 bit[31:16]、24bit 源放到 bit[31:8]、32bit 源原样 —— 三者都 MSB 对齐。
+ *
+ * ⚠️ ES8388 字长的权威编码来自官方驱动 espressif__esp_codec_dev：
+ *    es8388.c 里 `DACCONTROL1 & 0xc7` 后 `| (bits << 3)`，而 es_common.h 的枚举是
+ *    BIT_LENGTH_16BITS = 0x03、BIT_LENGTH_24BITS = 0x00 → 0x18 / 0x00。 */
+typedef enum {
+    BOARD_AUDIO_FMT_16 = 0,   /* 16bit（默认；与本次改动前完全一致） */
+    BOARD_AUDIO_FMT_24,       /* 24bit（32bit 槽 + MSB 左对齐） */
+} board_audio_fmt_t;
+
+/* 改变采样率【和/或】输出格式（重配时钟，不做重采样；S3 无硬件 ASRC）。
+ * ⚠️ 两者必须一起传：16bit 44.1k 与 24bit 44.1k 的采样率【相同】，
+ *    而现有的"采样率没变就直接返回"逻辑会让 24bit 数据被当成 16bit 解释。 */
+esp_err_t board_i2s_set_format(uint32_t sample_rate_hz, board_audio_fmt_t fmt);
+/* 只改采样率，保持当前输出格式（老调用方的语义不变） */
 esp_err_t board_i2s_set_rate(uint32_t sample_rate_hz);
 uint32_t  board_i2s_get_rate(void);
+/* 当前输出位深：16 / 24。给日志、UI、排障用 */
+int       board_i2s_out_bits(void);
 bool      board_is_ready(void);
 
 /* 注：MCLK 抖动这条路在 ESP32-S3 上走不通 —— S3 的 I2S 不支持 APLL
