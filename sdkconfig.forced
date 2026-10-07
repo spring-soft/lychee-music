@@ -200,3 +200,19 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 # ⚠️ 恢复 BLE 后 WiFi 缓冲会被重新挤小，高码率 FLAC 会重新开始卡；
 #    那时应该同时把 subsonic.c 里的 DIRECT_PLAY_MAX_KBS 调低。
 CONFIG_BT_ENABLED=n
+
+# ===== 板型：本分支固定为【面包板】=====
+#
+# 2026-10-07 起面包板与 PCB 拆成两条 git 分支，各自把板型【钉死】在这里，
+# 于是每条分支都自洽，不再依赖 sdkconfig.local（那是 gitignore 的、含密码的文件）：
+#
+#   breadboard 分支 → CONFIG_BOARD_VARIANT_BREADBOARD=y   ← 本行
+#   v2-pcb     分支 → CONFIG_BOARD_VARIANT_BREADBOARD=n
+#
+# 为什么必须钉死（这是"两条分支真正互不干扰"的关键）：
+#   sync_sdkconfig.py 先应用 sdkconfig.local、再应用本文件，所以这里能压过 local。
+#   否则 local 里残留的一行板型会让"面包板分支编出 PCB 固件"——而那种错误**不报错**，
+#   只能靠"K1 按了没反应"这种现象去发现（K1 在面包板是 GPIO3、在 V2 是 GPIO38）。
+#
+# ⚠️ 换了这一行必须 fullclean 再编（引脚宏影响多个组件的条件编译）。
+CONFIG_BOARD_VARIANT_BREADBOARD=y
