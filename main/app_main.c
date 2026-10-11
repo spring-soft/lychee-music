@@ -28,6 +28,7 @@
 #include "audio_engine.h"
 #include "net_mgr.h"
 #include "subsonic.h"
+#include "qqmusic.h"
 #include "app_core.h"
 #include "player.h"
 #include "settings.h"
@@ -288,6 +289,17 @@ void app_main(void)
      * 2026-10-01 砍掉 BLE 换 WiFi 吞吐（内部 SRAM 从 7KB 涨到 49KB），那一步没了。
      * 原来的位置改成了「同步曲库」——但它必须排在 player_init 之后
      * （那时 s_recent / s_lock 才分配好），所以挪到下面第 7 步。 */
+
+    /* ---- 音乐服务后端 ----
+     * Navidrome（Subsonic 协议）和 QQ 音乐（自建契约层服务）是**两个后端**，
+     * 设备侧共用同一个播放引擎和歌曲结构，由菜单里的「来源」切换。
+     * 先初始化 QQ 那边（只是读 NVS/Kconfig 里的地址 + 打日志，不联网）——
+     * 放在 Navidrome 的检查**之前**，因为 QQ 可以单独用（不配 Navidrome 也行）。 */
+    if (qqmusic_init() == ESP_OK) {
+        ESP_LOGI(TAG, "QQ 音乐服务: %s", qqmusic_host());
+    } else {
+        ESP_LOGW(TAG, "没配 QQ 音乐服务地址（菜单里切到 QQ 会取不到歌）");
+    }
 
     /* ---- M4: 起播（之后按键/网页都通过 player 命令层控制）---- */
     if (subsonic_init() != ESP_OK || !subsonic_configured()) {
