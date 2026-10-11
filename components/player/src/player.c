@@ -85,6 +85,12 @@ static player_src_t      s_src = PLAYER_SRC_RANDOM;
 static player_back_t     s_back    = PLAYER_BACK_NAV;
 static int               s_qq_mode = QQ_MODE_FAV;
 
+/* 「收藏」模式跳过前 N 首 —— 给 QQ「我喜欢」里的**置顶歌**用。
+ * 用户的需求原话：他 QQ 音乐里置顶了 5 首，希望设备进收藏模式时**直接播第 6 首**。
+ * ★ 队列**不变**（置顶那几首还在列表里，想听随时能点），只改"起播位置"——
+ *   这样既不破坏列表，也不影响用户手动选歌。 */
+static int               s_fav_skip = 5;
+
 /* 最近播放：环形缓冲，[0] 是最新的 */
 static sub_song_t       *s_recent;
 static int               s_recent_n;
@@ -731,8 +737,25 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
                      qq_mode_name((qq_mode_t)src), esp_err_to_name(err), got);
             return false;
         }
+        /* ★ 「收藏」模式里的歌**本来就在「我喜欢」里**，逐首把心形标上 ——
+         *   不标的话右上角的收藏标志不会亮（用户报的）。
+         *   服务端的歌曲项里**没有 starred 字段**（它按"取某个列表"的语境给数据，
+         *   并不知道这首歌在不在你的收藏里），所以在这一层补最省事也最准。
+         *   其余模式（每日30首/刷歌…）确实无法确定，保持不亮 —— 那是诚实的。 */
+        if ((qq_mode_t)src == QQ_MODE_FAV) {
+            for (int i = 0; i < got; i++) tmp[i].starred = true;
+        }
+
         queue_store(tmp, got, s_src, true);      /* 不动 s_src（那是 Navidrome 的模式） */
         *first_idx = 0;
+        /* ★ 「收藏」跳过前 N 首（QQ 我喜欢里的置顶歌）。
+         *   只改**起播位置**，队列内容和顺序一点不动 ——
+         *   置顶那几首还在列表里，用户想听随时能点。 */
+        if ((qq_mode_t)src == QQ_MODE_FAV && s_fav_skip > 0 && got > 1) {
+            *first_idx = (s_fav_skip < got) ? s_fav_skip : got - 1;
+            ESP_LOGW(TAG, "收藏：跳过前 %d 首置顶，从第 %d 首开始",
+                     s_fav_skip, *first_idx + 1);
+        }
         ESP_LOGW(TAG, "来源切到「QQ 音乐 · %s」（%d 首）%s",
                  qq_mode_name((qq_mode_t)src), got, autoplay ? "" : "（列表页浏览，不打断播放）");
         return true;
@@ -1485,6 +1508,9 @@ esp_err_t player_init(void)
     if (bk >= 0 && bk < PLAYER_BACK_COUNT) s_back = (player_back_t)bk;
     int qm = settings_get_int("qmode", (int)QQ_MODE_FAV);
     if (qm >= 0 && qm < QQ_MODE_COUNT) s_qq_mode = qm;
+    /* 「收藏」跳过前 N 首置顶（0 = 不跳） */
+    int fs = settings_get_int("favskip", 5);
+    if (fs >= 0 && fs <= 50) s_fav_skip = fs;
 
     /* ---- M6：从 cache 分区恢复。store 没挂上就跳过，一切照旧（只是重启后为空）---- */
     if (store_ready() && s_persist_ok) {
@@ -1536,6 +1562,16 @@ void player_set_source_next(int dir, bool autoplay)
 void player_set_back(player_back_t b, bool autoplay) { post(CMD_SET_BACK, (int)b, autoplay); }
 
 player_back_t player_back(void) { return s_back; }
+
+int  player_fav_skip(void) { return s_fav_skip; }
+void player_set_fav_skip(int n)
+{
+    if (n < 0) n = 0;
+    if (n > 50) n = 50;
+    s_fav_skip = n;
+    settings_set_int("favskip", n);      /* 立刻落盘（这种改动很稀疏，不用去抖） */
+    ESP_LOGW(TAG, "「收藏」跳过前 %d 首（下次进收藏生效）", n);
+}
 
 const char *player_back_name(player_back_t b)
 {

@@ -62,6 +62,13 @@ player_back_t player_back(void);
  * ⚠️ Navidrome 没配的时候切到它只会失败并保留原队列，不会把当前播放打断。 */
 void player_set_back(player_back_t b, bool autoplay);
 
+/* 「收藏」模式跳过前 N 首 —— 给 QQ「我喜欢」里的**置顶歌**用。
+ * 用户需求：他置顶了 5 首，希望进收藏时**直接播第 6 首**。
+ * ★ 只影响"起播位置"，队列内容和顺序一点不变
+ *   （置顶那几首还在列表里，想听随时能点）。n 存 NVS，重启保留；0 = 不跳。 */
+int  player_fav_skip(void);
+void player_set_fav_skip(int n);
+
 /* ---------------- 「模式」= 当前后端下的曲目来源
  *
  * ★ 「模式」的含义**随后端而变**，而且只由后端决定项数：

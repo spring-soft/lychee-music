@@ -12,6 +12,8 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "esp_system.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
@@ -745,6 +747,8 @@ static esp_err_t h_qq(httpd_req_t *req)
         cJSON *o = cJSON_CreateObject();
         cJSON_AddStringToObject(o, "host", qqmusic_host());
         cJSON_AddBoolToObject(o, "configured", qqmusic_configured());
+        /* 「收藏」跳过前 N 首（QQ 我喜欢里的置顶歌）—— 和设备上的设置同一个值 */
+        cJSON_AddNumberToObject(o, "fav_skip", player_fav_skip());
         return send_json(req, o);
     }
     cJSON *b = read_body(req);
@@ -753,8 +757,13 @@ static esp_err_t h_qq(httpd_req_t *req)
     /* ⚠️ 必须**先拷出来再 cJSON_Delete** —— json_str 返回的是树里的指针 */
     char buf[QQ_HOST_MAX] = {0};
     if (host != NULL) strlcpy(buf, host, sizeof(buf));
+    /* fav_skip 可选：不传就只改地址（老调用方不会因为少个字段而失败） */
+    const cJSON *fs = cJSON_GetObjectItem(b, "fav_skip");
+    bool has_fs = cJSON_IsNumber(fs);
+    int skip = has_fs ? (int)fs->valuedouble : 0;
     cJSON_Delete(b);
-    if (buf[0] == 0) return fail(req, "400 Bad Request", "host 不能为空");
+    if (has_fs) player_set_fav_skip(skip);
+    if (buf[0] == 0) return has_fs ? ok_json(req) : fail(req, "400 Bad Request", "host 不能为空");
     if (qqmusic_set_config(buf, true) != ESP_OK) return fail(req, "500", "保存失败");
     return ok_json(req);
 }
@@ -1215,9 +1224,86 @@ static log_rec_t *s_log;                        /* PSRAM 环形数组 */
 static volatile uint32_t s_log_next;            /* 下一个要写的行号（从 1 开始） */
 static vprintf_like_t    s_old_vprintf;         /* 原来的输出（串口），必须继续调 */
 
+/* ---------- 崩溃现场：放在 RTC 慢速内存里 ----------
+ *
+ * 为什么是 RTC RAM 而不是写 flash/cache 分区：
+ *   · **软复位、看门狗、异常崩溃都不丢** —— 只有彻底断电才丢。
+ *     而我们要覆盖的场景（"新固件能启动但一启动就崩，反复重启"）**正是软复位循环**，
+ *     RTC RAM 完全够用。
+ *   · 没有 flash 磨损顾虑，所以可以**每行都写**，崩溃瞬间的日志还在；
+ *     写 flash 的话要在"多久落一次盘"里两难（太快伤 flash、太慢丢现场）。
+ *
+ * ⚠️ RTC 慢速内存总共只有 8KB（启动日志里 RTCRAM 是 7KB），所以这里只留 2KB ——
+ *    够放"最后 10~20 行"，而那通常正好包含崩因。
+ * ⚠️ 必须用魔数判断"这块内存是本次开机刚上电（内容随机）还是上次留下的"，
+ *    否则上电会把随机字节当日志打出来。 */
+#define RTC_LOG_SIZE  2048
+#define RTC_LOG_MAGIC 0x45534C47u               /* "ESLG" */
+static RTC_NOINIT_ATTR char     s_rtc_log[RTC_LOG_SIZE];
+static RTC_NOINIT_ATTR uint32_t s_rtc_magic;
+static RTC_NOINIT_ATTR uint32_t s_rtc_len;
+static RTC_NOINIT_ATTR uint32_t s_rtc_boots;    /* 累计开机次数：反复重启一眼可见 */
+static RTC_NOINIT_ATTR int32_t  s_rtc_reason;
+
+/* 往 RTC 环形里追加一行（软复位后还能读到） */
+static void rtc_log_append(const char *s, size_t n)
+{
+    if (n == 0) return;
+    if (s_rtc_magic != RTC_LOG_MAGIC) {         /* 上电首次：初始化 */
+        s_rtc_magic = RTC_LOG_MAGIC;
+        s_rtc_len = 0;
+        s_rtc_boots = 0;
+        s_rtc_reason = -1;
+    }
+    if (n > RTC_LOG_SIZE / 2) {                 /* 单行太长就截断（保尾部） */
+        s += n - RTC_LOG_SIZE / 2;
+        n = RTC_LOG_SIZE / 2;
+    }
+    if (s_rtc_len + n > RTC_LOG_SIZE) {         /* 满了：整体前移，冲掉最旧的 */
+        size_t drop = s_rtc_len + n - RTC_LOG_SIZE;
+        memmove(s_rtc_log, s_rtc_log + drop, s_rtc_len - drop);
+        s_rtc_len -= drop;
+    }
+    memcpy(s_rtc_log + s_rtc_len, s, n);
+    s_rtc_len += n;
+}
+
+/* 把上一次运行的尾部日志打出来（在钩子装好之后调，这样它自己也会进新日志）。 */
+static void rtc_log_dump_prev(void)
+{
+    esp_reset_reason_t rr = esp_reset_reason();
+    if (s_rtc_magic == RTC_LOG_MAGIC && s_rtc_len > 0) {
+        ESP_LOGW(TAG, "===== 上次运行的尾部日志（RTC 内存，共 %u 字节；"
+                      "上一次复位原因=%d，累计开机 %u 次）=====",
+                 (unsigned)s_rtc_len, (int)s_rtc_reason, (unsigned)s_rtc_boots);
+        /* 按行打出来，保留原本的换行 */
+        size_t i = 0;
+        while (i < s_rtc_len) {
+            size_t j = i;
+            while (j < s_rtc_len && s_rtc_log[j] != '\n') j++;
+            char line[200];
+            size_t n = j - i;
+            if (n > sizeof(line) - 1) n = sizeof(line) - 1;
+            memcpy(line, s_rtc_log + i, n);
+            line[n] = 0;
+            if (n > 0) ESP_LOGW(TAG, "  [上次] %s", line);
+            i = (j < s_rtc_len) ? j + 1 : j;
+        }
+        ESP_LOGW(TAG, "===== 上次日志结束 =====");
+    } else {
+        ESP_LOGI(TAG, "RTC 里没有上次的日志（本次是上电冷启动）");
+    }
+    /* ★ 记下"本次开机"的信息，供下次崩溃时回看。
+     *   ⚠️ 复位原因是**读上一次**的，所以要先读再覆盖自己的。 */
+    s_rtc_reason = (int32_t)rr;
+    s_rtc_boots++;
+}
+
 static void log_line(const char *s, size_t n)
 {
-    if (s_log == NULL || n == 0) return;
+    if (n == 0) return;
+    rtc_log_append(s, n);                       /* 先存崩溃现场（哪怕下面没缓冲） */
+    if (s_log == NULL) return;
     if (n > LOG_LINE_MAX - 1) n = LOG_LINE_MAX - 1;
     uint32_t seq = s_log_next;
     log_rec_t *r = &s_log[seq % LOG_LINES];
@@ -1255,6 +1341,10 @@ void web_log_init(void)
     s_old_vprintf = esp_log_set_vprintf(log_vprintf);
     ESP_LOGW(TAG, "网络日志已启用：%d 行 × %d 字节（PSRAM），GET /api/log?since=N",
              LOG_LINES, LOG_LINE_MAX);
+
+    /* ★ 钩子装好【之后】再回放上次崩溃的尾部日志 —— 这样这段回放本身
+     *   也会进本次的网络日志，网页上连着看就是"上次怎么崩的 + 这次开机"。 */
+    rtc_log_dump_prev();
 }
 
 /* GET /api/log?since=<上次拿到的最大行号> → 纯文本，每行 "<行号> <内容>"

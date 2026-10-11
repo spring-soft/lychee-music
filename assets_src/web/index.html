@@ -547,8 +547,14 @@ input.sw:checked::after{transform:translateX(18px);}
                  spellcheck="false" placeholder="http://192.168.0.108:3210"></label>
         <button class="btn block" id="qq-save">保存地址</button>
         <div class="msg" id="qq-msg"></div>
+        <label class="f" style="margin-top:10px"><span>收藏跳过前几首（置顶歌）</span>
+          <input id="qq-skip" type="number" min="0" max="50" step="1" value="5"></label>
+        <button class="btn block" id="qq-skip-save">保存跳过数</button>
+        <div class="msg" id="qq-skip-msg"></div>
+        <div class="hint">你的 QQ「我喜欢」里如果有**置顶歌**，进「收藏」模式时会从第 N+1 首开始播
+          （置顶 5 首就填 5）。⚠️ 队列和列表**不变** —— 置顶那几首还在，想听随时点。0 = 不跳。</div>
         <div class="hint">设备从这里取 QQ 音乐（自建的契约层服务）。改完**立刻生效、存进 NVS**，
-          不用重刷固件；留空或填错会导致「来源=QQ音乐」时取不到歌，随时改回来即可。</div>
+          不用重刷固件。</div>
       </div>
     </div>
 
@@ -2043,7 +2049,9 @@ function loadLog(){
 }
 function loadQqHost(){
   api('/api/qq', {}, 10000).then(function(d){
-    if(d && typeof d.host === 'string') $('qq-host').value = d.host;
+    if(!d) return;
+    if(typeof d.host === 'string') $('qq-host').value = d.host;
+    if(typeof d.fav_skip === 'number') $('qq-skip').value = d.fav_skip;
   }, function(e){
     $('qq-msg').textContent = '读取失败：' + e.message;
   });
@@ -2344,6 +2352,16 @@ function bindEvents(){
     }, function(e){
       $('qq-msg').textContent = '保存失败：' + e.message;
     });
+  };
+
+  /* 收藏跳过前 N 首（QQ 我喜欢里的置顶歌） */
+  $('qq-skip-save').onclick = function(){
+    var n = parseInt($('qq-skip').value, 10);
+    if(isNaN(n) || n < 0 || n > 50){ $('qq-skip-msg').textContent = '填 0~50 之间的数'; return; }
+    post('/api/qq', {fav_skip: n}, 15000).then(function(){
+      $('qq-skip-msg').textContent = '已保存（下次进「收藏」生效）';
+      toast('收藏跳过前 ' + n + ' 首', '');
+    }, function(e){ $('qq-skip-msg').textContent = '保存失败：' + e.message; });
   };
 
   /* ---- 固件升级（OTA）---- */
