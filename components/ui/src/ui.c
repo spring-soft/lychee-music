@@ -235,7 +235,8 @@ const char *ui_page_name(ui_page_t p)
         case UI_PAGE_INFO:        return "系统信息";
         case UI_PAGE_MEM:         return "内存用量";
         case UI_PAGE_BT:          return "蓝牙控制";
-        case UI_PAGE_SRC:         return "来源二级";
+        case UI_PAGE_SRC:         return "模式二级";
+        case UI_PAGE_BACK:        return "来源二级";
         case UI_PAGE_SEARCH_MODE: return "搜索方式";
         case UI_PAGE_SEARCH_IN:   return "搜索输入";
         case UI_PAGE_SEARCH_RES:  return "搜索结果";

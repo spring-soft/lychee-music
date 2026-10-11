@@ -174,9 +174,10 @@ static void build_list_screen(void)
 #define MENU_ROWS  6                       /* 屏上能放 6 行 */
 #define MENU_ROW_H 17
 #define MENU_Y0    22                      /* 对应 bg_menu 的 TOPBAR_H + 2 */
-/* 菜单总项数（一屏 MENU_ROWS=6 行，5 项正好）。
- * 2026-10-01 用户要求简化：删掉"音质"（固定用最高）、删掉"蓝牙控制"（BLE 已编掉）。*/
-#define MENU_N     5
+/* 菜单总项数。2026-10-01 用户要求简化：删掉"音质"（固定用最高）、删掉"蓝牙控制"（BLE 已编掉）。
+ * ★ 2026-10-11 用户要求：把空着的那一行用起来 —— 新增「来源」，原来那行「来源」改名「模式」。
+ *   现在正好 6 项，一屏 MENU_ROWS=6 行放满，不用滚动。 */
+#define MENU_N     6
 
 static lv_obj_t *s_scr_menu;
 static lv_obj_t *s_menu_hl;
@@ -188,33 +189,41 @@ static bool      s_menu_dirty = true;
 
 static const char *menu_name(int i)
 {
-    /* 只有"来源"那一项的文字是动态的，文本在这个静态缓冲里 */
-    static char s_menu_src_lbl[48];
+    /* 「模式」和「来源」两行的文字是动态的，文本放在这两个静态缓冲里 */
+    static char s_menu_mode_lbl[48];
+    static char s_menu_back_lbl[48];
     switch (i) {
-        /* ★ 来源只占【一项】，冒号后面直接显示当前来源；
-         *   按 K3 进二级菜单选（K1/K2 选、K3 确定退出）。 */
+        /* ★ 两个概念分开，就不打架了：
+         *     来源 = 音乐从哪个**服务**来（Navidrome / QQ 音乐）
+         *     模式 = 这个服务下的哪一类**曲目**（最近播放… / 每日30首…）
+         *   原来只有"来源"一项，切的是后者 —— 名不副实，所以改名。 */
         case 0:
-            snprintf(s_menu_src_lbl, sizeof(s_menu_src_lbl), "来源: %s",
-                     player_src_name(player_source()));
-            return s_menu_src_lbl;
-        case 1: return "搜索";                 /* ★ 取代原来的"播放 / 暂停" */
-        case 2: return "屏幕亮度";
+            snprintf(s_menu_mode_lbl, sizeof(s_menu_mode_lbl), "模式: %s",
+                     player_mode_name(player_mode()));
+            return s_menu_mode_lbl;
+        case 1:
+            snprintf(s_menu_back_lbl, sizeof(s_menu_back_lbl), "来源: %s",
+                     player_back_name(player_back()));
+            return s_menu_back_lbl;
+        case 2: return "搜索";
+        case 3: return "屏幕亮度";
         /* ★ 2026-10-01：这里原来是"重连 WiFi"，用户要求换成"设置"，
          *   重连挪进设置二级菜单（并且在那边加了二次确认）。 */
-        case 3: return "设置";
-        case 4: return "系统信息";
+        case 4: return "设置";
+        case 5: return "系统信息";
         default: return "";
     }
 }
 
 static void menu_render(void)
 {
-    /* 只有"来源"是动态的。它一变就把菜单标脏，否则要等到用户翻页才刷新
+    /* 「模式」和「来源」两行都是动态的。任一变就把菜单标脏，否则要等到用户翻页才刷新
      * —— 用户会以为"换了来源但屏幕上没反应"。 */
     {
-        static char prev[64];
-        char now[64];
-        snprintf(now, sizeof(now), "%s", player_src_name(player_source()));
+        static char prev[128];
+        char now[128];
+        snprintf(now, sizeof(now), "%s|%s",
+                 player_back_name(player_back()), player_mode_name(player_mode()));
         if (strcmp(now, prev) != 0) {
             strlcpy(prev, now, sizeof(prev));
             s_menu_dirty = true;
@@ -263,6 +272,7 @@ ui_page_t ui_page_parent(ui_page_t p)
     switch (p) {
         case UI_PAGE_MENU:        return UI_PAGE_PLAY;
         case UI_PAGE_SRC:         return UI_PAGE_MENU;
+        case UI_PAGE_BACK:        return UI_PAGE_MENU;   /* 来源二级菜单的上一级也是主菜单 */
         case UI_PAGE_SETTINGS:    return UI_PAGE_MENU;   /* 设置页的上一级 = 菜单 */
         case UI_PAGE_SEARCH_MODE: return UI_PAGE_MENU;
         case UI_PAGE_SEARCH_IN:   return UI_PAGE_SEARCH_MODE;   /* 用户要的：回输入页要先过方式选择 */
@@ -276,26 +286,43 @@ ui_page_t ui_page_parent(ui_page_t p)
     }
 }
 
-/* ============================================================ 来源二级菜单
+/* ============================================================ 「模式」二级菜单
  *
- * 用户要求：主菜单里"来源"只占一项（冒号后面显示当前来源），
+ * 2026-10-11 改名 + 改成动态：
+ *   · 这一页原来叫"来源"，但它切的是"最近播放 / 我的收藏 / 随机30首" —— 那是**模式**。
+ *     真正的"来源"（Navidrome / QQ 音乐）是主菜单新加的那一行。
+ *   · 项数和文字现在**随后端动态变**（QQ 6 个 / Navidrome 3 个），
+ *     所以不再写死项数，一律用 player_mode_count()/player_mode_name() 现取。
+ *     → 以后服务端加模式（改 qqmusic 的 k_modes 表）时，**UI 一行都不用改**。
+ *
+ * 用户要求：主菜单里"模式"只占一项（冒号后面显示当前模式），
  * 按 K3 进这一页，K1/K2 选、K3 确定并退出、K4 返回。
  * 底图/高亮条直接复用菜单页的（同一套视觉，不额外做素材）。
  */
-#define SRC_N  3
+#define MODE_MAX  MENU_ROWS          /* 一屏就 6 行 —— QQ 的模式数正好也是 6 */
 
-static lv_obj_t *s_scr_src, *s_src_hl, *s_src_lbl[SRC_N];
+static lv_obj_t *s_scr_src, *s_src_hl, *s_src_lbl[MODE_MAX];
 static int       s_src_sel;
 static int       s_src_r_sel = -1;
 
 static void src_render(void)
 {
-    for (int i = 0; i < SRC_N; i++) {
+    int n = player_mode_count();
+    if (n > MODE_MAX) {
+        /* 一屏放不下就先截断（当前两边都不会触发：QQ 6 个、Navidrome 3 个）。
+         * 真要更多模式，这页得加滚动 —— 但别默默藏掉，至少日志里说一声。 */
+        ESP_LOGW(TAG, "模式有 %d 个，一屏只显示 %d 个", n, MODE_MAX);
+        n = MODE_MAX;
+    }
+    for (int i = 0; i < MODE_MAX; i++) {
+        if (i >= n) { ui_set_text(s_src_lbl[i], ""); continue; }   /* 用不到的行清空 */
         char buf[48];
-        bool cur = (player_source() == (player_src_t)i);
-        bool empty = (i == PLAYER_SRC_RECENT && player_recent_count() == 0);
-        /* 标出"现在是哪个"，来源为空也标出来 —— 不然用户会奇怪为什么选了没反应 */
-        snprintf(buf, sizeof(buf), "%s%s%s", player_src_name((player_src_t)i),
+        bool cur = (player_mode() == i);
+        /* "（空）"只对 Navidrome 的"最近播放"有意义：一首歌都没听过时提醒一下，
+         * 不然用户会奇怪"选了怎么没反应"。QQ 的模式都由服务端给，不存在空。 */
+        bool empty = (player_back() == PLAYER_BACK_NAV && i == PLAYER_SRC_RECENT
+                      && player_recent_count() == 0);
+        snprintf(buf, sizeof(buf), "%s%s%s", player_mode_name(i),
                  cur ? "（当前）" : "", empty ? "（空）" : "");
         ui_set_text(s_src_lbl[i], buf);
     }
@@ -314,38 +341,109 @@ static void build_src_screen(void)
 
     ui_put_img(scr, ASSET_BG_MENU, 0, 0);
     ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
-    ui_put_label_1line(scr, "来源", 20, 2, 134, ui_font_16, 0x1C1C1E);
+    ui_put_label_1line(scr, "模式", 20, 2, 134, ui_font_16, 0x1C1C1E);
 
     s_src_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
-    for (int i = 0; i < SRC_N; i++) {
+    for (int i = 0; i < MODE_MAX; i++) {
         s_src_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
                                          136, ui_font_12, 0x1C1C1E);
     }
-    ESP_LOGI(TAG, "来源二级菜单已建好（%d 项：K1/K2 选、K3 确定、K4 返回）", SRC_N);
+    ESP_LOGI(TAG, "模式二级菜单已建好（最多 %d 项：K1/K2 选、K3 确定、K4 返回）", MODE_MAX);
 }
 
 void ui_srcmenu_open(void)
 {
-    /* 光标默认停在【当前来源】上，用户一进来就知道自己在哪 */
-    s_src_sel = (int)player_source();
-    if (s_src_sel < 0 || s_src_sel >= SRC_N) s_src_sel = 0;
+    /* 光标默认停在【当前模式】上，用户一进来就知道自己在哪 */
+    s_src_sel = player_mode();
+    if (s_src_sel < 0 || s_src_sel >= player_mode_count()) s_src_sel = 0;
     s_src_r_sel = -1;
     ui_page_show(UI_PAGE_SRC);
 }
 
 void ui_srcmenu_move(int delta)
 {
-    s_src_sel = (s_src_sel + delta + SRC_N) % SRC_N;
+    int n = player_mode_count();
+    if (n <= 0) return;
+    s_src_sel = (s_src_sel + delta + n) % n;
 }
 
 void ui_srcmenu_activate(void)
 {
     char buf[48];
-    snprintf(buf, sizeof(buf), "正在获取: %.16s", player_src_name((player_src_t)s_src_sel));
+    snprintf(buf, sizeof(buf), "正在获取: %.16s", player_mode_name(s_src_sel));
     ui_toast(buf);
-    player_set_source((player_src_t)s_src_sel, true);   /* 立刻播第一首 */
-    s_menu_dirty = true;      /* 主菜单那行"来源: X"要跟着变 */
-    ui_page_show(UI_PAGE_MENU);                          /* 确定并退出（回上级菜单） */
+    player_set_mode(s_src_sel, true);     /* 立刻播第一首 */
+    s_menu_dirty = true;                  /* 主菜单那行"模式: X"要跟着变 */
+    ui_page_show(UI_PAGE_MENU);           /* 确定并退出（回上级菜单） */
+}
+
+/* ============================================================ 「来源」二级菜单（切后端）
+ *
+ * 2026-10-11 新增。只有两项：Navidrome / QQ 音乐。
+ * ⚠️ 切过去**不一定成功**（Navidrome 没配、QQ 服务连不上都会失败）——
+ *    player 那边会回退状态、队列不动，所以提示语用"正在切换"而不是"已切换到"，
+ *    别让用户在失败时以为切成功了。
+ */
+#define BACK_N  ((int)PLAYER_BACK_COUNT)
+
+static lv_obj_t *s_scr_back, *s_back_hl, *s_back_lbl[BACK_N];
+static int       s_back_sel;
+static int       s_back_r_sel = -1;
+
+static void back_render(void)
+{
+    for (int i = 0; i < BACK_N; i++) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%s%s", player_back_name((player_back_t)i),
+                 (player_back() == (player_back_t)i) ? "（当前）" : "");
+        ui_set_text(s_back_lbl[i], buf);
+    }
+    int y = MENU_Y0 + s_back_sel * MENU_ROW_H;
+    if (s_back_r_sel < 0 || lv_obj_get_y(s_back_hl) != y) {
+        ui_anim_slide_obj(s_back_hl, y, 120);
+    }
+    s_back_r_sel = s_back_sel;
+}
+
+static void build_back_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    s_scr_back = scr;
+    ui_page_register(UI_PAGE_BACK, scr);
+
+    ui_put_img(scr, ASSET_BG_MENU, 0, 0);
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    ui_put_label_1line(scr, "来源", 20, 2, 134, ui_font_16, 0x1C1C1E);
+
+    s_back_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
+    for (int i = 0; i < BACK_N; i++) {
+        s_back_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
+                                           136, ui_font_12, 0x1C1C1E);
+    }
+    ESP_LOGI(TAG, "来源二级菜单已建好（%d 项）", BACK_N);
+}
+
+void ui_backmenu_open(void)
+{
+    s_back_sel = (int)player_back();
+    if (s_back_sel < 0 || s_back_sel >= BACK_N) s_back_sel = 0;
+    s_back_r_sel = -1;
+    ui_page_show(UI_PAGE_BACK);
+}
+
+void ui_backmenu_move(int delta)
+{
+    s_back_sel = (s_back_sel + delta + BACK_N) % BACK_N;
+}
+
+void ui_backmenu_activate(void)
+{
+    char buf[48];
+    snprintf(buf, sizeof(buf), "正在切换: %.16s", player_back_name((player_back_t)s_back_sel));
+    ui_toast(buf);
+    player_set_back((player_back_t)s_back_sel, true);   /* 换了后端就重建队列并起播 */
+    s_menu_dirty = true;      /* 主菜单那两行（来源/模式）都要跟着变 */
+    ui_page_show(UI_PAGE_MENU);
 }
 
 /* ============================================================ 设置二级菜单
@@ -663,23 +761,15 @@ static void build_info_screen(void)
 }
 
 
-static void menu_pick_source(player_src_t src)
-{
-    char buf[64];
-    snprintf(buf, sizeof(buf), "正在获取: %.16s", player_src_name(src));
-    ui_toast(buf);
-    player_set_source(src, true);      /* 立刻播第一首 */
-    ui_page_show(UI_PAGE_PLAY);
-}
-
 static void menu_activate(int i)
 {
     switch (i) {
-        case 0: ui_srcmenu_open(); break;        /* 来源 → 二级菜单 */
-        case 1: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
-        case 2: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
-        case 3: ui_setmenu_open(); break;        /* 设置 → 二级菜单 */
-        case 4: ui_page_show(UI_PAGE_INFO); break;
+        case 0: ui_srcmenu_open(); break;      /* 模式 → 二级菜单（最近播放… / 每日30首…） */
+        case 1: ui_backmenu_open(); break;     /* ★ 新增：来源 → 二级菜单（Navidrome / QQ 音乐） */
+        case 2: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
+        case 3: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
+        case 4: ui_setmenu_open(); break;      /* 设置 → 二级菜单 */
+        case 5: ui_page_show(UI_PAGE_INFO); break;
         default: break;
     }
 }
@@ -888,7 +978,8 @@ void ui_pages_build(void)
     build_vol_screen();
     build_info_screen();
     build_bt_screen();
-    build_src_screen();
+    build_src_screen();              /* 「模式」二级菜单（项数随后端动态） */
+    build_back_screen();             /* 「来源」二级菜单（Navidrome / QQ 音乐） */
     build_set_screen();              /* 设置二级菜单（开机续播 / 重连 WiFi）*/
     /* 音质二级菜单已按用户要求删除（固定用最高：无损优先）*/
     build_mem_screen();              /* 内存用量图表（系统信息页长按 K3 进）*/             /* 音质二级菜单（5 个挡位）*/
@@ -932,6 +1023,10 @@ void ui_pages_enter(ui_page_t p)
             s_src_r_sel = -1;
             src_render();
             break;
+        case UI_PAGE_BACK:
+            s_back_r_sel = -1;
+            back_render();
+            break;
         case UI_PAGE_SEARCH_MODE:
         case UI_PAGE_SEARCH_IN:
         case UI_PAGE_SEARCH_RES:
@@ -971,6 +1066,7 @@ void ui_pages_tick(void)
         case UI_PAGE_MEM:  mem_render();       break;
         case UI_PAGE_BT:   bt_render();        break;
         case UI_PAGE_SRC:  src_render();       break;
+        case UI_PAGE_BACK: back_render();      break;
         case UI_PAGE_SEARCH_MODE:
         case UI_PAGE_SEARCH_IN:
         case UI_PAGE_SEARCH_RES:

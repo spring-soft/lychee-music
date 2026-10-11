@@ -157,11 +157,20 @@ static void key_short(int k)
             }
             break;
 
-        case UI_PAGE_SRC:                       /* 来源二级菜单 */
+        case UI_PAGE_SRC:                       /* 「模式」二级菜单（项数随后端动态） */
             switch (k) {
                 case 0: ui_srcmenu_move(-1); break;
                 case 1: ui_srcmenu_move(+1); break;
                 case 2: ui_srcmenu_activate(); break;   /* 确定并退回主菜单 */
+                default: break;              /* K4 由 k4_navigate 管 */
+            }
+            break;
+
+        case UI_PAGE_BACK:                      /* 「来源」二级菜单（Navidrome / QQ 音乐） */
+            switch (k) {
+                case 0: ui_backmenu_move(-1); break;
+                case 1: ui_backmenu_move(+1); break;
+                case 2: ui_backmenu_activate(); break;  /* 确定并退回主菜单 */
                 default: break;              /* K4 由 k4_navigate 管 */
             }
             break;
