@@ -830,6 +830,10 @@ static void start_index_from(int idx, uint32_t from_ms)
             if (old) ae_source_http_free(old);
             return;
         }
+        /* ⚠️ 必须标一下：屏幕/网页的"直出/转码"指示器读的是 subsonic_last_raw()，
+         *    而那条变量只在 Subsonic 的拼 URL 路径里被写过。QQ 不走那条路，
+         *    不标的话指示器永远停在初值 → **一直显示"转码"**（真机踩到过）。 */
+        subsonic_note_direct("QQ直连");
     } else {
         uint32_t off_s = from_ms / 1000;
         if (off_s > 0) {

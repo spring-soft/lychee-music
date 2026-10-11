@@ -22,6 +22,7 @@
 #include "audio_engine.h"
 #include "player.h"
 #include "subsonic.h"
+#include "qqmusic.h"
 #include "net_mgr.h"
 #include "settings.h"
 #include "store.h"
@@ -668,6 +669,29 @@ static esp_err_t h_source(httpd_req_t *req)
 /* 换「来源」= 换后端（Navidrome / QQ 音乐）。
  * ⚠️ 切换**不一定成功**（Navidrome 没配、QQ 服务连不上都会失败，player 会回退状态），
  *    所以这里只回"已下发"，真正的结果要看 /api/status 里的 back/back_name。 */
+/* QQ 音乐契约层服务的地址（改完立刻生效并存 NVS，不用重刷固件）。
+ * 为什么需要它：那个服务可能跑在别的机器/端口上，装机时不该要求重编固件。
+ * 存进 NVS 后优先于 Kconfig 默认值（见 qqmusic_init）。 */
+static esp_err_t h_qq(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "host", qqmusic_host());
+        cJSON_AddBoolToObject(o, "configured", qqmusic_configured());
+        return send_json(req, o);
+    }
+    cJSON *b = read_body(req);
+    if (b == NULL) return fail(req, "400 Bad Request", "请求体不是合法 JSON");
+    const char *host = json_str(b, "host");
+    /* ⚠️ 必须**先拷出来再 cJSON_Delete** —— json_str 返回的是树里的指针 */
+    char buf[QQ_HOST_MAX] = {0};
+    if (host != NULL) strlcpy(buf, host, sizeof(buf));
+    cJSON_Delete(b);
+    if (buf[0] == 0) return fail(req, "400 Bad Request", "host 不能为空");
+    if (qqmusic_set_config(buf, true) != ESP_OK) return fail(req, "500", "保存失败");
+    return ok_json(req);
+}
+
 static esp_err_t h_back(httpd_req_t *req)
 {
     cJSON *b = read_body(req);
@@ -1130,6 +1154,8 @@ esp_err_t web_console_start(void)
     }
 
     static const httpd_uri_t uris[] = {
+        { .uri = "/api/qq",              .method = HTTP_GET,  .handler = h_qq },
+        { .uri = "/api/qq",              .method = HTTP_POST, .handler = h_qq },
         { .uri = "/api/update",          .method = HTTP_POST, .handler = h_update },
         { .uri = "/api/update",          .method = HTTP_GET,  .handler = h_update_status },
         { .uri = "/",                    .method = HTTP_GET,  .handler = h_index },

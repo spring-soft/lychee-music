@@ -96,6 +96,19 @@ bool subsonic_last_raw(void) { return s_last_raw; }
 static char s_last_why[48] = "?";
 const char *subsonic_last_why(void) { return s_last_why; }
 
+/* ★ 给【别的后端】标一次"这次是直连、不是转码"。
+ *
+ * 为什么需要它（真机踩到的）：屏幕/网页上那个"直出 / 转码"指示器读的就是 s_last_raw，
+ * 而它**只在 subsonic_stream_url() 里被写过**。QQ 音乐走的是 qqmusic_stream_url()，
+ * 根本不经过这里 —— 于是这个变量一直是初值 false，屏幕**永远显示"转码"**，
+ * 哪怕实际放的是 CDN 上的无损原文件（用户报的"QQ 一直显示转码"就是这个）。
+ * QQ 那条路把 URL 拼好后调一次本函数即可。 */
+void subsonic_note_direct(const char *why)
+{
+    s_last_raw = true;
+    strlcpy(s_last_why, why ? why : "直连", sizeof(s_last_why));
+}
+
 /* ---------- 音质挡位 ----------
  * ⚠️ 放在这一层而不是 UI 层：屏幕菜单和网页控制台共用同一套挡位。
  *    网页控制台在 ui 的下层结构里不能 include ui，各写一份必然会不一致。

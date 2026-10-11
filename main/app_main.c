@@ -24,6 +24,7 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_ota_ops.h"
 #include "board.h"
 #include "audio_engine.h"
 #include "net_mgr.h"
@@ -225,6 +226,21 @@ static void splash_watch_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     ESP_LOGI(TAG, "启动完成，用时 %" PRIu32 " ms", (uint32_t)(esp_timer_get_time() / 1000) - t0);
+
+    /* ★ OTA 自动回滚的"我还活着"声明（背景见 sdkconfig.forced 里那段说明）。
+     *
+     * 为什么偏偏放在这里：上面那个循环要等到**真的出声了**才走到这 ——
+     * 播放链路（网络→解码→I2S→ES8388）任何一环坏掉都到不了，
+     * 所以它是"这次固件真的能用"最硬的判据。
+     * 放 app_main 末尾反而太早：那只能说明"初始化没崩"，说明不了能出声。
+     *
+     * ⚠️ 必须和 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 配对：只开配置不调本函数，
+     *    每次升级都会被回滚（表现为"升级完重启又变回旧版本"），很费解。 */
+#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    esp_err_t oerr = esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGW(TAG, "OTA：本次启动已标记为有效，回滚取消（%s）", esp_err_to_name(oerr));
+#endif
+
     ui_splash_finish();
     vTaskDelete(NULL);
 }
