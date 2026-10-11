@@ -79,6 +79,22 @@ esp_err_t qqmusic_stream_url(const sub_song_t *song, char *out, size_t out_len);
 /* 歌词（GET /v1/lyric?id=...），返回 LRC 纯文本 */
 esp_err_t qqmusic_lyrics(const char *song_id, char *out, size_t out_len);
 
+/* 把歌加入 QQ 账号的「我喜欢」（红心）。
+ *
+ * ⚠️ **只能加，不能删**（2026-10-11 查清，服务端 README 里有完整证据）：
+ *   加（AddSonglist）实测有效；删（DelSonglist）QQ 对 dirId=201 **静默忽略** ——
+ *   返回 retCode=0 但什么都不做。穷举过 4 类 10 种组合，全部无效。
+ *
+ *   ⚠️ 别被上游库的自测骗了：它的 test_like_song_roundtrip 只断言返回值，
+ *      而 del_songs 是 `return retCode == 0`（删失败也是 0）→ **假阳性**。
+ *
+ *   所以 on=false 时本函数**直接返回 ESP_ERR_NOT_SUPPORTED，连请求都不发**，
+ *   也不改任何本地状态。调用方据此提示用户"请到 QQ 音乐 App 里手动取消"。
+ *
+ * 成功时 *added = 服务端**回读收藏总数**后确认真的新增了
+ *   （false 表示这首歌本来就在收藏里；服务端不盲信上游返回值）。 */
+esp_err_t qqmusic_favorite(const sub_song_t *song, bool on, bool *added);
+
 /* 封面直链：固件自己拼，不经服务（实测直连可通、不带请求头也行）。
  * ⚠️ size 只能取 90/120/150/300/500/800 —— 其它尺寸 QQ 一律 404。 */
 esp_err_t qqmusic_cover_url(const char *album_mid, int size, char *out, size_t out_len);

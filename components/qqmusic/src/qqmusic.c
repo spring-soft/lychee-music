@@ -94,10 +94,12 @@ esp_err_t qqmusic_set_config(const char *host, bool save)
 
 /* ============================================================ HTTP */
 
-/* GET 一个 URL，把 body 拿回（PSRAM，调用方负责 free）。
+/* 发一个请求，把 body 拿回（PSRAM，调用方负责 free）。
+ * 要 GET / POST 两种方法：加红心那一步是 POST（写操作语义上该用 POST）。
  * 写法照抄 subsonic.c 的 http_get_body_ex —— 尤其是"Content-Length 可能缺失
  * （chunked）"那条坑：不能按固定大小读，否则 JSON 会被截断、cJSON_Parse 失败。 */
-static esp_err_t http_get(const char *url, char **body_out, size_t *len_out,
+static esp_err_t http_req(esp_http_client_method_t method, const char *url,
+                          char **body_out, size_t *len_out,
                           int *status_out, int timeout_ms)
 {
     *body_out = NULL;
@@ -106,6 +108,7 @@ static esp_err_t http_get(const char *url, char **body_out, size_t *len_out,
 
     esp_http_client_config_t cfg = {
         .url = url,
+        .method = method,
         .timeout_ms = timeout_ms,
         .buffer_size = 4096,
         .keep_alive_enable = true,      /* 元数据请求频繁，复用连接 */
@@ -253,7 +256,7 @@ esp_err_t qqmusic_health(char *msg, size_t len)
 
     char *body = NULL;
     int status = 0;
-    esp_err_t err = http_get(url, &body, NULL, &status, 8000);
+    esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, NULL, &status, 8000);
     if (err != ESP_OK) {
         if (msg && len) snprintf(msg, len, "连不上服务（HTTP %d）", status);
         return err;
@@ -300,7 +303,7 @@ esp_err_t qqmusic_list(qq_mode_t mode, sub_song_t *out, int max, int *got)
              s_host, qq_mode_slug(mode), max);
 
     char *body = NULL;
-    esp_err_t err = http_get(url, &body, NULL, NULL, 20000);   /* 雷达/刷歌上游偶发慢 */
+    esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, NULL, NULL, 20000);   /* 雷达/刷歌上游偶发慢 */
     if (err != ESP_OK) return err;
     cJSON *root = cJSON_Parse(body);
     heap_caps_free(body);
@@ -326,7 +329,7 @@ esp_err_t qqmusic_search(const char *query, sub_song_t *out, int max, int *got)
     snprintf(url, sizeof(url), "%s/v1/search?q=%s&limit=%d", s_host, enc, max);
 
     char *body = NULL;
-    esp_err_t err = http_get(url, &body, NULL, NULL, 15000);
+    esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, NULL, NULL, 15000);
     if (err != ESP_OK) return err;
     cJSON *root = cJSON_Parse(body);
     heap_caps_free(body);
@@ -350,7 +353,7 @@ esp_err_t qqmusic_stream_url(const sub_song_t *song, char *out, size_t out_len)
 
     char *body = NULL;
     int status = 0;
-    esp_err_t err = http_get(url, &body, NULL, &status, 12000);
+    esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, NULL, &status, 12000);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "取播放地址失败（HTTP %d，歌曲 %.24s）", status, song->title);
         return err;
@@ -396,7 +399,7 @@ esp_err_t qqmusic_lyrics(const char *song_id, char *out, size_t out_len)
 
     char *body = NULL;
     size_t n = 0;
-    esp_err_t err = http_get(url, &body, &n, NULL, 12000);
+    esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, &n, NULL, 12000);
     if (err != ESP_OK) return err;
 
     /* 服务端返回的是 LRC 纯文本（歌词页本来就吃纯文本）。
@@ -408,6 +411,53 @@ esp_err_t qqmusic_lyrics(const char *song_id, char *out, size_t out_len)
     strlcpy(out, body, out_len);
     heap_caps_free(body);
     return ESP_OK;
+}
+
+esp_err_t qqmusic_favorite(const sub_song_t *song, bool on, bool *added)
+{
+    if (added) *added = false;
+    if (!qqmusic_configured() || song == NULL || song->id[0] == 0) return ESP_ERR_INVALID_ARG;
+
+    /* ★ 取消红心：上游根本做不到，所以**连请求都不发**。
+     *   千万别"发出去试试看" —— 上游会回 ok，很容易让人以为删掉了。
+     *   （上游库的自测就是这么被骗过去的，见头文件注释。） */
+    if (!on) {
+        ESP_LOGW(TAG, "QQ 不支持取消红心（上游 DelSonglist 静默忽略），"
+                      "提示用户到 App 手动取消：「%.32s」", song->title);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    char enc[128];
+    url_encode(song->id, enc, sizeof(enc));
+
+    char url[320];
+    snprintf(url, sizeof(url), "%s/v1/favorite?id=%s&on=1", s_host, enc);
+
+    char *body = NULL;
+    int status = 0;
+    esp_err_t err = http_req(HTTP_METHOD_POST, url, &body, NULL, &status, 15000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "加红心失败（HTTP %d，「%.24s」）", status, song->title);
+        return err;
+    }
+    cJSON *root = cJSON_Parse(body);
+    heap_caps_free(body);
+    if (!root) return ESP_ERR_INVALID_RESPONSE;
+
+    const cJSON *ok = cJSON_GetObjectItem(root, "ok");
+    const cJSON *ad = cJSON_GetObjectItem(root, "added");
+    bool okv = cJSON_IsTrue(ok);
+    if (added) *added = cJSON_IsTrue(ad);
+
+    if (okv) {
+        ESP_LOGI(TAG, "红心已加：「%.24s」%s", song->title,
+                 (added && *added) ? "（确认新增）" : "（本来就在收藏里）");
+    } else {
+        const cJSON *d = cJSON_GetObjectItem(root, "detail");
+        ESP_LOGW(TAG, "服务端拒绝加红心: %s", cJSON_IsString(d) ? d->valuestring : "(无 detail)");
+    }
+    cJSON_Delete(root);
+    return okv ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t qqmusic_cover_url(const char *album_mid, int size, char *out, size_t out_len)
