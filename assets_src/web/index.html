@@ -527,6 +527,40 @@ input.sw:checked::after{transform:translateX(18px);}
         <div class="kv" id="dbg"></div>
       </div>
     </div>
+
+    <!-- QQ 音乐契约层服务地址：设备从哪儿拉 QQ 的歌。
+         以前只能改 Kconfig 重刷固件，现在网页改完存 NVS、立刻生效。 -->
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-qq"><span>QQ 音乐服务</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-qq" hidden>
+        <label class="f"><span>服务地址（含 http:// 与端口）</span>
+          <input id="qq-host" autocomplete="off" autocorrect="off" autocapitalize="off"
+                 spellcheck="false" placeholder="http://192.168.0.108:3210"></label>
+        <button class="btn block" id="qq-save">保存地址</button>
+        <div class="msg" id="qq-msg"></div>
+        <div class="hint">设备从这里取 QQ 音乐（自建的契约层服务）。改完**立刻生效、存进 NVS**，
+          不用重刷固件；留空或填错会导致「来源=QQ音乐」时取不到歌，随时改回来即可。</div>
+      </div>
+    </div>
+
+    <!-- 固件升级：把 build/esp-music.bin 传上去就行，不用插 USB。
+         写进**另一个** OTA 槽 → 校验 → 切换启动分区 → 重启。
+         校验不过就不切换，当前固件一个字节都不动。 -->
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-ota"><span>固件升级（OTA）</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-ota" hidden>
+        <div class="kv"><span>当前运行槽</span><b id="ota-run">-</b></div>
+        <div class="kv"><span>本次将写入</span><b id="ota-next">-</b></div>
+        <label class="f" style="margin-top:10px"><span>固件文件（.bin）</span>
+          <input type="file" id="ota-file" accept=".bin,application/octet-stream"></label>
+        <button class="btn block" id="ota-go">上传并重启</button>
+        <div class="msg" id="ota-msg"></div>
+        <div class="prog" id="ota-prog" hidden><i id="ota-bar"></i></div>
+        <div class="hint">选 <code>build/esp-music.bin</code>。升级只写**另一个**槽，
+          当前固件全程不动；镜像校验不过就不会切换，重启还是现在的版本。
+          升级成功后设备自动重启（约 20 秒），期间本页会短暂失联属正常。</div>
+      </div>
+    </div>
   </section>
 
   <footer class="foot">
@@ -1954,6 +1988,20 @@ function applyAp(){
     loadWifi();
   }).then(function(){ busy(btn, false); });
 }
+/* QQ 服务地址 / OTA 槽位：展开卡片时才拉，省得每次 status 都带这些 */
+function loadQqHost(){
+  api('/api/qq', {}, 10000).then(function(d){
+    if(d && typeof d.host === 'string') $('qq-host').value = d.host;
+  }, function(e){
+    $('qq-msg').textContent = '读取失败：' + e.message;
+  });
+}
+function loadOtaInfo(){
+  api('/api/update', {}, 10000).then(function(d){
+    $('ota-run').textContent  = (d && d.running) || '-';
+    $('ota-next').textContent = (d && d.next) || '-';
+  }, function(){});
+}
 function loadDebug(){
   return api('/api/debug', {}, 8000).then(function(d){
     d = d || {};
@@ -2232,6 +2280,67 @@ function bindEvents(){
 
   /* 设备信息 */
   $('dbg-refresh').onclick = loadDebug;
+
+  /* ---- QQ 音乐服务地址 ---- */
+  $('qq-save').onclick = function(){
+    var h = ($('qq-host').value || '').trim();
+    if(!h){ $('qq-msg').textContent = '地址不能为空'; return; }
+    $('qq-msg').textContent = '正在保存…';
+    post('/api/qq', {host: h}, 15000).then(function(){
+      $('qq-msg').textContent = '已保存并生效';
+      toast('QQ 服务地址已保存', '');
+    }, function(e){
+      $('qq-msg').textContent = '保存失败：' + e.message;
+    });
+  };
+
+  /* ---- 固件升级（OTA）---- */
+  $('ota-go').onclick = function(){
+    var f = $('ota-file').files && $('ota-file').files[0];
+    if(!f){ $('ota-msg').textContent = '先选一个 .bin 文件'; return; }
+    if(!confirm('确定把「' + f.name + '」(' + Math.round(f.size/1024) + ' KB) 刷进设备？\n\n' +
+                '升级会写进另一个槽，当前固件不受影响；校验不过不会切换。\n' +
+                '成功后设备会自动重启，约 20 秒。')) return;
+    $('ota-msg').textContent = '正在上传 ' + Math.round(f.size/1024) + ' KB…（别关页面）';
+    $('ota-prog').hidden = false;
+    $('ota-bar').style.width = '0%';
+    /* ★ 用 XHR 而不是 fetch：**要看上传进度** —— 2.5MB 走 WiFi 要十几秒，
+       没有进度用户不知道是不是卡住了。 */
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/update?confirm=1');
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = function(ev){
+      if(!ev.lengthComputable) return;
+      var p = Math.round(ev.loaded * 100 / ev.total);
+      $('ota-bar').style.width = p + '%';
+      $('ota-msg').textContent = '上传中 ' + p + '%（上传完设备还要校验+重启）';
+    };
+    xhr.onload = function(){
+      if(xhr.status === 200){
+        $('ota-msg').textContent = '上传完成，设备正在校验并重启…（约 20 秒后自动回来）';
+        $('ota-bar').style.width = '100%';
+        toast('升级成功，设备重启中', '');
+        /* 20 秒后探一下：通了就刷新页面，让用户看到新版本 */
+        setTimeout(function(){ refreshStatus(); }, 22000);
+      }else{
+        $('ota-msg').textContent = '升级失败：HTTP ' + xhr.status + ' ' + (xhr.responseText || '');
+      }
+    };
+    xhr.onerror = function(){
+      /* 设备重启时连接会断 —— 那时 upload 已经完成，所以这**不一定**是失败 */
+      $('ota-msg').textContent = '连接中断。如果进度已到 100%，说明设备正在重启（正常）；否则是真失败。';
+    };
+    xhr.send(f);
+  };
+
+  /* 折叠展开 QQ / 升级卡片时，顺手把当前状态拉一次 */
+  document.addEventListener('click', function(ev){
+    var b = ev.target.closest ? ev.target.closest('[data-pn]') : null;
+    if(!b) return;
+    var pn = b.getAttribute('data-pn');
+    if(pn === 'pn-qq') loadQqHost();
+    if(pn === 'pn-ota') loadOtaInfo();
+  });
 
   /* 回前台立刻校正一次 */
   document.addEventListener('visibilitychange', function(){

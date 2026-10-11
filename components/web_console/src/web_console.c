@@ -191,12 +191,24 @@ static void add_song(cJSON *arr, int i, const sub_song_t *s, int playing_index)
 
 /* ============================================================ 页面本体 */
 
+/* ★★ 网页现在**内嵌在 app 里**（由 tools/gen_assets.py 生成这个 C 数组）。
+ *
+ * 为什么不继续从 assets 分区读（以前是这样）：
+ *   assets 是**独立分区**，而 **OTA 只更新 app 分区** —— 实测踩到过：
+ *   OTA 上传成功、槽也换了，但页面一点没变（网页还在 assets 里）。
+ *   把网页编进 app 之后，"改网页"也能跟着 OTA 走 —— 而网页恰恰是最常改的。
+ *   字库/图标仍留在 assets 分区（几百 KB，且很少改）。
+ *
+ * 代价：app 体积 +几十 KB（gzip 后的 HTML），3MB 的槽装得下。
+ * ⚠️ 内容是**生成**的，改网页要跑 tools/gen_assets.py 再编译。 */
+extern const unsigned char web_index_gz[];
+extern const unsigned int  web_index_gz_len;
+
 static esp_err_t h_index(httpd_req_t *req)
 {
-    asset_t a;
-    if (!assets_get_by_name("index.html.gz", &a) || a.fmt != ASSET_FMT_WEB_GZ) {
+    if (web_index_gz_len == 0) {
         return fail(req, "503 Service Unavailable",
-                    "网页资源没烧进 assets 分区（跑 tools/gen_assets.py 后 idf.py flash）");
+                    "内嵌网页为空（跑 tools/gen_assets.py 再编译）");
     }
     /* 浏览器声明支持 gzip 才发压缩体（手机上都会声明） */
     char enc[32];
@@ -210,8 +222,7 @@ static esp_err_t h_index(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     if (gz) {
-        /* ★ mmap 的指针直接发给 socket，零拷贝（httpd 内部会分块发） */
-        return httpd_resp_send(req, (const char *)a.data, a.size);
+        return httpd_resp_send(req, (const char *)web_index_gz, web_index_gz_len);
     }
     return fail(req, "406 Not Acceptable", "请用支持 gzip 的浏览器");
 }
