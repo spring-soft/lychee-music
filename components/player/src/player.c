@@ -42,9 +42,17 @@ static const char *TAG = "player";
 #define F_STAR    "STAR.SC"
 #define F_PEND    "PEND.OP"
 
-/* 序列化缓冲：64 首 × 最坏 ~560 字节 ≈ 36KB，留点余量。
- * 读和写共用一份（都在 player 任务里，天然串行）。 */
-#define JSON_BUF  (40 * 1024)
+/* 序列化缓冲：64 首 × 最坏 ~630 字节 ≈ 40KB，留点余量 → 64KB。
+ *
+ * ⚠️ 这个数**随 sub_song_t 走**：2026-10 加 TF 卡时多了 path[192]，
+ *    结构从 ~370B 涨到 660B，"最坏 ~560 字节/首"的老估算随之失效
+ *    （64×630 ≈ 40KB，正好顶在原来的 40KB 上限上 —— 会静默少存几条最近播放）。
+ *    所以下面用断言把它钉住：改动结构却忘了看这里，编译期就报。
+ * （读和写共用一份；都在 player 任务里，天然串行。） */
+#define JSON_BUF  (64 * 1024)
+
+_Static_assert(sizeof(sub_song_t) == 660,
+               "sub_song_t 大小变了 —— 请重新核算 JSON_BUF 的余量（见上面的说明）");
 
 #define RECENT_SAVE_MS   10000   /* 最近播放：变了 10 秒后才落盘（掉电最多丢这一小段） */
 #define STAR_SAVE_MS     10000
@@ -839,11 +847,36 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
         int n = s_recent_n;
         if (n > 0) memcpy(tmp, s_recent, (size_t)n * sizeof(sub_song_t));
         xSemaphoreGive(s_lock);
-        got = n;
-        err = n > 0 ? ESP_OK : ESP_FAIL;
-        fill_missing_suffix(tmp, got);
         /* ⚠️ 这里**不覆盖** back：最近播放可能混着 QQ 歌，覆盖了就会拿错 URL */
-        ESP_LOGI(TAG, "来源「最近播放」: %d 首", n);
+        got = n;
+
+        /* ★ 把 TF 卡上的歌**剔掉**（除非当前来源就是 TF 卡）。
+         *
+         * 为什么：最近播放是**跨后端**的一本流水（QQ 的歌照样留着，它们靠网络能放），
+         * 但 TF 的歌是本地文件，而卡在非 TF 来源下是**故意卸载**的
+         * （懒挂载 —— 在线播放要用回 SDSPI 占的那份内部 SRAM，见 sd_card.h）。
+         * 留着它们的结果是：列表里看得见、点了却"打不开文件"，用户只会觉得坏了。
+         *
+         * 剔掉而不是"点了再挂卡"：那会在 Navidrome 播放期间长期占着那份内部 SRAM，
+         * 把"来源切走就还内存"这条账破坏掉 —— 而那个账是在线播放能跑通的前提之一。
+         * 代价只是这几首在 Navidrome 的「最近播放」里看不到；曲库本身不受影响。 */
+        if (s_back != PLAYER_BACK_TF) {
+            int w = 0, dropped = 0;
+            for (int i = 0; i < got; i++) {
+                if (tmp[i].back == SUB_BACK_TF) { dropped++; continue; }
+                if (w != i) tmp[w] = tmp[i];
+                w++;
+            }
+            if (dropped) {
+                ESP_LOGW(TAG, "最近播放里有 %d 首 TF 卡上的歌，本来源下卡是卸着的，已跳过"
+                              "（切到「来源 = TF卡」才看得到它们）", dropped);
+            }
+            got = w;
+        }
+
+        err = got > 0 ? ESP_OK : ESP_FAIL;
+        fill_missing_suffix(tmp, got);
+        ESP_LOGI(TAG, "来源「最近播放」: %d 首", got);
     } else if (src == PLAYER_SRC_STARRED) {
         /* 切到"我的收藏"= 用户想看最新的，强制跟服务器对一次；
          * 对不上（没网）就用本地镜像 —— M6 之前这里会直接失败，收藏来源变空。 */
@@ -1432,7 +1465,19 @@ static void do_search(const char *q)
 /* 重扫 TF 卡曲库。跑在 player 任务里（会阻塞几秒，但这是用户主动触发的、
  * 界面上有"扫描中"进度的那类操作，可以接受）。
  *
- * 顺序：确保挂卡 → 起扫描 → 轮询进度 → 重新读索引 → 如果当前就在 TF 来源，
+ * ★★ 这里**故意阻塞 player 任务**（在下面那个 while 里轮询），不只是为了进度显示 ——
+ *    它是扫描期间的**并发保证**：musiclib 的扫描是**原地重建**索引
+ *    （scan_task 一上来就把 s_n 归零，然后边遍历边往里加），
+ *    所以扫描过程中 s_rec/s_n 一直是"半成品"。
+ *    而所有会读索引体的入口（load_source / musiclib_search / musiclib_find_by_id）
+ *    **全都在 player 任务里** —— 把这个任务按住，它们就都不会在扫描中途读到半成品。
+ *    剩下唯一会跨任务读到的是 musiclib_count()（网页 /api/tf 查状态），它只读一个 int，
+ *    最坏结果是数字在涨，无害。
+ *
+ * ⚠️ 因此：**如果以后要把扫描改成对 player 任务异步**（比如再开一个任务去轮询），
+ *    必须先在 musiclib 里给索引加锁/双缓冲，否则会出现"队列里混着半张曲库"。
+ *
+ * 顺序：确保挂卡 → 起扫描 → 轮询进度 → 如果当前就在 TF 来源，
  * 顺手把队列重建一遍（不然扫完还得再切一次来源才看得见新歌）。 */
 static void handle_tf_scan(void)
 {
@@ -1476,11 +1521,15 @@ static void handle_tf_scan(void)
                  esp_err_to_name(s_tf_scan_err), s_tf_scan_scanned, s_tf_scan_found);
         return;
     }
-    if (musiclib_load() != ESP_OK) {
-        ESP_LOGE(TAG, "扫描成功但索引读不回来：%s", esp_err_to_name(musiclib_last_err()));
-        return;
-    }
-    ESP_LOGW(TAG, "扫描完成：遍历 %d 个文件，曲库 %d 首",
+    /* ★ 扫完**不再 musiclib_load()**。
+     *
+     * 扫描是**原地重建** memory 里的索引，所以这时候内存里就是权威结果；
+     * s_scan_result == ESP_OK 已经说明 index_save() 成功了（它和扫描同一个结果码）。
+     * 再 load 一次不但多余，而且**有害**：musiclib_load() 是"先 musiclib_clear()
+     * 再读文件校验"，一旦读回这一步失败（CRC/版本/读盘出错），
+     * 它会把刚扫出来的索引一起清掉 —— 于是用户看到"扫描成功，但曲库是空的"，
+     * 而且重启前无法恢复。留着内存里那份，至少这次开机是好的。 */
+    ESP_LOGW(TAG, "扫描完成：遍历 %d 个文件，曲库 %d 首（已落盘，重启后自动读回）",
              s_tf_scan_scanned, musiclib_count());
 
     /* 当前就在 TF 来源：把队列跟着更新（列表页/播放页立刻看到新曲库） */
