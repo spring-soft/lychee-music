@@ -17,6 +17,7 @@
 #include "board.h"
 #include "settings.h"
 #include "store.h"
+#include "qqmusic.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -55,6 +56,7 @@ typedef enum {
     CMD_SEEK, CMD_PLAY_ID, CMD_STAR_ID,
     CMD_RESUME, CMD_STAR_REFRESH,
     CMD_SEARCH,               /* M8：屏上搜索 */
+    CMD_SET_BACK,             /* 换「来源」= Navidrome / QQ 音乐 */
 } cmd_kind_t;
 
 typedef struct {
@@ -75,6 +77,13 @@ static int               s_count;
 static int               s_index = -1;
 static uint32_t          s_queue_gen;
 static player_src_t      s_src = PLAYER_SRC_RANDOM;
+
+/* ---- 「来源」（后端）与每个后端各自的「模式」----
+ * s_src 是 Navidrome 的模式（老代码一直用它），s_qq_mode 是 QQ 的模式。
+ * 两个分开存是为了"每个后端记住自己上次的模式"：切到 QQ 再切回来，
+ * Navidrome 那边还是原来那个模式，而不是被重置。 */
+static player_back_t     s_back    = PLAYER_BACK_NAV;
+static int               s_qq_mode = QQ_MODE_FAV;
 
 /* 最近播放：环形缓冲，[0] 是最新的 */
 static sub_song_t       *s_recent;
@@ -150,7 +159,11 @@ const char *player_src_name(player_src_t s)
  * 存的是"必要子集"不是整个 sub_song_t：size / suffix 只是嗅探与 seek 的提示，
  * 丢了也能靠头几个字节重新嗅出来，所以只在有值时写。
  * 键名是单字母（t=title, a=artist, b=album, c=cover, d=duration, z=size,
- * x=suffix, s=starred）—— 文件每次换歌都要重写整份，能省一半体积。
+ * x=suffix, s=starred, k=后端）—— 文件每次换歌都要重写整份，能省一半体积。
+ *
+ * ⚠️ k（后端）**只在不是 Navidrome 时才写** —— 这样：
+ *   · 老格式文件（没有 k）读回来 back=0=Navidrome，**历史收藏/最近播放不会丢也不会错**；
+ *   · 绝大多数情况（Navidrome 用户）文件体积一点没变。
  */
 
 static void song_to_json(cJSON *arr, const sub_song_t *s)
@@ -165,6 +178,7 @@ static void song_to_json(cJSON *arr, const sub_song_t *s)
     if (s->size)        cJSON_AddNumberToObject(o, "z", (double)s->size);
     if (s->suffix[0])   cJSON_AddStringToObject(o, "x", s->suffix);
     if (s->starred)     cJSON_AddBoolToObject(o, "s", true);
+    if (s->back)        cJSON_AddNumberToObject(o, "k", s->back);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -185,6 +199,9 @@ static bool song_from_json(const cJSON *o, sub_song_t *s)
     if (cJSON_IsNumber(j)) s->duration_s = (uint32_t)j->valuedouble;
     j = cJSON_GetObjectItem(o, "z");
     if (cJSON_IsNumber(j)) s->size = (uint32_t)j->valuedouble;
+    /* 后端：老文件里没有这个键 → 保持 memset 出来的 0 = Navidrome（向后兼容） */
+    j = cJSON_GetObjectItem(o, "k");
+    if (cJSON_IsNumber(j)) s->back = (uint8_t)j->valuedouble;
     s->starred = cJSON_IsTrue(cJSON_GetObjectItem(o, "s"));
     return true;
 }
@@ -606,9 +623,13 @@ static void queue_store(const sub_song_t *songs, int n, player_src_t src, bool c
     xSemaphoreGive(s_lock);
     /* 队列换了：把"当前歌在队列里的位置"重新算一遍 */
     if (content_changed) {
-        player_status_set_queue(s_index, n, player_src_name(src), true);
-        /* 来源是"设置"，要持久化 —— 不然重启后又回到随机 30 首 */
-        settings_set_int_lazy("src", (int)src);
+        player_status_set_queue(s_index, n, player_mode_name(player_mode()), true);
+        /* 「来源」和「模式」都是"设置"，要持久化 —— 不然重启后又回到默认那套。
+         * 三个键分开存：src 是 Navidrome 的模式、qmode 是 QQ 的模式、
+         * back 是当前用哪个后端（这样两边各自的模式都能记住）。 */
+        settings_set_int_lazy("src",   (int)s_src);
+        settings_set_int_lazy("qmode", s_qq_mode);
+        settings_set_int_lazy("back",  (int)s_back);
     }
 }
 
@@ -696,6 +717,28 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
 
     int got = 0;
     esp_err_t err;
+
+    /* ---- QQ 音乐后端：6 个模式全由服务端给（收藏/每日30首/百万收藏/新歌推荐/刷歌/雷达）---- */
+    if (s_back == PLAYER_BACK_QQ) {
+        err = qqmusic_list((qq_mode_t)src, tmp, PLAYER_QUEUE_MAX, &got);
+        /* ★ 逐首打后端标记：拼播放地址时要靠它选 URL（见 start_index_from） */
+        for (int i = 0; i < got; i++) tmp[i].back = SUB_BACK_QQ;
+        if (err == ESP_OK && got > 0) {
+            ESP_LOGI(TAG, "QQ「%s」: %d 首", qq_mode_name((qq_mode_t)src), got);
+        }
+        if (err != ESP_OK || got <= 0) {
+            ESP_LOGE(TAG, "QQ「%s」拉取失败（%s，%d 首）—— 保留原队列",
+                     qq_mode_name((qq_mode_t)src), esp_err_to_name(err), got);
+            return false;
+        }
+        queue_store(tmp, got, s_src, true);      /* 不动 s_src（那是 Navidrome 的模式） */
+        *first_idx = 0;
+        ESP_LOGW(TAG, "来源切到「QQ 音乐 · %s」（%d 首）%s",
+                 qq_mode_name((qq_mode_t)src), got, autoplay ? "" : "（列表页浏览，不打断播放）");
+        return true;
+    }
+
+    /* ---- Navidrome 后端（原样保留）---- */
     if (src == PLAYER_SRC_RECENT) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         int n = s_recent_n;
@@ -704,6 +747,7 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
         got = n;
         err = n > 0 ? ESP_OK : ESP_FAIL;
         fill_missing_suffix(tmp, got);
+        /* ⚠️ 这里**不覆盖** back：最近播放可能混着 QQ 歌，覆盖了就会拿错 URL */
         ESP_LOGI(TAG, "来源「最近播放」: %d 首", n);
     } else if (src == PLAYER_SRC_STARRED) {
         /* 切到"我的收藏"= 用户想看最新的，强制跟服务器对一次；
@@ -713,9 +757,11 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
         got = starred_copy(tmp, PLAYER_QUEUE_MAX, &synced);
         err = got > 0 ? ESP_OK : ESP_FAIL;
         fill_missing_suffix(tmp, got);
+        for (int i = 0; i < got; i++) tmp[i].back = SUB_BACK_NAV;
         ESP_LOGI(TAG, "来源「我的收藏」: %d 首%s", got, synced ? "" : "（本地镜像，未与服务器对上）");
     } else {
         err = subsonic_get_random(tmp, 30, &got);
+        for (int i = 0; i < got; i++) tmp[i].back = SUB_BACK_NAV;
     }
 
     if (err != ESP_OK || got <= 0) {
@@ -763,11 +809,34 @@ static void start_index_from(int idx, uint32_t from_ms)
     s_cur_src = NULL;
 
     char url[768];
-    uint32_t off_s = from_ms / 1000;
-    if (off_s > 0) {
-        subsonic_stream_url_at(&song, 0, off_s, url, sizeof(url));
+    if (song.back == SUB_BACK_QQ) {
+        /* ★ QQ 直链**每次播放之前现取** —— vkey 只有 2 小时有效期，
+         *   若在装载队列时就把 URL 取好存着，会"存的时候好好的、播的时候 403"。
+         *   这里正是"播之前"那一刻。直链约 250~260 字符，url[768] 装得下。
+         *
+         * ⚠️ QQ **不支持拖进度条**：Subsonic 那边是靠 `timeOffset` 让服务端重转来实现
+         *    seek 的，而 QQ 的直链没有这个机制（服务端只给整文件）。
+         *   所以这里把 from_ms 归零 —— 从头播，而且位置基准也归零，
+         *   不然进度条会显示成一个根本不对的位置。 */
+        if (from_ms > 0) {
+            ESP_LOGW(TAG, "QQ 音乐不支持拖进度条，从 0:00 重放：「%.24s」", song.title);
+            from_ms = 0;
+        }
+        esp_err_t uerr = qqmusic_stream_url(&song, url, sizeof(url));
+        if (uerr != ESP_OK) {
+            ESP_LOGE(TAG, "取 QQ 直链失败（%s）：「%.24s」", esp_err_to_name(uerr), song.title);
+            restore_mute();
+            s_active = false;
+            if (old) ae_source_http_free(old);
+            return;
+        }
     } else {
-        subsonic_stream_url(&song, 0, url, sizeof(url));
+        uint32_t off_s = from_ms / 1000;
+        if (off_s > 0) {
+            subsonic_stream_url_at(&song, 0, off_s, url, sizeof(url));
+        } else {
+            subsonic_stream_url(&song, 0, url, sizeof(url));
+        }
     }
     ae_source_t *src = ae_source_http_new(url);
     if (src == NULL) {
@@ -798,7 +867,7 @@ static void start_index_from(int idx, uint32_t from_ms)
 
     if (from_ms > 0) {
         ESP_LOGW(TAG, "seek 到 %" PRIu32 "s：[%d/%d] %s - %s",
-                 off_s, idx + 1, count, song.title, song.artist);
+                 from_ms / 1000, idx + 1, count, song.title, song.artist);
     } else {
         ESP_LOGW(TAG, "▶ [%d/%d] %s - %s (%" PRIu32 "s, %s)%s",
                  idx + 1, count, song.title, song.artist, song.duration_s, song.suffix,
@@ -904,7 +973,14 @@ static void star_song_id(const char *id, bool on)
         strlcpy(song.album,  st.album,    sizeof(song.album));
         strlcpy(song.cover,  st.cover_id, sizeof(song.cover));
         song.duration_s = st.duration_ms / 1000;
-        player_status_set_starred(on);
+        /* 当前歌的后端标记：状态结构里没有 back，去队列里找同一首。
+         * 找不到就按"当前后端"算（多数情况就对：正在放的那首一般来自当前后端）。 */
+        song.back = (s_back == PLAYER_BACK_QQ) ? SUB_BACK_QQ : SUB_BACK_NAV;
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        for (int i = 0; i < s_count; i++) {
+            if (!strcmp(s_queue[i].id, id)) { song.back = s_queue[i].back; break; }
+        }
+        xSemaphoreGive(s_lock);
     } else {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         bool found = false;
@@ -916,12 +992,54 @@ static void star_song_id(const char *id, bool on)
                 if (!strcmp(s_starred[i].id, id)) { song = s_starred[i]; found = true; break; }
             }
         }
-        for (int i = 0; i < s_count; i++) {                       /* 队列那份拷贝的心形也要翻 */
-            if (!strcmp(s_queue[i].id, id)) s_queue[i].starred = on;
-        }
         xSemaphoreGive(s_lock);
         if (!found) ESP_LOGW(TAG, "收藏的 %s 不在队列/收藏里，只有 id（元数据等刷新时从服务器补）", id);
     }
+
+    /* ============================================================
+     * ★ QQ 音乐的歌：走「红心」那一套 —— **能加不能删**
+     *
+     *  加：真写回 QQ 账号的「我喜欢」（服务端还会回读收藏总数确认）。
+     *  删：上游做不到（QQ 对 dirId=201 的删除是静默忽略，详见 qqmusic.h）。
+     *      按用户要求**直接报错、什么都不改** —— 本地也不改。
+     *      否则界面显示"已取消"、QQ 那边还在，用户回手机 App 一看会以为设备在骗人。
+     *
+     * ⚠️ 且**绝不碰 s_starred**：那是 Navidrome 收藏的本地镜像。
+     *    把 QQ 的歌塞进去，"我的收藏"列表里会混进拼不出 URL 的条目。
+     * ============================================================ */
+    if (song.back == SUB_BACK_QQ) {
+        if (!on) {
+            ESP_LOGW(TAG, "QQ 音乐不支持取消红心（上游限制）：「%.32s」"
+                          " —— 请到 QQ 音乐 App 里手动取消。**本次未做任何改动**", song.title);
+            return;
+        }
+        bool added = false;
+        esp_err_t qerr = qqmusic_favorite(&song, true, &added);
+        if (qerr == ESP_OK) {
+            ESP_LOGW(TAG, "已加入 QQ「我喜欢」：「%.32s」%s", song.title,
+                     added ? "（服务端回读确认已新增）" : "（本来就在收藏里）");
+            /* 心形翻过来 —— 但只翻这一首，不动 s_starred */
+            player_status_set_starred(true);
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            for (int i = 0; i < s_count; i++) {
+                if (!strcmp(s_queue[i].id, id)) s_queue[i].starred = true;
+            }
+            xSemaphoreGive(s_lock);
+        } else {
+            ESP_LOGE(TAG, "加入 QQ「我喜欢」失败（%s）—— 本地未做任何改动",
+                     esp_err_to_name(qerr));
+        }
+        return;
+    }
+
+    /* ---- 以下是 Navidrome 的收藏，原样保留 ---- */
+
+    if (is_current) player_status_set_starred(on);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < s_count; i++) {                       /* 队列那份拷贝的心形也要翻 */
+        if (!strcmp(s_queue[i].id, id)) s_queue[i].starred = on;
+    }
+    xSemaphoreGive(s_lock);
 
     /* 2) 本地镜像先落实（界面立刻对），3) 再推服务器 */
     starred_local_apply(&song, on);
@@ -957,6 +1075,14 @@ static void next_or_wrap(int dir)
 static bool load_source_chain(player_src_t src, int *first)
 {
     if (load_source(src, false, first)) return true;
+    /* ★ QQ 那边**不退回别的模式**：用户点的是"每日30首"，悄悄换成"刷歌"只会让人困惑，
+     *   而且分不清到底哪一步出了问题。失败就明确失败、保留原队列。
+     *   （Navidrome 那边的"退回随机30首"是 M6 之前就有的行为，保持不变。） */
+    if (s_back == PLAYER_BACK_QQ) {
+        ESP_LOGW(TAG, "QQ 模式「%s」取不到歌（刻意不自动退回别的模式）",
+                 qq_mode_name((qq_mode_t)src));
+        return false;
+    }
     if (src == PLAYER_SRC_RANDOM) return false;
     ESP_LOGW(TAG, "来源「%s」取不到歌，退回随机 30 首", player_src_name(src));
     return load_source(PLAYER_SRC_RANDOM, false, first);
@@ -964,7 +1090,16 @@ static bool load_source_chain(player_src_t src, int *first)
 
 static void handle_set_source(int src, bool autoplay)
 {
-    if (src < 0 || src >= PLAYER_SRC_COUNT) return;
+    /* 「模式」的含义**随后端而变**，所以两组下标分别校验：
+     *   QQ 音乐   : 0..5  (收藏/每日30首/百万收藏/新歌推荐/刷歌/雷达)
+     *   Navidrome : 0..2  (最近播放/我的收藏/随机30首) */
+    if (s_back == PLAYER_BACK_QQ) {
+        if (src < 0 || src >= QQ_MODE_COUNT) return;
+        s_qq_mode = src;
+    } else {
+        if (src < 0 || src >= PLAYER_SRC_COUNT) return;
+        s_src = (player_src_t)src;
+    }
     int first = 0;
     if (!load_source_chain((player_src_t)src, &first)) return;
     if (autoplay) {
@@ -972,8 +1107,37 @@ static void handle_set_source(int src, bool autoplay)
         start_index(first);
     } else {
         /* 列表页浏览：不动播放，但如果当前歌恰好在新队列里，把位置标出来 */
-        player_status_set_queue(-1, player_queue_count(), player_src_name((player_src_t)src), false);
+        player_status_set_queue(-1, player_queue_count(), player_mode_name(src), false);
     }
+}
+
+/* 换「来源」= 换后端。和换模式走同一条路径（重建队列 → 可选起播）。
+ *
+ * ★ 每个后端**各自记住**自己上次的模式（s_src / s_qq_mode），所以切过来切回去
+ *   不会把模式重置 —— 用户切到 QQ 听两首再切回来，Navidrome 还是原来那个模式。
+ *
+ * ★ 切换失败必须**回退状态**：否则界面显示"已切到 QQ 音乐"、队列却还是 Navidrome 的，
+ *   用户点歌会发现放的是毫不相干的歌。常见失败：Navidrome 没配、QQ 服务连不上。 */
+static void handle_set_back(int back, bool autoplay)
+{
+    if (back < 0 || back >= PLAYER_BACK_COUNT) return;
+    player_back_t old = s_back;
+    s_back = (player_back_t)back;
+
+    int first = 0;
+    if (!load_source_chain((player_src_t)player_mode(), &first)) {
+        s_back = old;
+        ESP_LOGE(TAG, "切到「%s」失败，保持「%s」（队列没动）",
+                 player_back_name((player_back_t)back), player_back_name(old));
+        return;
+    }
+    if (autoplay) {
+        s_active = true;
+        start_index(first);
+    } else {
+        player_status_set_queue(-1, player_queue_count(), player_mode_name(player_mode()), false);
+    }
+    ESP_LOGW(TAG, "来源 = 「%s」，模式「%s」", player_back_name(s_back), player_mode_name(player_mode()));
 }
 
 /* 开机：沿用上次来源，并且**接着上次那首、那个位置放**（M6：重启恢复上次曲目与位置）。
@@ -981,7 +1145,8 @@ static void handle_set_source(int src, bool autoplay)
 static void handle_resume(void)
 {
     int first = 0;
-    if (!load_source_chain(s_src, &first)) return;
+    /* 沿用上次的「来源 + 模式」—— player_mode() 会按当前后端给出正确下标 */
+    if (!load_source_chain((player_src_t)player_mode(), &first)) return;
 
     uint32_t from = 0;
     int idx = resume_find(player_queue_count(), &from);
@@ -1022,10 +1187,18 @@ static void do_search(const char *q)
     s_found_busy = true;
     xSemaphoreGive(s_lock);
 
-    ESP_LOGW(TAG, "搜索 \"%s\"…", q);
+    ESP_LOGW(TAG, "搜索 \"%s\"…（%s）", q, player_back_name(s_back));
     int got = 0;
-    esp_err_t err = s_found_tmp ? subsonic_search(q, s_found_tmp, SUB_SONGS_MAX, &got)
-                                : ESP_ERR_NO_MEM;
+    esp_err_t err;
+    /* ★ 搜索也跟着「来源」走 —— 否则切到 QQ 音乐后搜索还在搜 Navidrome，
+     *   用户会以为"QQ 里搜不到这首歌"。 */
+    if (s_back == PLAYER_BACK_QQ) {
+        err = s_found_tmp ? qqmusic_search(q, s_found_tmp, QQ_SONGS_MAX, &got) : ESP_ERR_NO_MEM;
+        for (int i = 0; i < got; i++) s_found_tmp[i].back = SUB_BACK_QQ;   /* 逐首打后端标记 */
+    } else {
+        err = s_found_tmp ? subsonic_search(q, s_found_tmp, SUB_SONGS_MAX, &got) : ESP_ERR_NO_MEM;
+        for (int i = 0; i < got; i++) s_found_tmp[i].back = SUB_BACK_NAV;
+    }
 
     /* 搜完了整体换过去（持锁只做 memcpy）*/
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -1083,6 +1256,9 @@ static void handle_cmd(const player_cmd_t *c)
             break;
         case CMD_SET_SOURCE:
             handle_set_source(c->iarg, c->barg);
+            break;
+        case CMD_SET_BACK:
+            handle_set_back(c->iarg, c->barg);
             break;
         case CMD_RESUME:
             handle_resume();
@@ -1297,8 +1473,13 @@ esp_err_t player_init(void)
     s_bright_target = settings_get_int("bright", 100);
     if (s_bright_target < 5 || s_bright_target > 100) s_bright_target = 100;
 
+    /* 「来源」（后端）和每个后端各自的「模式」—— 三个键都恢复 */
     int src = settings_get_int("src", (int)PLAYER_SRC_RANDOM);
     if (src >= 0 && src < PLAYER_SRC_COUNT) s_src = (player_src_t)src;
+    int bk = settings_get_int("back", (int)PLAYER_BACK_NAV);
+    if (bk >= 0 && bk < PLAYER_BACK_COUNT) s_back = (player_back_t)bk;
+    int qm = settings_get_int("qmode", (int)QQ_MODE_FAV);
+    if (qm >= 0 && qm < QQ_MODE_COUNT) s_qq_mode = qm;
 
     /* ---- M6：从 cache 分区恢复。store 没挂上就跳过，一切照旧（只是重启后为空）---- */
     if (store_ready() && s_persist_ok) {
@@ -1314,12 +1495,13 @@ esp_err_t player_init(void)
     }
 
     player_status_set_volume(s_volume);
-    player_status_set_queue(-1, 0, player_src_name(s_src), true);
+    player_status_set_queue(-1, 0, player_mode_name(player_mode()), true);
 
     xTaskCreatePinnedToCore(player_task, "player", PLAYER_TASK_STACK, NULL,
                             PLAYER_TASK_PRIO, NULL, PLAYER_TASK_CORE);
-    ESP_LOGI(TAG, "就绪：队列 %d 首 / 最近 %d 条（都在 PSRAM），音量 %d%%，上次来源「%s」",
-             PLAYER_QUEUE_MAX, PLAYER_RECENT_MAX, s_volume, player_src_name(s_src));
+    ESP_LOGI(TAG, "就绪：队列 %d 首 / 最近 %d 条（都在 PSRAM），音量 %d%%，上次来源「%s · %s」",
+             PLAYER_QUEUE_MAX, PLAYER_RECENT_MAX, s_volume,
+             player_back_name(s_back), player_mode_name(player_mode()));
     return ESP_OK;
 }
 
@@ -1332,11 +1514,51 @@ static void post(cmd_kind_t kind, int iarg, bool barg)
 }
 
 void player_set_source(player_src_t src, bool autoplay) { post(CMD_SET_SOURCE, (int)src, autoplay); }
+
+/* 换「模式」：含义随后端变（QQ 6 个 / Navidrome 3 个），所以这里**不做校验**，
+ * 统一交给 player 任务里的 handle_set_source 按当前后端校验。
+ * 校验放在任务里也是必须的：s_back 只在任务上下文里改，UI 那边读到的可能是旧值。 */
+void player_set_mode(int i, bool autoplay) { post(CMD_SET_SOURCE, i, autoplay); }
+
 void player_set_source_next(int dir, bool autoplay)
 {
-    int n = (int)player_source() + (dir >= 0 ? 1 : PLAYER_SRC_COUNT - 1);
-    post(CMD_SET_SOURCE, n % PLAYER_SRC_COUNT, autoplay);
+    int n = player_mode_count();
+    if (n <= 0) return;
+    int next = (player_mode() + (dir >= 0 ? 1 : n - 1)) % n;
+    post(CMD_SET_SOURCE, next, autoplay);
 }
+
+void player_set_back(player_back_t b, bool autoplay) { post(CMD_SET_BACK, (int)b, autoplay); }
+
+player_back_t player_back(void) { return s_back; }
+
+const char *player_back_name(player_back_t b)
+{
+    switch (b) {
+        case PLAYER_BACK_QQ:  return "QQ音乐";
+        case PLAYER_BACK_NAV: return "Navidrome";
+        default:              return "";
+    }
+}
+
+int player_mode(void)
+{
+    return (s_back == PLAYER_BACK_QQ) ? s_qq_mode : (int)s_src;
+}
+
+int player_mode_count(void)
+{
+    return (s_back == PLAYER_BACK_QQ) ? QQ_MODE_COUNT : PLAYER_SRC_COUNT;
+}
+
+const char *player_mode_name(int i)
+{
+    if (s_back == PLAYER_BACK_QQ) {
+        return (i >= 0 && i < QQ_MODE_COUNT) ? qq_mode_name((qq_mode_t)i) : "";
+    }
+    return (i >= 0 && i < PLAYER_SRC_COUNT) ? player_src_name((player_src_t)i) : "";
+}
+
 void player_play_index(int idx) { post(CMD_PLAY_INDEX, idx, false); }
 void player_next(void)          { post(CMD_NEXT, 0, false); }
 void player_prev(void)          { post(CMD_PREV, 0, false); }

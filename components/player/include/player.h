@@ -40,6 +40,43 @@ typedef enum {
 
 const char *player_src_name(player_src_t s);
 
+/* ============================================================ 「来源」= 后端
+ *
+ * 设备有两个音乐源，主菜单里的「来源」切的就是它：
+ *   Navidrome  走 Subsonic 协议（subsonic.c）
+ *   QQ 音乐    走自建的契约层服务（qqmusic.c）
+ *
+ * 两者**共用同一个播放引擎和歌曲结构**，区别只有两处：列表从哪来、播放地址怎么拼。
+ * 后者靠 sub_song_t.back 逐首判断（队列里可能混着两种歌），前者靠这个全局状态。
+ */
+typedef enum {
+    PLAYER_BACK_NAV = 0,     /* Navidrome（默认） */
+    PLAYER_BACK_QQ,          /* QQ 音乐 */
+    PLAYER_BACK_COUNT,
+} player_back_t;
+
+const char *player_back_name(player_back_t b);
+player_back_t player_back(void);
+
+/* 换后端并重建队列（和换模式走同一条路径）。
+ * ⚠️ Navidrome 没配的时候切到它只会失败并保留原队列，不会把当前播放打断。 */
+void player_set_back(player_back_t b, bool autoplay);
+
+/* ---------------- 「模式」= 当前后端下的曲目来源
+ *
+ * ★ 「模式」的含义**随后端而变**，而且只由后端决定项数：
+ *     Navidrome: 0=最近播放  1=我的收藏  2=随机30首
+ *     QQ 音乐:   0=收藏  1=每日30首  2=百万收藏  3=新歌推荐  4=刷歌  5=雷达
+ *
+ * UI 只用下面四个函数渲染二级菜单 —— **不需要知道有几项、叫什么**，
+ * 以后服务端加模式（改 qqmusic 的 k_modes 表）UI 一行都不用动。 */
+int         player_mode_count(void);
+const char *player_mode_name(int i);       /* 越界返回 "" */
+void        player_set_mode(int i, bool autoplay);
+int         player_mode(void);             /* 当前模式下标 */
+
+/* 每个后端各自记住自己上次的模式：切到 QQ 再切回来，Navidrome 还是原来那个模式。 */
+
 esp_err_t player_init(void);
 
 /* ---------------- 命令（任任务可调，非阻塞） ---------------- */
