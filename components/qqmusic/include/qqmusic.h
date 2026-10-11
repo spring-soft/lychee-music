@@ -79,6 +79,12 @@ esp_err_t qqmusic_stream_url(const sub_song_t *song, char *out, size_t out_len);
 /* 歌词（GET /v1/lyric?id=...），返回 LRC 纯文本 */
 esp_err_t qqmusic_lyrics(const char *song_id, char *out, size_t out_len);
 
+/* 歌词的**归一化 JSON**（GET /v1/lyric?id=...&format=json）：
+ * `{"synced":bool,"total":N,"lines":[{"t":毫秒,"text":"..."}]}` —— 网页控制台要这个。
+ * LRC 解析放在服务端做（一行多个时间标签、小数位数、无时间轴都处理好了），
+ * 设备只管转发。调用方给 4KB 以上（实测 70 行的歌词 JSON 约 3KB）。 */
+esp_err_t qqmusic_lyrics_json(const char *song_id, char *out, size_t out_len);
+
 /* 把歌加入 QQ 账号的「我喜欢」（红心）。
  *
  * ⚠️ **只能加，不能删**（2026-10-11 查清，服务端 README 里有完整证据）：

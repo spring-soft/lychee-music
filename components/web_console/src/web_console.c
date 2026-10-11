@@ -123,10 +123,23 @@ static const char *json_str(cJSON *o, const char *key)
 
 static bool query_int(httpd_req_t *req, const char *key, int *out)
 {
-    char val[32];
+    /* ⚠️⚠️ 这里的缓冲原来是 **32 字节**，踩过一个极隐蔽的坑：
+     *   `httpd_req_get_url_query_str()` 在缓冲不够时会**静默截断**（不报错），
+     *   于是超长的查询串里，**排在后面的参数直接消失**，取不到就用调用方的默认值 ——
+     *   症状是"这个参数改了没用"，而且毫无提示。
+     *
+     *   实际踩到的：封面请求 `/api/cover?id=<14位mid>&size=144&back=1` = **33 字节**，
+     *   只超一个字节 → 截断成 `...&back`（没有 `=1`）→ back 取到 0 →
+     *   设备去 Navidrome 取 QQ 的封面 → 404。**同时**歌词请求只有 25 字节，
+     *   能塞下 → 歌词是好的。于是现象变成"歌词有了、封面没有"，
+     *   加上屏幕走的是内部调用（不经过 HTTP query）也正常 —— 三条线索互相矛盾，极难查。
+     *
+     *   教训：**这种"边界差一个字节"的参数解析，宁可用大缓冲**。
+     *   现在是 192 字节（够放 id + size + back 这类组合），栈上多这 160 字节无所谓。 */
+    char val[192];
     if (httpd_req_get_url_query_len(req) == 0) return false;
     if (httpd_req_get_url_query_str(req, val, sizeof(val)) != ESP_OK) return false;
-    char got[32];
+    char got[64];
     if (httpd_query_key_value(val, key, got, sizeof(got)) != ESP_OK) return false;
     *out = atoi(got);
     return true;
@@ -185,6 +198,10 @@ static void add_song(cJSON *arr, int i, const sub_song_t *s, int playing_index)
     if (s->suffix[0]) cJSON_AddStringToObject(o, "suffix", s->suffix);
     if (s->size)      cJSON_AddNumberToObject(o, "size", (double)s->size);
     if (s->starred) cJSON_AddBoolToObject(o, "starred", true);
+    /* ★ 这首歌属于哪个后端（sub_back_t）。前端拿封面/歌词时要把这个带上 ——
+     *   Navidrome 的 cover 是 coverArt id，QQ 的是**专辑 mid**，
+     *   同一个字段、两条完全不同的取图路子。不带给后端的话 QQ 歌就没封面/没歌词。 */
+    cJSON_AddNumberToObject(o, "back", s->back);
     if (i >= 0 && i == playing_index) cJSON_AddBoolToObject(o, "playing", true);
     cJSON_AddItemToArray(arr, o);
 }
@@ -266,6 +283,8 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(song, "album", st.album);
     cJSON_AddStringToObject(song, "cover", st.cover_id);
     cJSON_AddBoolToObject(song, "starred", st.starred);
+    /* ★ 当前歌属于哪个后端 —— 前端拿封面/歌词时要带上（QQ 和 Navidrome 两条路） */
+    cJSON_AddNumberToObject(song, "back", st.back);
 
     /* ★ 音频规格：解码格式 / 采样率 / 位深 / 是否直出 / 缓冲水位 / 欠载次数。
      *   屏幕播放页右栏已经有一份同样的信息，网页这边也要能看 ——
@@ -476,12 +495,24 @@ static esp_err_t h_cover(httpd_req_t *req)
     }
     int size = 144;
     query_int(req, "size", &size);
+    /* ★ 后端分派：Navidrome 的封面走 /rest/getCoverArt；QQ 的是 y.qq.com 直链。
+     *   前端把这首歌的 `back` 带上来（列表项里就有）。
+     *   不带的话默认 0=Navidrome，保持老行为。 */
+    int back = 0;
+    query_int(req, "back", &back);
 
     /* ★ 转发的是【原始 JPEG 字节】，不是 RGB565 —— 浏览器不认 RGB565。
      *   顺带也做了格式校验（Navidrome 对 WebP 封面转不了码，会原样透传）。 */
     uint8_t *jpg = NULL;
     size_t len = 0;
-    esp_err_t err = subsonic_get_cover_raw(id, size, &jpg, &len);
+    esp_err_t err;
+    if (back == SUB_BACK_QQ) {
+        char url[192];
+        err = qqmusic_cover_url(id, size, url, sizeof(url));
+        if (err == ESP_OK) err = subsonic_cover_raw_url(url, size, &jpg, &len);
+    } else {
+        err = subsonic_get_cover_raw(id, size, &jpg, &len);
+    }
     if (err != ESP_OK) {
         /* 404 很常见（WebP 封面），前端会退到占位图，不要刷错误日志 */
         return fail(req, "404 Not Found", "取不到封面");
@@ -501,6 +532,31 @@ static esp_err_t h_lyrics(httpd_req_t *req)
     if (!query_str(req, "id", id, sizeof(id)) || id[0] == 0) {
         return fail(req, "400 Bad Request", "缺少 id 参数");
     }
+    /* ★ 后端分派（前端带上歌曲的 back）：QQ 的歌词要的是归一化 JSON，
+     *   Navidrome 那边 subsonic_get_lyrics() 直接就给同一格式的 JSON。 */
+    int back = 0;
+    query_int(req, "back", &back);
+
+    if (back == SUB_BACK_QQ) {
+        char *json = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+        if (json == NULL) return fail(req, "500", "没有内存取歌词");
+        esp_err_t qe = qqmusic_lyrics_json(id, json, 8192);
+        if (qe != ESP_OK) {
+            heap_caps_free(json);
+            /* 没歌词不是错误：回一个空 lines 的 200，网页照常渲染"暂无歌词" */
+            no_keepalive(req);
+            httpd_resp_set_type(req, "application/json; charset=utf-8");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+            return httpd_resp_sendstr(req, "{\"synced\":false,\"total\":0,\"lines\":[]}");
+        }
+        no_keepalive(req);
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        esp_err_t e = httpd_resp_sendstr(req, json);
+        heap_caps_free(json);
+        return e;
+    }
+
     char *json = NULL;
     esp_err_t err = subsonic_get_lyrics(id, &json);
     if (err != ESP_OK || json == NULL) {

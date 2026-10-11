@@ -931,7 +931,10 @@ function renderCover(song, gen){
   img.onload  = function(){ img.hidden = false; ph.hidden = true; replay(img, 'anim'); };
   img.onerror = function(){ img.hidden = true;  ph.hidden = false; };
   ph.hidden = true;
-  img.src = '/api/cover?id=' + encodeURIComponent(cid) + '&size=144';
+  /* ★ 带上这首歌的后端：Navidrome 的 cover 是 coverArt id、QQ 的是专辑 mid，
+     同一个字段两条完全不同的取图路子（不带的话 QQ 歌就没封面）。 */
+  var bk = (S.status && S.status.song && S.status.song.back) ? ('&back=' + S.status.song.back) : '';
+  img.src = '/api/cover?id=' + encodeURIComponent(cid) + '&size=144' + bk;
   img.hidden = false;
 }
 function renderPlayBtn(){
@@ -1724,7 +1727,8 @@ function lyricsFollow(){
   if(c){ lyrApply(c); return; }                      /* 命中缓存：0 请求 */
   lyrShowNone('正在加载歌词…');
   var want = id;
-  api('/api/lyrics?id=' + encodeURIComponent(id), {}, 9000).then(function(d){
+  var bk = song.back ? ('&back=' + song.back) : '';
+  api('/api/lyrics?id=' + encodeURIComponent(id) + bk, {}, 9000).then(function(d){
     if(LYR.id !== want) return;      /* ★ 已经换歌了：这份回复作废，别串词 */
     var v = lyrNormalize(d, LYR.title);
     lyrCachePut(want, v);

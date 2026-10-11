@@ -841,9 +841,14 @@ esp_err_t subsonic_cover_raw_url(const char *url, int size_px,
         return err;
     }
     if (jpeg_len < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) {
-        ESP_LOGW(TAG, "封面不是 JPEG（前 4 字节 %02X %02X %02X %02X）—— 用占位图",
+        /* ⚠️ 把 URL 一起打出来 —— 真机踩到过：QQ 封面回来 232 字节的 HTML
+         *    （前 4 字节 `<sub`），主机上同一个 URL 却是 JPEG。
+         *    不打 URL 就只能干瞪眼，排查要多花一小时。 */
+        ESP_LOGW(TAG, "封面不是 JPEG（前 4 字节 %02X %02X %02X %02X，共 %u 字节）—— 用占位图\n"
+                      "          请求的是: %.150s",
                  jpeg[0], jpeg_len > 1 ? jpeg[1] : 0,
-                 jpeg_len > 2 ? jpeg[2] : 0, jpeg_len > 3 ? jpeg[3] : 0);
+                 jpeg_len > 2 ? jpeg[2] : 0, jpeg_len > 3 ? jpeg[3] : 0,
+                 (unsigned)jpeg_len, url);
         heap_caps_free(jpeg);
         return ESP_ERR_NOT_SUPPORTED;
     }

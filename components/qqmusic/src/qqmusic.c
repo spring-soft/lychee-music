@@ -460,6 +460,34 @@ esp_err_t qqmusic_favorite(const sub_song_t *song, bool on, bool *added)
     return okv ? ESP_OK : ESP_FAIL;
 }
 
+esp_err_t qqmusic_lyrics_json(const char *song_id, char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) return ESP_ERR_INVALID_ARG;
+    out[0] = 0;
+    if (!qqmusic_configured() || song_id == NULL || song_id[0] == 0) return ESP_ERR_INVALID_ARG;
+
+    char enc[128];
+    url_encode(song_id, enc, sizeof(enc));
+
+    char url[320];
+    /* ★ format=json：归一化的 {"synced","total","lines":[{"t","text"}]}
+     *   LRC 解析（一行多个时间标签、小数位数、无时间轴…）放在服务端做更稳，
+     *   设备这边只转发 —— 网页控制台的歌词页正好要这个格式。 */
+    snprintf(url, sizeof(url), "%s/v1/lyric?id=%s&format=json", s_host, enc);
+
+    char *body = NULL;
+    size_t n = 0;
+    esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, &n, NULL, 12000);
+    if (err != ESP_OK) return err;
+    if (n == 0) {
+        heap_caps_free(body);
+        return ESP_ERR_NOT_FOUND;
+    }
+    strlcpy(out, body, out_len);
+    heap_caps_free(body);
+    return ESP_OK;
+}
+
 esp_err_t qqmusic_cover_url(const char *album_mid, int size, char *out, size_t out_len)
 {
     if (out == NULL || out_len == 0) return ESP_ERR_INVALID_ARG;
