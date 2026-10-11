@@ -118,7 +118,16 @@ svg{display:block;}
 .iconbtn.star.on svg{filter:drop-shadow(0 1px 1px rgba(180,140,0,.25));}
 
 /* 进度条：视觉 6px，触摸区 40px */
-.prog{height:40px;display:flex;align-items:center;touch-action:none;cursor:pointer;margin-top:2px;}
+.prog{
+  height:40px;display:flex;align-items:center;touch-action:none;cursor:pointer;margin-top:2px;}
+
+/* ---------- 设备日志框 ---------- */
+.logbox{
+  margin:8px 0 0;padding:8px 10px;max-height:min(42vh,340px);overflow:auto;
+  background:#1b1d21;color:#d5dae0;border-radius:9px;
+  font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  white-space:pre-wrap;word-break:break-word;-webkit-overflow-scrolling:touch;
+}
 .track{position:relative;width:100%;height:6px;border-radius:3px;background:var(--line);}
 .fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:3px;background:var(--accent);}
 .knob{
@@ -559,6 +568,21 @@ input.sw:checked::after{transform:translateX(18px);}
         <div class="hint">选 <code>build/esp-music.bin</code>。升级只写**另一个**槽，
           当前固件全程不动；镜像校验不过就不会切换，重启还是现在的版本。
           升级成功后设备自动重启（约 20 秒），期间本页会短暂失联属正常。</div>
+      </div>
+    </div>
+
+    <!-- 网络日志：设备平时独立供电、不接电脑，没串口就等于瞎了。
+         这里把设备侧 esp_log 的环形缓冲增量拉到页面上。 -->
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-log"><span>设备日志</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-log" hidden>
+        <div class="row-between"><span style="font-size:13px;color:var(--muted)">实时日志（最近 160 行）</span>
+          <button class="iconbtn sm" id="log-refresh" aria-label="刷新日志"></button></div>
+        <label class="row-between" style="margin:6px 0"><span>自动刷新</span>
+          <input type="checkbox" class="sw" id="log-auto" checked></label>
+        <pre class="logbox" id="logbox"></pre>
+        <div class="hint">设备**不插电脑也能看** —— 它把 esp_log 抄了一份进内存环形缓冲，
+          这里是增量拉取（只传新行）。**开机全过程都在**，用来排查"升级后不出声""取不到歌"这类问题。</div>
       </div>
     </div>
   </section>
@@ -1989,6 +2013,30 @@ function applyAp(){
   }).then(function(){ busy(btn, false); });
 }
 /* QQ 服务地址 / OTA 槽位：展开卡片时才拉，省得每次 status 都带这些 */
+/* 设备日志：增量拉取（只传新行），最多留 300 行在 DOM 里。
+   ⚠️ 用 fetch 直接取纯文本，不走 api()（那个按 JSON 解）。 */
+var LOG_SEQ = 0;
+function loadLog(){
+  var box = $('logbox');
+  if(!box) return;
+  fetch('/api/log' + (LOG_SEQ ? ('?since=' + LOG_SEQ) : '')).then(function(r){
+    return r.text();
+  }).then(function(t){
+    if(!t) return;
+    var lines = t.split('\n'), add = '';
+    for(var i = 0; i < lines.length; i++){
+      var m = /^(\d+) ([\s\S]*)$/.exec(lines[i]);
+      if(!m) continue;
+      LOG_SEQ = Number(m[1]);
+      add += m[2] + '\n';
+    }
+    if(!add) return;
+    box.textContent += add;
+    var all = box.textContent.split('\n');
+    if(all.length > 300) box.textContent = all.slice(all.length - 300).join('\n');
+    box.scrollTop = box.scrollHeight;
+  }).catch(function(){});
+}
 function loadQqHost(){
   api('/api/qq', {}, 10000).then(function(d){
     if(d && typeof d.host === 'string') $('qq-host').value = d.host;
@@ -2333,13 +2381,21 @@ function bindEvents(){
     xhr.send(f);
   };
 
-  /* 折叠展开 QQ / 升级卡片时，顺手把当前状态拉一次 */
+  /* 设备日志：展开时清空重来，之后每秒增量拉一行（只在这张卡片可见时才拉） */
+  $('log-refresh').onclick = function(){ LOG_SEQ = 0; $('logbox').textContent = ''; loadLog(); };
+  setInterval(function(){
+    var pn = $('pn-log');
+    if(pn && !pn.hidden && $('log-auto').checked) loadLog();
+  }, 1000);
+
+  /* 折叠展开 QQ / 升级 / 日志卡片时，顺手把当前状态拉一次 */
   document.addEventListener('click', function(ev){
     var b = ev.target.closest ? ev.target.closest('[data-pn]') : null;
     if(!b) return;
     var pn = b.getAttribute('data-pn');
     if(pn === 'pn-qq') loadQqHost();
     if(pn === 'pn-ota') loadOtaInfo();
+    if(pn === 'pn-log'){ LOG_SEQ = 0; $('logbox').textContent = ''; loadLog(); }
   });
 
   /* 回前台立刻校正一次 */

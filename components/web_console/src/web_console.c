@@ -1129,6 +1129,114 @@ static esp_err_t h_update(httpd_req_t *req)
     return send_json(req, o);
 }
 
+/* ============================================================ 网络日志
+ *
+ * 为什么需要它：这台设备平时**独立供电、不接电脑** —— 没插串口就等于瞎了。
+ * 而开发时几乎所有的 bug 都是靠串口日志抓到的（接口静默注册失败、
+ * 封面尺寸坑、"QQ 到底拉到歌没有"）。把日志搬到网页上，
+ * 不插线也能看，手机连设备热点也能看。
+ *
+ * 做法：钩住 `esp_log_set_vprintf()` —— 除了照常往串口打，再抄一份进 PSRAM 环形缓冲。
+ * 缓冲按**行**存，每行带一个只增不减的序号；网页用 `?since=<序号>` 增量拉，
+ * 所以每秒轮询也只传新增的那几行。
+ *
+ * ⚠️ 三条硬约束（vprintf 钩子会在**任意任务、甚至中断上下文**被调用）：
+ *   1. 只做 memcpy 和索引运算 —— **不加锁、不 malloc、不做 I/O**，
+ *      否则某个任务在打日志时持锁，别的任务再来打日志就死锁。
+ *   2. 缓冲区启动时一次性分配在 PSRAM。
+ *   3. 覆盖写：满了冲掉最旧的。日志要的是"最近发生了什么"，旧的不重要。
+ */
+#define LOG_LINE_MAX   192                      /* 单行截断长度 */
+#define LOG_LINES      160                      /* 160 × 192 ≈ 30 KB PSRAM */
+
+typedef struct {
+    volatile uint32_t seq;                      /* 只增不减的行号（0 = 这个槽还没用过） */
+    volatile uint16_t len;
+    char              text[LOG_LINE_MAX];
+} log_rec_t;
+
+static log_rec_t *s_log;                        /* PSRAM 环形数组 */
+static volatile uint32_t s_log_next;            /* 下一个要写的行号（从 1 开始） */
+static vprintf_like_t    s_old_vprintf;         /* 原来的输出（串口），必须继续调 */
+
+static void log_line(const char *s, size_t n)
+{
+    if (s_log == NULL || n == 0) return;
+    if (n > LOG_LINE_MAX - 1) n = LOG_LINE_MAX - 1;
+    uint32_t seq = s_log_next;
+    log_rec_t *r = &s_log[seq % LOG_LINES];
+    /* 先写内容，最后再写 seq —— 读的人靠 seq 判断这条是不是新的/写完的 */
+    memcpy(r->text, s, n);
+    r->text[n] = 0;
+    r->len = (uint16_t)n;
+    r->seq = seq + 1;                           /* 行号从 1 开始，0 表示空槽 */
+    s_log_next = seq + 1;
+}
+
+/* vprintf 钩子：串口照打，另抄一份进环形缓冲 */
+static int log_vprintf(const char *fmt, va_list ap)
+{
+    va_list cp;
+    va_copy(cp, ap);
+    char tmp[LOG_LINE_MAX];
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, cp);
+    va_end(cp);
+    if (n > 0) log_line(tmp, (size_t)(n < (int)sizeof(tmp) ? n : (int)sizeof(tmp) - 1));
+    /* ★ 串口输出必须继续走原来的路子，不能因为加了网页日志就丢掉串口 */
+    return s_old_vprintf ? s_old_vprintf(fmt, ap) : n;
+}
+
+void web_log_init(void)
+{
+    if (s_log != NULL) return;
+    s_log = heap_caps_calloc(LOG_LINES, sizeof(log_rec_t), MALLOC_CAP_SPIRAM);
+    if (s_log == NULL) {
+        ESP_LOGW(TAG, "日志环形缓冲分配失败（%u KB）—— 网页日志不可用",
+                 (unsigned)(LOG_LINES * sizeof(log_rec_t) / 1024));
+        return;
+    }
+    s_log_next = 1;
+    s_old_vprintf = esp_log_set_vprintf(log_vprintf);
+    ESP_LOGW(TAG, "网络日志已启用：%d 行 × %d 字节（PSRAM），GET /api/log?since=N",
+             LOG_LINES, LOG_LINE_MAX);
+}
+
+/* GET /api/log?since=<上次拿到的最大行号> → 纯文本，每行 "<行号> <内容>"
+ * 为什么要带行号：客户端拿最大行号当地标，下次只拉新的 —— 每秒轮询也不费流量。 */
+static esp_err_t h_log(httpd_req_t *req)
+{
+    char q[16] = {0};
+    uint32_t since = 0;
+    if (query_str(req, "since", q, sizeof(q))) since = (uint32_t)strtoul(q, NULL, 10);
+
+    if (s_log == NULL) return fail(req, "503 Service Unavailable", "网络日志没启用（缓冲分配失败）");
+
+    /* 先算最老还有效的行号；since 比它还旧就从最老的开始（中间的被覆盖了） */
+    uint32_t next = s_log_next;
+    uint32_t oldest = (next > LOG_LINES) ? (next - LOG_LINES) : 1;
+    if (since + 1 > oldest) oldest = since + 1;
+
+    /* 拼进 PSRAM（最多 30KB）—— 不占内部 SRAM，也不做 chunked 的麻烦事 */
+    size_t cap = (size_t)LOG_LINES * (LOG_LINE_MAX + 16) + 64;
+    char *out = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (out == NULL) return fail(req, "500", "没有内存拼日志");
+    size_t o = 0;
+    for (uint32_t s = oldest; s < next; s++) {
+        const log_rec_t *r = &s_log[(s - 1) % LOG_LINES];
+        if (r->seq != s || r->len == 0) continue;      /* 被覆盖了或还没写完 */
+        /* ⚠️ 日志行**自带换行**，所以这里不加 \n —— 加了每行之间会多一个空行。
+         *    但没有换行的（极少）补一个，否则两行会粘在一起。 */
+        bool nl = (r->text[r->len - 1] == '\n');
+        o += snprintf(out + o, cap - o, "%" PRIu32 " %s%s", s, r->text, nl ? "" : "\n");
+        if (cap - o < LOG_LINE_MAX + 24) break;
+    }
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    esp_err_t e = httpd_resp_send(req, out, o);
+    heap_caps_free(out);
+    return e;
+}
+
 esp_err_t web_console_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -1165,6 +1273,7 @@ esp_err_t web_console_start(void)
     }
 
     static const httpd_uri_t uris[] = {
+        { .uri = "/api/log",             .method = HTTP_GET,  .handler = h_log },
         { .uri = "/api/qq",              .method = HTTP_GET,  .handler = h_qq },
         { .uri = "/api/qq",              .method = HTTP_POST, .handler = h_qq },
         { .uri = "/api/update",          .method = HTTP_POST, .handler = h_update },

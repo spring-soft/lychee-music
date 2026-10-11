@@ -247,6 +247,12 @@ static void splash_watch_task(void *arg)
 
 void app_main(void)
 {
+    /* ★ 第一件事就把"网络日志"打开：设备平时独立供电、不接电脑，
+     *   没串口就等于瞎了。这里钩住 esp_log，把输出抄一份进 PSRAM 环形缓冲，
+     *   之后网页 GET /api/log?since=N 能拉到 —— 放最前面是为了把
+     *   **开机全过程**都录下来（否则只能看到网络起来之后的那段）。 */
+    web_log_init();
+
     log_chip_info();
     log_memory("boot");
     player_status_init();
