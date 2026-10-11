@@ -13,6 +13,8 @@ idf_component_register(
         hid_remote
         board
         esp_http_server
+        app_update
+        esp_partition
         json
         esp_timer
         esp_hw_support

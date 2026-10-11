@@ -12,6 +12,10 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include "assets.h"
 #include "app_core.h"
@@ -960,6 +964,136 @@ static esp_err_t h_debug(httpd_req_t *req)
 
 /* ============================================================ 注册 */
 
+/* ============================================================ 固件升级（OTA）
+ *
+ * 为什么现在做：分区表里那对 3MB 的 ota_0/ota_1 从项目一开始就留着
+ * （注释写着"以后改 UI 走 WiFi 升级"），但一直没实现 ——
+ * 结果每次改固件都得插 USB 烧录，实测一轮改了十几次就得插十几次。
+ *
+ * 流程：POST /api/update?confirm=1，**请求体就是 esp-music.bin 的原始字节** →
+ *       写进"下一个" OTA 分区 → esp_ota_end() 校验 → 切换启动分区 → 1 秒后重启。
+ *
+ * 为什么刷不成砖：
+ *   · `esp_ota_set_boot_partition()` **只在 esp_ota_end() 校验通过之后**才调用。
+ *     中途断电 / 上传截断 / 传错文件，都只是"这次升级失败"，重启还是跑旧固件。
+ *   · 升级全程只写"下一个"分区，**当前正在跑的那个分区一个字节都不碰**。
+ *
+ * ⚠️ 分块缓冲必须放 PSRAM：起播后内部 SRAM 只剩几十 KB，而 httpd 任务栈只有 4KB，
+ *    在那儿放 4KB 的局部数组会直接爆栈。
+ * ⚠️ esp_ota_write 要求每块长度是 4 的倍数（最后一块除外），所以按 4096 收。
+ * ⚠️ 依赖 `partitions.csv` 里 ota_0/ota_1 这对槽 —— 它们**不能删**，
+ *    删了就没法再远程升级，只能插 USB 救。
+ */
+static volatile int s_ota_pct = -1;      /* -1 = 没在升级；0..100 = 进度 */
+
+static esp_err_t h_update_status(httpd_req_t *req)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "busy", s_ota_pct >= 0);
+    cJSON_AddNumberToObject(o, "pct", s_ota_pct);
+    /* 顺带报两个 app 槽，排查"这次升到哪个槽了"很方便 */
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    const esp_partition_t *nxt = esp_ota_get_next_update_partition(NULL);
+    cJSON_AddStringToObject(o, "running", run ? run->label : "?");
+    cJSON_AddStringToObject(o, "next",    nxt ? nxt->label : "?");
+    return send_json(req, o);
+}
+
+static void ota_reboot_cb(void *arg) { esp_restart(); }
+
+static esp_err_t h_update(httpd_req_t *req)
+{
+    /* 防误触：别人随手 POST 一下不该触发升级 */
+    char cf[8] = {0};
+    if (!query_str(req, "confirm", cf, sizeof(cf)) || strcmp(cf, "1") != 0) {
+        return fail(req, "400 Bad Request", "升级要带 ?confirm=1（防误触）");
+    }
+    if (req->content_len <= 0) {
+        return fail(req, "400 Bad Request", "请求体是空的（要把 .bin 的原始字节作为 body）");
+    }
+    if (s_ota_pct >= 0) return fail(req, "409 Conflict", "已经有一次升级在进行");
+
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (part == NULL) return fail(req, "500", "没有可用的 OTA 分区（partitions.csv 里 ota_0/ota_1 还在吗？）");
+    if ((size_t)req->content_len > part->size) {
+        return fail(req, "413", "固件比 OTA 分区还大，装不下");
+    }
+
+    ESP_LOGW(TAG, "OTA 开始：%u 字节 → 分区 %s（%u KB）",
+             (unsigned)req->content_len, part->label, (unsigned)(part->size / 1024));
+    s_ota_pct = 0;
+
+    const size_t CHUNK = 4096;
+    char *buf = heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
+    if (buf == NULL) { s_ota_pct = -1; return fail(req, "500", "没有内存收固件"); }
+
+    esp_ota_handle_t ota = 0;
+    esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &ota);
+    if (err != ESP_OK) {
+        heap_caps_free(buf);
+        s_ota_pct = -1;
+        ESP_LOGE(TAG, "ota_begin 失败: %s", esp_err_to_name(err));
+        return fail(req, "500", "ota_begin 失败");
+    }
+
+    int total = req->content_len;
+    int got = 0;
+    while (got < total) {
+        int want = total - got;
+        if (want > (int)CHUNK) want = (int)CHUNK;
+        int n = httpd_req_recv(req, buf, want);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;      /* 网络抖动：重试这一块 */
+        if (n <= 0) {
+            ESP_LOGE(TAG, "收包中断（%d/%d）", got, total);
+            err = ESP_FAIL;
+            break;
+        }
+        err = esp_ota_write(ota, buf, n);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ota_write 失败: %s", esp_err_to_name(err));
+            break;
+        }
+        got += n;
+        s_ota_pct = got * 100 / total;
+    }
+    heap_caps_free(buf);
+
+    if (err != ESP_OK || got != total) {
+        esp_ota_abort(ota);
+        s_ota_pct = -1;
+        return fail(req, "500", "写入失败/中断，已放弃 —— 旧固件不受影响，重启还是它");
+    }
+
+    /* ★ 校验：镜像损坏、或者传错文件（比如把 assets.bin 传上来）会在这里被挡下 */
+    err = esp_ota_end(ota);
+    if (err != ESP_OK) {
+        s_ota_pct = -1;
+        ESP_LOGE(TAG, "ota_end 校验失败: %s", esp_err_to_name(err));
+        return fail(req, "400", "镜像校验失败 —— 是不是传错文件了？（要传 build/esp-music.bin）");
+    }
+
+    err = esp_ota_set_boot_partition(part);
+    if (err != ESP_OK) {
+        s_ota_pct = -1;
+        ESP_LOGE(TAG, "set_boot_partition 失败: %s", esp_err_to_name(err));
+        return fail(req, "500", "切换启动分区失败，这次升级没生效");
+    }
+
+    ESP_LOGW(TAG, "OTA 完成：下次从 %s 启动，1 秒后重启", part->label);
+    s_ota_pct = 100;
+
+    /* 先把响应发出去，客户端才知道成功了；重启放到定时器里做 ——
+     * 否则"响应还没发完就重启"，浏览器只看到连接断开，会以为升级失败。 */
+    esp_timer_handle_t t = NULL;
+    const esp_timer_create_args_t targs = { .callback = ota_reboot_cb, .name = "ota_reboot" };
+    if (esp_timer_create(&targs, &t) == ESP_OK) esp_timer_start_once(t, 1000 * 1000);
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddStringToObject(o, "note", "1 秒后重启到新固件");
+    return send_json(req, o);
+}
+
 esp_err_t web_console_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -996,6 +1130,8 @@ esp_err_t web_console_start(void)
     }
 
     static const httpd_uri_t uris[] = {
+        { .uri = "/api/update",          .method = HTTP_POST, .handler = h_update },
+        { .uri = "/api/update",          .method = HTTP_GET,  .handler = h_update_status },
         { .uri = "/",                    .method = HTTP_GET,  .handler = h_index },
         { .uri = "/api/status",          .method = HTTP_GET,  .handler = h_status },
         { .uri = "/api/lyrics",          .method = HTTP_GET,  .handler = h_lyrics },
