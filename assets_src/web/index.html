@@ -591,6 +591,18 @@ input.sw:checked::after{transform:translateX(18px);}
           这里是增量拉取（只传新行）。**开机全过程都在**，用来排查"升级后不出声""取不到歌"这类问题。</div>
       </div>
     </div>
+
+    <!-- 清空缓存：封面缓存是可再生的，占空间了/封面显示不对时可以清一下 -->
+    <div class="card acc-card">
+      <button class="acc" data-pn="pn-cache"><span>清空缓存</span><span class="chev" data-chev></span></button>
+      <div class="panel" id="pn-cache" hidden>
+        <button class="btn block" id="cache-clear">清空封面缓存</button>
+        <div class="msg" id="cache-msg"></div>
+        <div class="hint">只清**封面缓存**（纯可再生：下次看到那首歌会自动重新下载）。
+          ⚠️ **不动**最近播放和收藏镜像 —— 那里有你的东西。
+          屏幕上也有同一个功能：菜单 →「设置」→「清空缓存」（两段确认）。</div>
+      </div>
+    </div>
   </section>
 
   <footer class="foot">
@@ -2401,6 +2413,18 @@ function bindEvents(){
       $('ota-msg').textContent = '连接中断。如果进度已到 100%，说明设备正在重启（正常）；否则是真失败。';
     };
     xhr.send(f);
+  };
+
+  /* 清空封面缓存（封面是可再生的；最近播放/收藏镜像不动） */
+  $('cache-clear').onclick = function(){
+    if(!confirm('清空封面缓存？\n\n封面下次看到会自动重新下载，不会丢任何数据。\n' +
+                '最近播放和收藏镜像**不动**。')) return;
+    $('cache-msg').textContent = '正在清…';
+    post('/api/cache', {}, 20000).then(function(d){
+      $('cache-msg').textContent = '清了 ' + (d.removed || 0) + ' 个封面，释放 ' +
+                                   (d.freed_kb || 0) + ' KB（现可用 ' + (d.free_kb || 0) + ' KB）';
+      toast('封面缓存已清空', '');
+    }, function(e){ $('cache-msg').textContent = '清空失败：' + e.message; });
   };
 
   /* 设备日志：展开时清空重来，之后每秒增量拉一行（只在这张卡片可见时才拉） */

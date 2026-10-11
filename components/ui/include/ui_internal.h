@@ -100,6 +100,10 @@ void ui_backmenu_activate(void);
 void ui_setmenu_open(void);
 void ui_setmenu_move(int delta);
 void ui_setmenu_activate(void);
+
+/* 清空封面缓存后调它：把内存里的"封面黑名单"一起清掉。
+ * ⚠️ 不清的话那些歌不会重新去取封面 —— 等于白清。 */
+void ui_cover_cache_cleared(void);
 /* 开机续播已按用户要求取消（不再提供开关，player.c 一律从 0:00 开始放）*/
 
 /* 内存用量图表页：系统信息页长按 K3 进来，只画 PSRAM（flash 基本不变，用户说不用）*/

@@ -876,6 +876,15 @@ static bool cover_is_bad(const char *id)
     return false;
 }
 
+/* ★ 清空缓存后必须调用：把"这些封面取不到"的黑名单也清掉。
+ * 不清的话，清完缓存那些歌**依然不会重新去取** —— 等于白清。
+ * （黑名单是为了避免对同一个坏封面反复发请求，但缓存被清后前提已经变了。） */
+void ui_cover_cache_cleared(void)
+{
+    s_cover_bad_n = 0;
+    ESP_LOGW(TAG, "封面黑名单已清空，之前取不到的封面会重新尝试");
+}
+
 static void cover_mark_bad(const char *id)
 {
     if (cover_is_bad(id)) return;

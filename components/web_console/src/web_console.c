@@ -738,6 +738,24 @@ static esp_err_t h_source(httpd_req_t *req)
 /* 换「来源」= 换后端（Navidrome / QQ 音乐）。
  * ⚠️ 切换**不一定成功**（Navidrome 没配、QQ 服务连不上都会失败，player 会回退状态），
  *    所以这里只回"已下发"，真正的结果要看 /api/status 里的 back/back_name。 */
+/* 清空封面缓存（POST /api/cache）。
+ * ★ 只清**封面缓存** —— 它是纯可再生数据（下次看到那首歌会自动重新下载）。
+ *   最近播放 / 收藏镜像**不清**：那里有用户的东西，清掉会莫名其妙地丢历史。
+ * 返回清了多少、释放了多少，前端能给出真实反馈（而不是"点了没反应"）。 */
+static esp_err_t h_cache(httpd_req_t *req)
+{
+    uint64_t before = store_free_kb();
+    int n = store_evict("COVER", 0);            /* keep=0 = 全删 */
+    uint64_t after = store_free_kb();
+    ESP_LOGW(TAG, "清空封面缓存：删 %d 个，%u KB → %u KB 可用",
+             n, (unsigned)before, (unsigned)after);
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "removed", n);
+    cJSON_AddNumberToObject(o, "freed_kb", (double)(after - before));
+    cJSON_AddNumberToObject(o, "free_kb", (double)after);
+    return send_json(req, o);
+}
+
 /* QQ 音乐契约层服务的地址（改完立刻生效并存 NVS，不用重刷固件）。
  * 为什么需要它：那个服务可能跑在别的机器/端口上，装机时不该要求重编固件。
  * 存进 NVS 后优先于 Kconfig 默认值（见 qqmusic_init）。 */
@@ -1419,6 +1437,7 @@ esp_err_t web_console_start(void)
     }
 
     static const httpd_uri_t uris[] = {
+        { .uri = "/api/cache",           .method = HTTP_POST, .handler = h_cache },
         { .uri = "/api/log",             .method = HTTP_GET,  .handler = h_log },
         { .uri = "/api/qq",              .method = HTTP_GET,  .handler = h_qq },
         { .uri = "/api/qq",              .method = HTTP_POST, .handler = h_qq },

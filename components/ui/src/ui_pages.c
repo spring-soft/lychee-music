@@ -23,6 +23,7 @@
 #include "audio_engine.h"
 #include "board.h"
 #include "net_mgr.h"
+#include "store.h"        /* 清空缓存：store_evict / store_free_kb */
 #include "settings.h"
 #include "hid_remote.h"
 #include "esp_log.h"
@@ -457,20 +458,26 @@ void ui_backmenu_activate(void)
  * 主菜单里按一下就执行，往上翻菜单很容易误触。现在第一次按 K3 只是把这一行变成
  * "重连 WiFi？再按K3确认"，再按一次才真的动网络，K4 随时退出。
  */
-#define SET_N  1
+#define SET_N  2
 
 static lv_obj_t *s_scr_set, *s_set_hl, *s_set_lbl[SET_N];
 static int       s_set_sel;
 static int       s_set_r_sel = -1;
-static bool      s_set_confirm;      /* true = 正停在"重连 WiFi"的确认态 */
+static bool      s_set_confirm;      /* true = 正停在某一项的确认态 */
 
 static void set_render(void)
 {
     /* 确认态下把提示直接写在行里 —— 这个屏幕上没有独立的弹窗层，
      * 复用同一行最省事，也不会盖住别的东西。 */
     char buf[48];
-    snprintf(buf, sizeof(buf), "重连 WiFi%s", s_set_confirm ? "？再按K3确认" : "");
+    snprintf(buf, sizeof(buf), "重连 WiFi%s",
+             (s_set_confirm && s_set_sel == 0) ? "？再按K3确认" : "");
     ui_set_text(s_set_lbl[0], buf);
+    /* 清空缓存：清掉封面缓存（可再生）。加在设置里是因为它属于"偶尔要清一下"
+     * 的维护动作，不配占用主菜单一行。 */
+    snprintf(buf, sizeof(buf), "清空缓存%s",
+             (s_set_confirm && s_set_sel == 1) ? "？再按K3确认" : "");
+    ui_set_text(s_set_lbl[1], buf);
 
     int y = MENU_Y0 + s_set_sel * MENU_ROW_H;
     if (s_set_r_sel < 0 || lv_obj_get_y(s_set_hl) != y) {
@@ -515,17 +522,35 @@ void ui_setmenu_move(int delta)
 
 void ui_setmenu_activate(void)
 {
-    /* 重连 WiFi：两段式 */
+    /* 两段式：第一次按 K3 只是"进入确认态"，再按一次才真的执行。
+     * 这两项都有副作用（断网 / 删文件），不该一按就中。 */
     if (!s_set_confirm) {
         s_set_confirm = true;
-        ui_toast("再按 K3 确认重连");
+        ui_toast(s_set_sel == 0 ? "再按 K3 确认重连" : "再按 K3 确认清空");
         set_render();
         return;
     }
     s_set_confirm = false;
-    net_mgr_reconnect();
-    ui_toast("正在重连 WiFi...");
-    ui_page_show(UI_PAGE_MENU);     /* 确认后退出，让它自己去连 */
+
+    if (s_set_sel == 0) {
+        net_mgr_reconnect();
+        ui_toast("正在重连 WiFi...");
+    } else {
+        /* ★ 只清**封面缓存**：它是纯粹的可再生数据（下次看到那首歌会自动重新下载）。
+         *   最近播放 / 收藏镜像**不清** —— 那里面有用户的东西，清掉会莫名其妙。 */
+        uint64_t before = store_free_kb();
+        int n = store_evict("COVER", 0);        /* keep=0 = 全删 */
+        uint64_t after = store_free_kb();
+        char t[48];
+        snprintf(t, sizeof(t), "清了 %d 个封面，释放 %u KB", n, (unsigned)(after - before));
+        ui_toast(t);
+        ESP_LOGW(TAG, "清空封面缓存：删 %d 个，%u KB → %u KB 可用",
+                 n, (unsigned)before, (unsigned)after);
+        /* 内存里还留着"这些封面取不到"的黑名单 —— 不清掉的话，
+         * 清完缓存那些歌**依然不会重新去取**，等于白清。 */
+        ui_cover_cache_cleared();
+    }
+    ui_page_show(UI_PAGE_MENU);     /* 执行完退出 */
 }
 
 
