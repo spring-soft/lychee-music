@@ -849,8 +849,9 @@ static void start_index_from(int idx, uint32_t from_ms)
 
     /* 先登记到快照（UI/网页立刻看到新歌名），再开流 */
     player_status_set_song(song.id, song.title, song.artist, song.album, song.cover,
-                           (uint32_t)((uint64_t)song.duration_s * 1000), song.starred);
-    player_status_set_queue(idx, count, player_src_name(s_src), false);
+                           (uint32_t)((uint64_t)song.duration_s * 1000), song.starred,
+                           song.back);
+    player_status_set_queue(idx, count, player_mode_name(player_mode()), false);
 
     s_cur_src = src;
     s_err_streak = 0;
@@ -914,7 +915,7 @@ static void play_song_id(const char *id)
     }
     int n = s_count;
     xSemaphoreGive(s_lock);
-    player_status_set_queue(slot, n, player_src_name(s_src), true);
+    player_status_set_queue(slot, n, player_mode_name(player_mode()), true);
     s_active = true;
     start_index(slot);
 }
@@ -944,7 +945,7 @@ static void play_song_meta(const sub_song_t *song)
     s_queue_gen++;
     int n = s_count;
     xSemaphoreGive(s_lock);
-    player_status_set_queue(slot, n, player_src_name(s_src), true);
+    player_status_set_queue(slot, n, player_mode_name(player_mode()), true);
     s_active = true;
     start_index(slot);
 }

@@ -136,6 +136,15 @@ esp_err_t subsonic_get_cover_rgb565(const char *cover_id, int size_px,
                                     uint8_t *out, size_t out_cap,
                                     uint16_t *w_out, uint16_t *h_out);
 
+/* ---- 按【完整 URL】取封面：QQ 音乐走这两个 ----
+ * QQ 的封面不在 Subsonic 服务器上，是 y.qq.com 直链（用 qqmusic_cover_url() 拼）。
+ * 和上面两个的区别只有"图片从哪来"，后面的限尺寸/验魔数/解码完全共用。 */
+esp_err_t subsonic_cover_raw_url(const char *url, int size_px,
+                                 uint8_t **out, size_t *len_out);
+esp_err_t subsonic_cover_rgb565_url(const char *url, int size_px,
+                                    uint8_t *out, size_t out_cap,
+                                    uint16_t *w_out, uint16_t *h_out);
+
 #ifdef __cplusplus
 }
 #endif

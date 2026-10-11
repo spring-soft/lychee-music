@@ -104,11 +104,13 @@ static void list_render(bool force)
         ui_anim_slide_obj(s_list_hl, LIST_Y0 + (s_list_sel - s_list_win) * LIST_ROW_H, 120);
     }
 
-    /* 顶栏：来源 + "3/30"（%.16s 限宽：GCC 会按 const char* 的最坏长度算截断，
-     * 不加会被 -Werror=format-truncation 拦下来） */
+    /* 顶栏：当前**模式** + "3/30"（%.16s 限宽：GCC 会按 const char* 的最坏长度算截断，
+     * 不加会被 -Werror=format-truncation 拦下来）
+     * ⚠️ 必须用 player_mode_name() 而不是 player_src_name() —— 后者只认 Navidrome 那三个，
+     *    切到 QQ 音乐后顶栏会显示成"最近播放"这类完全不相干的名字。 */
     char buf[64];
     if (count > 0) {
-        snprintf(buf, sizeof(buf), "%.16s %d/%d", player_src_name(player_source()),
+        snprintf(buf, sizeof(buf), "%.16s %d/%d", player_mode_name(player_mode()),
                  s_list_sel + 1, count);
     } else {
         snprintf(buf, sizeof(buf), "列表为空");
@@ -568,8 +570,9 @@ static void info_line(int i, char *buf, size_t len)
                      player_brightness());
             break;
         case 5:
-            snprintf(buf, len, "曲目  %d/%d  %s", st.queue_index + 1, st.queue_count,
-                     player_src_name(player_source()));
+            /* 同样要用"模式名"（QQ 后端下 player_src_name 会给出不相干的名字） */
+            snprintf(buf, len, "曲目  %d/%d  %.16s", st.queue_index + 1, st.queue_count,
+                     player_mode_name(player_mode()));
             break;
         case 6:
             snprintf(buf, len, "运行  %u时%u分  设置待存 %d",

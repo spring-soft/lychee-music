@@ -973,7 +973,17 @@ esp_err_t web_console_start(void)
     cfg.max_open_sockets   = 6;
     cfg.lru_purge_enable   = true;      /* 满了就踢最久没动的连接，别拒绝新请求 */
     cfg.stack_size         = 4096;
-    cfg.max_uri_handlers   = 32;
+    /* ⚠️ 这个数字**必须大于 uris[] 的项数**，而且要有余量。
+     *
+     * 血泪教训（2026-10-11 真机验证抓到）：这里原来是 32，而 uris[] 已经有 **33** 项 ——
+     * 超出的部分会**静默注册失败**，而且失败的是**数组末尾那几个**，不是新加的那个。
+     * 当时的症状是 `/api/hid`、`/api/hid/send`（蓝牙遥控）一直注册不上，
+     * 只在日志里留一行 `no slots left for registering handler`（W 级），
+     * 平时看启动日志很容易划过去。我加 `/api/back` 把它从"少 1 个"变成"少 2 个"才发现。
+     *
+     * 内存代价：每项只是一个指针（sizeof(httpd_uri_t*)），48 项 = 192 字节，可以忽略。
+     * 所以这里给足余量，宁可多留也别再踩一次。 */
+    cfg.max_uri_handlers   = 48;
     cfg.recv_wait_timeout  = 5;
     cfg.send_wait_timeout  = 5;
 

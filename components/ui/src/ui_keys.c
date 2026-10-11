@@ -125,15 +125,26 @@ static void key_short(int k)
                 case 0: player_next();   break;
                 case 1: player_toggle();  break;
                 case 2: player_prev();   break;
-                case 3: {                        /* 换来源（下一个），立刻播 */
-                    player_src_t nx = (player_src_t)((player_source() + 1) % PLAYER_SRC_COUNT);
-                    if (nx == PLAYER_SRC_RECENT && player_recent_count() == 0) {
-                        nx = (player_src_t)((nx + 1) % PLAYER_SRC_COUNT);   /* 还没播过任何歌 */
+                case 3: {                        /* 换「模式」（下一个），立刻播 */
+                    /* ⚠️⚠️ 这段原来是**写死 Navidrome 三个来源**的：
+                     *     `(player_source() + 1) % PLAYER_SRC_COUNT` + `player_src_name()`。
+                     *   切到 QQ 音乐后端后就全错了（用户实测报的"QQ 下切模式有问题"）：
+                     *     · QQ 有 **6 个**模式，它只在前 3 个里转 ——
+                     *       **永远切不到「新歌推荐 / 刷歌 / 雷达」**；
+                     *     · toast 显示的是 Navidrome 的名字，跟实际模式对不上（等于骗人）。
+                     *   现在一律走 player_mode_* —— 项数和名字都跟着后端走。 */
+                    int n = player_mode_count();
+                    if (n <= 0) break;
+                    int nx = (player_mode() + 1) % n;
+                    /* Navidrome 的"最近播放"在一首歌都没播过时是空的，跳过它 */
+                    if (player_back() == PLAYER_BACK_NAV
+                        && nx == PLAYER_SRC_RECENT && player_recent_count() == 0) {
+                        nx = (nx + 1) % n;
                     }
                     char buf[48];
-                    snprintf(buf, sizeof(buf), "来源: %s", player_src_name(nx));
+                    snprintf(buf, sizeof(buf), "模式: %.16s", player_mode_name(nx));
                     ui_toast(buf);
-                    player_set_source(nx, true);
+                    player_set_mode(nx, true);
                     break;
                 }
             }
