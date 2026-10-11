@@ -192,17 +192,35 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;bac
 .btn[disabled]{opacity:.5;pointer-events:none;}
 .hint{font-size:12px;color:var(--icon);line-height:1.5;margin-top:8px;word-break:break-all;}
 
-/* ---------- 来源选项卡 ---------- */
+/* ---------- 来源 / 模式 选项卡 ----------
+   两层结构，因为设备上现在是两个概念：
+     来源 = 从哪个服务来（Navidrome / QQ 音乐），只有两三个
+     模式 = 这个服务下的哪类曲目（最近播放… / 每日30首…），QQ 有 6 个
+   以前它们是同一个东西，所以视觉上必须能看出层级：
+   来源做成**小号胶囊**、模式是**大按钮**，中间一条虚线分段。 */
 .tabs{
-  display:flex;gap:6px;background:#fff;border:1px solid var(--line);
-  border-radius:10px;padding:4px;margin-bottom:10px;
+  display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+  background:#fff;border:1px solid var(--line);
+  border-radius:12px;padding:8px;margin-bottom:10px;
 }
+.tabs-lbl{font-size:11px;color:var(--icon);letter-spacing:.5px;padding-left:2px;}
+/* flex-basis:100% 强制换行，::after 画出那条虚线 —— 把"来源"和"模式"分开 */
+.tabs-sep{flex-basis:100%;height:0;margin:1px 0;}
+.tabs-sep::after{content:'';display:block;border-top:1px dashed var(--line);}
 .tab{
-  flex:1;min-height:40px;border-radius:8px;font-size:14px;color:var(--muted);
-  display:flex;align-items:center;justify-content:center;padding:0 4px;
+  min-height:34px;border-radius:9px;font-size:13px;color:var(--muted);
+  display:flex;align-items:center;justify-content:center;padding:0 12px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  transition:background .15s,color .15s;
 }
+.tab:active{background:var(--press);}
 .tab.on{background:var(--accent-bg);color:var(--accent);font-weight:600;}
+/* 来源：更小、更"胶囊"，一眼跟模式区分开 */
+.tab.back{
+  min-height:28px;font-size:12px;padding:0 10px;border-radius:999px;
+  background:#f2f3f5;color:var(--muted);font-weight:500;
+}
+.tab.back.on{background:var(--accent);color:#fff;}
 
 /* ---------- 列表 ---------- */
 .listhead{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted);margin-bottom:4px;}
@@ -746,8 +764,26 @@ function post(path, body, timeoutMs){
    ============================================================ */
 var PAGE  = 60;                 /* 单次最多渲染多少行 */
 var PAGE_N = 60;                /* 一次向设备要多少条（设备上限 64） */
-var SRC_NAME = { recent:'最近播放', starred:'我的收藏', random:'随机 30 首' };
-var RANDOM_NAME = '随机 30 首';  /* 必须与设备 player_src_name(PLAYER_SRC_RANDOM) 一致 */
+/* ============================================================
+   「来源」和「模式」都不再写死
+   ============================================================
+   设备上现在是两个概念（见 components/player/include/player.h）：
+     来源 = 从哪个**服务**来：Navidrome / QQ 音乐
+     模式 = 这个服务下的哪类**曲目**：
+            Navidrome 是"最近播放 / 我的收藏 / 随机30首"，
+            QQ 音乐是"收藏 / 每日30首 / 百万收藏 / 新歌推荐 / 刷歌 / 雷达"
+   模式**随后端而变**（项数和名字都不同），所以一律从 GET /api/sources 现取，
+   前端不再自己维护名字表 —— 以后服务端加模式，这个页面一行都不用改。
+
+   只保留一个判断：Navidrome 的前两个模式是"本地视图"（拉设备本地列表、不换台）。 */
+var LOCAL_VIEW_BACK = 0;        /* 0 = Navidrome */
+var LOCAL_VIEW_MAX  = 1;        /* Navidrome 的 0/1 两个模式属于本地视图 */
+
+function isLocalView(i){ return S.back === LOCAL_VIEW_BACK && i <= LOCAL_VIEW_MAX; }
+function modeName(i){
+  for(var k = 0; k < S.modes.length; k++) if(S.modes[k].i === i) return S.modes[k].name;
+  return '';
+}
 
 function newList(){
   return { kind:'', srcKey:'', items:[], total:0, shown:PAGE, els:null, loading:false, err:'' };
@@ -759,7 +795,9 @@ var S = {
   volHold:0, volTimer:null, brightHold:0, brightTimer:null,
   fails:0, stBusy:false, offT:null,
   tab:'play',                  /* play | songs | set */
-  src:'recent',                /* recent | starred | random */
+  src:0,                       /* 当前「模式」下标（清单来自 /api/sources） */
+  back:0, backName:'',         /* 当前「来源」（后端） */
+  modes:[], backs:[],          /* /api/sources 给的清单 */
   mode:'src',                  /* src | search */
   L:newList(), SR:newList(),
   starOv:{},                   /* 收藏乐观覆盖 */
@@ -982,13 +1020,16 @@ function paintRows(){
 }
 function syncHead(){
   var L = curL(), q = (S.status && S.status.queue) || {};
-  var nm = (S.mode === 'search') ? '搜索结果' : (SRC_NAME[S.src] || '列表');
-  if(S.mode === 'src' && S.src === 'random' && q.source && q.source !== RANDOM_NAME) nm += '（设备当前：' + q.source + '）';
+  var nm = (S.mode === 'search') ? '搜索结果' : (modeName(S.src) || '列表');
+  /* 列表内容和设备当前实际在放的那套对不上时，标一句 —— 否则用户会以为列表坏了。
+     本地视图（最近播放/我的收藏）本来就不等于设备队列，所以只在"需要设备换台"的模式下提示。 */
+  if(S.mode === 'src' && !isLocalView(S.src) && q.source && q.source !== modeName(S.src))
+    nm += '（设备当前：' + q.source + '）';
   $('list-title').textContent = nm;
   $('list-count').textContent = L.items.length
     ? (L.items.length + (L.items.length < L.total ? ' / ' + L.total : '') + ' 首') : '';
   /* 收藏页额外标一句同步状态（镜像没跟服务器对上时用户要能看出来） */
-  if(S.mode === 'src' && S.src === 'starred' && S.starNote){
+  if(S.mode === 'src' && isLocalView(S.src) && S.src === 1 && S.starNote){
     $('list-count').textContent += ' · ' + S.starNote;
   }
   $('list-refresh').hidden = (S.mode === 'search');
@@ -1007,7 +1048,7 @@ function loadQueuePage(L, mode){
     if(mode !== 'more') L.items = [];
     L.items = L.items.concat((d && d.items) || []);
     L.total = (d && typeof d.total === 'number') ? d.total : L.items.length;
-    L.kind = 'queue'; L.srcKey = 'random'; L.err = '';
+    L.kind = 'queue'; L.srcKey = S.src; L.err = '';
     renderList(mode !== 'reset');
   }, function(e){
     L.loading = false; L.err = e.message;
@@ -1024,89 +1065,153 @@ function loadMore(){
     renderList(true);
   }
 }
-/* 等设备真的把来源换过来（换来源要联网，几百毫秒），靠每秒的 status 判断，不额外打请求。
-   判据 = 来源名对上 且 队列内容 gen 变了（换成同一批歌 gen 也会变）。 */
-function waitSrc(name, cb){
+/* 等设备真的把模式换过来（换模式要联网，几百毫秒），靠每秒的 status 判断，不额外打请求。
+   判据 = 模式下标和来源都对上 且 队列内容 gen 变了（换成同一批歌 gen 也会变）。 */
+function waitSrc(i, cb){
   var g0 = (S.status && S.status.queue) ? S.status.queue.gen : null;
   var t0 = performance.now();
   S.waitQ = function(st){
     if(performance.now() - t0 > 15000) return true;
     var q = st.queue || {};
-    if(q.source !== name) return false;
+    if(q.mode !== i || q.back !== S.back) return false;
     return (g0 === null || q.gen !== g0);
   };
   S.waitCb = cb;
 }
-/* 来源列表：最近播放 / 我的收藏 是"只看不换台"，随机 30 首是设备上真换来源 + 起播。
-   force  = 不管当前是不是随机，都让设备重新抽 30 首（播放页那个按钮就是这个语义）
-   silent = 静默重拉（收藏镜像在后台变了时用）：**不清空列表**，只把行换成新的 ——
-            否则用户每点一次心形，整个列表会闪一下"正在加载…" */
-function fetchSrc(k, force, silent){
+/* 取某个「模式」的列表。i 是模式**下标**（清单来自 /api/sources）。
+ *
+ * 两类模式的处理方式不同：
+ *   · 本地视图（Navidrome 的"最近播放/我的收藏"）：拉设备本地的列表，**不动播放**
+ *     —— 用户只是想看看，不该把正在放的那首打断。
+ *   · 其余（Navidrome 的"随机30首" + **QQ 音乐的全部模式**）：让设备真换模式再读队列。
+ *     QQ 那些模式（每日30首/刷歌/雷达…）设备侧本来就要联网去拉，只能在设备上做。
+ *
+ *   force  = 不管设备当前是不是这个模式，都让它重新拉一遍
+ *            （"随机30首"就是靠它实现"再抽一批"；QQ 的"刷歌"同理）
+ *   silent = 静默重拉（收藏镜像在后台变了时用）：**不清空列表**，只把行换成新的 ——
+ *            否则用户每点一次心形，整个列表会闪一下"正在加载…" */
+function fetchSrc(i, force, silent){
   var L = S.L;
   if(L.loading) return;
-  if(k === 'random'){
-    if(!force && S.status && S.status.queue && S.status.queue.source === RANDOM_NAME){
-      loadQueuePage(L, 'reset');
-      return;
-    }
-    /* 先把旧列表清掉，免得"我的收藏"的行挂在"随机 30 首"下面 */
-    L.loading = true; L.items = []; L.total = 0; L.shown = PAGE; L.err = '';
-    L.kind = 'queue'; L.srcKey = 'random';
-    renderList(false);
-    waitSrc(RANDOM_NAME, function(){
-      L.loading = false;
-      /* 等设备的这几百毫秒里用户可能已经点了别的来源，那就去补那个列表，
-         否则会一直卡在"正在加载…"上 */
-      if(S.src === 'random' && S.mode === 'src') loadQueuePage(L, 'reset');
-      else if(S.src !== 'random') fetchSrc(S.src);
-    });
-    post('/api/source', {i:2, autoplay:true}, 20000).then(function(){
-      refreshStatus();          /* 早点让 status 反映新来源，waitQ 靠它判断 */
-    }, function(e){
-      S.waitQ = null; S.waitCb = null;
-      L.loading = false; L.err = e.message;
+
+  /* ---- 本地视图：只看不换台 ---- */
+  if(isLocalView(i)){
+    if(!silent){
+      L.loading = true; L.items = []; L.total = 0; L.shown = PAGE; L.err = '';
+      L.kind = 'src'; L.srcKey = i;
       renderList(false);
-      toast('切换失败：' + e.message, 'err');
+    }
+    api(i === 1 ? '/api/starred' : '/api/recent', {}, 15000).then(function(d){
+      L.loading = false;
+      L.items = (d && d.items) || [];
+      L.total = (d && typeof d.total === 'number') ? d.total : L.items.length;
+      if(i === 1 && !d.synced){
+        /* 设备上这份是本地镜像：synced=false = 还没跟服务器对上（没网 / 有操作没发出去）。
+           提示文案由 syncHead 统一维护，这里只是让它早点出现 */
+        S.starNote = d.pending ? '待同步 ' + d.pending + ' 条' : '未与服务器同步';
+      }
+      renderList(false);
+    }, function(e){
+      L.loading = false; L.items = []; L.total = 0; L.err = e.message;
+      renderList(false);
     });
     return;
   }
-  if(!silent){
-    L.loading = true; L.items = []; L.total = 0; L.shown = PAGE; L.err = '';
-    L.kind = k; L.srcKey = k;
-    renderList(false);
+
+  /* ---- 需要设备真换模式 ---- */
+  if(!force && S.status && S.status.queue &&
+     S.status.queue.mode === i && S.status.queue.back === S.back){
+    loadQueuePage(L, 'reset');
+    return;
   }
-  api(k === 'starred' ? '/api/starred' : '/api/recent', {}, 15000).then(function(d){
+  /* 先把旧列表清掉，免得"我的收藏"的行挂在新模式下面 */
+  L.loading = true; L.items = []; L.total = 0; L.shown = PAGE; L.err = '';
+  L.kind = 'queue'; L.srcKey = i;
+  renderList(false);
+  waitSrc(i, function(){
     L.loading = false;
-    L.items = (d && d.items) || [];
-    L.total = (d && typeof d.total === 'number') ? d.total : L.items.length;
-    if(k === 'starred' && !d.synced){
-      /* 设备上这份是本地镜像：synced=false = 还没跟服务器对上（没网 / 有操作没发出去）。
-         提示文案由 applyStatus 统一维护，这里只是让它早点出现 */
-      S.starNote = d.pending ? '待同步 ' + d.pending + ' 条' : '未与服务器同步';
-    }
-    renderList(false);
+    /* 等设备的这几百毫秒里用户可能已经点了别的模式，那就去补那个列表，
+       否则会一直卡在"正在加载…"上 */
+    if(S.src === i && S.mode === 'src') loadQueuePage(L, 'reset');
+    else if(S.src !== i) fetchSrc(S.src, false, false);
+  });
+  post('/api/source', {i:i, autoplay:true}, 20000).then(function(){
+    refreshStatus();          /* 早点让 status 反映新模式，waitQ 靠它判断 */
   }, function(e){
-    L.loading = false; L.items = []; L.total = 0; L.err = e.message;
+    S.waitQ = null; S.waitCb = null;
+    L.loading = false; L.err = e.message;
     renderList(false);
+    toast('切换失败：' + e.message, 'err');
   });
 }
 function renderSrcTabs(){
-  var ks = ['recent','starred','random'], html = '';
-  for(var i = 0; i < ks.length; i++){
-    html += '<button type="button" class="tab' + (S.src === ks[i] ? ' on' : '') +
-            '" data-src="' + ks[i] + '">' + SRC_NAME[ks[i]] + '</button>';
+  var html = '';
+  /* ---- 第一行：来源（后端）----
+   * 只有两三个，用一个小标签隔开，跟下面的"模式"区分清楚 ——
+   * 这两个概念以前是一个，图标/文字上必须让人一眼看出层级。 */
+  if(S.backs.length){
+    html += '<span class="tabs-lbl">来源</span>';
+    for(var b = 0; b < S.backs.length; b++){
+      var bk = S.backs[b];
+      html += '<button type="button" class="tab back' + (S.back === bk.i ? ' on' : '') +
+              '" data-back="' + bk.i + '">' + esc(bk.name) + '</button>';
+    }
+    html += '<span class="tabs-sep"></span>';
+  }
+  /* ---- 第二行：模式（项数和名字都由设备给，前端不写死）---- */
+  for(var i = 0; i < S.modes.length; i++){
+    var it = S.modes[i];
+    html += '<button type="button" class="tab' + (S.src === it.i ? ' on' : '') +
+            '" data-src="' + it.i + '">' + esc(it.name) + '</button>';
   }
   $('tabs').innerHTML = html;
 }
-function pickSrc(k){
-  if(!SRC_NAME[k]) return;
-  var changed = (S.src !== k);
-  S.src = k;
+function pickSrc(i){
+  i = Number(i);
+  var changed = (S.src !== i);
+  S.src = i;
   S.mode = 'src';
   clearSearch();
   renderSrcTabs();
-  if(changed || !S.L.items.length) fetchSrc(k);
+  if(changed || !S.L.items.length) fetchSrc(i, false, false);
   else renderList(false);
+}
+
+/* 切「来源」= 切后端。
+   ⚠️ **不一定成功**（Navidrome 没配、QQ 服务连不上都会失败，设备那边会回退状态），
+   所以这里只负责"下发 + 等 status 回来"，成功与否由 status 的 back 字段说了算。
+   切成功后模式清单整个会变（QQ 6 个 / Navidrome 3 个），所以必须重拉。 */
+function pickBack(b){
+  b = Number(b);
+  if(isNaN(b) || b === S.back) return;
+  toast('正在切换来源…', '');
+  post('/api/back', {i:b, autoplay:true}, 20000).then(function(){
+    refreshStatus();
+    /* 换后端设备要联网拉歌，慢的话一两秒 —— 稍等一下再拉新的模式清单，
+       否则会拿到旧后端的模式，界面闪一下又变 */
+    setTimeout(function(){ fetchSources(function(){ fetchSrc(S.src, true, false); }); }, 1500);
+  }, function(e){
+    toast('切换失败：' + e.message, 'err');
+  });
+}
+
+/* 从设备拉「来源 + 模式」清单。
+   清单是**设备说了算**的：它才真正知道当前后端下有哪些模式。
+   ⚠️ 老固件没有 backs 字段 —— 那就只显示模式行、不显示来源行，不至于白屏。 */
+function fetchSources(cb){
+  api('/api/sources', {}, 15000).then(function(d){
+    d = d || {};
+    S.backs = d.backs || [];
+    S.modes = d.items || [];
+    if(typeof d.back === 'number') S.back = d.back;
+    S.backName = d.back_name || '';
+    if(typeof d.current === 'number') S.src = d.current;
+    renderSrcTabs();
+    if(cb) cb();
+  }, function(e){
+    toast('来源清单加载失败：' + e.message, 'err');
+    if(cb) cb();
+  });
 }
 
 /* ============================================================
@@ -1179,6 +1284,11 @@ function applyStatus(st){
   S.status = st;
 
   var q = st.queue || {};
+  /* 设备那边的「来源」变了（在屏幕上切的、或别的手机切的）→ 模式清单也整个变了，重拉一次。
+     判据就是 status.queue.back；fetchSources 会把 S.back/S.src 同步成设备当前的真实值。 */
+  if(typeof q.back === 'number' && q.back !== S.back){
+    fetchSources(function(){ if(S.mode === 'src') fetchSrc(S.src, false, false); });
+  }
   $('hdr-sub').textContent = (STATE_TXT[st.state] || '空闲') + (q.source ? ' · ' + q.source : '');
   $('hdr-dot').className = 'dot ok';
 
@@ -1194,8 +1304,8 @@ function applyStatus(st){
      正在看"我的收藏"就静默重拉一次，用户不用手动刷。 */
   var sst = st.starred;
   if(sst && typeof sst.gen === 'number'){
-    if(S.starGen !== null && sst.gen !== S.starGen && S.src === 'starred' && S.mode === 'src'){
-      fetchSrc('starred', true, true);
+    if(S.starGen !== null && sst.gen !== S.starGen && isLocalView(S.src) && S.src === 1 && S.mode === 'src'){
+      fetchSrc(1, true, true);
     }
     S.starGen = sst.gen;
     S.starNote = sst.synced ? ''
@@ -1370,7 +1480,7 @@ function toggleMute(){
   });
 }
 /* 注：播放页原来那个全宽「随机 30 首」按钮按需求去掉了。
-   随机来源还在「歌曲」Tab 的来源选项卡里（pickSrc('random')）。 */
+   随机来源还在「歌曲」Tab 的模式选项卡里（pickSrc(2)）。 */
 
 /* ============================================================
    8. 进度条：内插 + 拖动 / 点击
@@ -2052,7 +2162,9 @@ function bindEvents(){
   /* 来源选项卡 + 列表（事件委托，整个列表只挂一个监听器） */
   $('tabs').addEventListener('click', function(ev){
     var b = ev.target.closest ? ev.target.closest('[data-src]') : null;
-    if(b) pickSrc(b.getAttribute('data-src'));
+    if(b){ pickSrc(b.getAttribute('data-src')); return; }
+    var bk = ev.target.closest ? ev.target.closest('[data-back]') : null;
+    if(bk) pickBack(bk.getAttribute('data-back'));
   });
   $('list').addEventListener('click', function(ev){
     var t = ev.target;
@@ -2165,9 +2277,11 @@ function init(){
   bindEvents();
   drawProgress();
 
-  /* 首屏：状态 + 第一份列表（来源默认「最近播放」——它不改设备来源，最安全） */
+  /* 首屏：先问设备"有哪些来源/模式"，再拉第一份列表。
+     ★ 顺序不能反：模式清单是设备给的，不先拿到就不知道该拉哪个列表
+       （而且默认模式可能是 QQ 的，那就得让设备去联网拉歌）。 */
   refreshStatus();
-  fetchSrc(S.src);
+  fetchSources(function(){ fetchSrc(S.src, false, false); });
 
   /* 进度条内插：150ms 一次，只改两个 style；歌词高亮跟着同一个插值走，
      但只有行号变了才碰 DOM（行号没变时 lyrTick 立刻 return）。 */
