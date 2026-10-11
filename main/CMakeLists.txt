@@ -7,6 +7,7 @@ idf_component_register(
         audio_engine
         net_mgr
         subsonic
+        qqmusic
         player
         settings
         store

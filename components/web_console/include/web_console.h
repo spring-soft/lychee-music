@@ -24,6 +24,11 @@ extern "C" {
  * 因为它要读这些模块的状态。 */
 esp_err_t web_console_start(void);
 
+/* ★ 尽早调用（app_main 最开始）—— 把 esp_log 的输出抄一份进 PSRAM 环形缓冲，
+ * 之后 GET /api/log?since=N 就能拉到（设备平时独立供电、不接电脑，没串口等于瞎了）。
+ * ⚠️ 放在最前面是为了把**开机全过程**都录下来，而不是只录网络起来之后的。 */
+void web_log_init(void);
+
 #ifdef __cplusplus
 }
 #endif

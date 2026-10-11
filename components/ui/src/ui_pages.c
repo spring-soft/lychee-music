@@ -17,13 +17,13 @@
 #include "esp_timer.h"
 #include "ui.h"
 #include "ui_internal.h"
-#include "musiclib.h"
 #include "assets.h"
 #include "player.h"
 #include "app_core.h"
 #include "audio_engine.h"
 #include "board.h"
 #include "net_mgr.h"
+#include "store.h"        /* 清空缓存：store_evict / store_free_kb */
 #include "settings.h"
 #include "hid_remote.h"
 #include "esp_log.h"
@@ -105,11 +105,13 @@ static void list_render(bool force)
         ui_anim_slide_obj(s_list_hl, LIST_Y0 + (s_list_sel - s_list_win) * LIST_ROW_H, 120);
     }
 
-    /* 顶栏：来源 + "3/30"（%.16s 限宽：GCC 会按 const char* 的最坏长度算截断，
-     * 不加会被 -Werror=format-truncation 拦下来） */
+    /* 顶栏：当前**模式** + "3/30"（%.16s 限宽：GCC 会按 const char* 的最坏长度算截断，
+     * 不加会被 -Werror=format-truncation 拦下来）
+     * ⚠️ 必须用 player_mode_name() 而不是 player_src_name() —— 后者只认 Navidrome 那三个，
+     *    切到 QQ 音乐后顶栏会显示成"最近播放"这类完全不相干的名字。 */
     char buf[64];
     if (count > 0) {
-        snprintf(buf, sizeof(buf), "%.16s %d/%d", player_src_name(player_source()),
+        snprintf(buf, sizeof(buf), "%.16s %d/%d", player_mode_name(player_mode()),
                  s_list_sel + 1, count);
     } else {
         snprintf(buf, sizeof(buf), "列表为空");
@@ -175,10 +177,9 @@ static void build_list_screen(void)
 #define MENU_ROWS  6                       /* 屏上能放 6 行 */
 #define MENU_ROW_H 17
 #define MENU_Y0    22                      /* 对应 bg_menu 的 TOPBAR_H + 2 */
-/* 菜单总项数。屏上正好 6 行（MENU_ROWS），所以这 6 项一屏放满、不滚动。
- * 2026-10-01 简化：删掉"音质"（固定用最高）、删掉"蓝牙控制"（BLE 已编掉）。
- * 2026-10-06 新增"模式: 在线/离线"，插在"设置"上面（用户指定），
- *            原来的"设置"/"系统信息"顺延到第 5/6 项。 */
+/* 菜单总项数。2026-10-01 用户要求简化：删掉"音质"（固定用最高）、删掉"蓝牙控制"（BLE 已编掉）。
+ * ★ 2026-10-11 用户要求：把空着的那一行用起来 —— 新增「来源」，原来那行「来源」改名「模式」。
+ *   现在正好 6 项，一屏 MENU_ROWS=6 行放满，不用滚动。 */
 #define MENU_N     6
 
 static lv_obj_t *s_scr_menu;
@@ -188,37 +189,27 @@ static int       s_menu_sel;
 static int       s_menu_r_sel = -1;
 static int       s_menu_win;
 static bool      s_menu_dirty = true;
-/* "模式"那一项正停在"再按一次才真切"的确认态（两段式，和设置页的重连 WiFi 同款）。
- * 一移动光标就取消 —— 手一抖移开还保持着确认态更危险。 */
-static bool      s_menu_confirm_mode;
 
 static const char *menu_name(int i)
 {
-    /* 动态文本的公共缓冲：调用方（menu_render）拿到返回值就立刻 ui_set_text 拷走，
-     * 所以几个动态项共用一份是安全的。 */
-    static char s_menu_dyn_lbl[48];
+    /* 「模式」和「来源」两行的文字是动态的，文本放在这两个静态缓冲里 */
+    static char s_menu_mode_lbl[48];
+    static char s_menu_back_lbl[48];
     switch (i) {
-        /* ★ 来源只占【一项】，冒号后面直接显示当前来源；
-         *   按 K3 进二级菜单选（K1/K2 选、K3 确定退出）。 */
+        /* ★ 两个概念分开，就不打架了：
+         *     来源 = 音乐从哪个**服务**来（Navidrome / QQ 音乐）
+         *     模式 = 这个服务下的哪一类**曲目**（最近播放… / 每日30首…）
+         *   原来只有"来源"一项，切的是后者 —— 名不副实，所以改名。 */
         case 0:
-            snprintf(s_menu_dyn_lbl, sizeof(s_menu_dyn_lbl), "来源: %s",
-                     player_src_name(player_source()));
-            return s_menu_dyn_lbl;
-        case 1: return "搜索";                 /* ★ 取代原来的"播放 / 暂停" */
-        case 2: return "屏幕亮度";
-        /* ★ 模式切换：两段确认。
-         * ⚠️ 文案必须短：菜单行可用宽 136px、12px 字，
-         *    "模式: 离线？再按K3确认" 会被 ui_put_label_1line 截掉"确认"两个字，
-         *    所以确认态换成"切到离线？再按K3"（约 92px）。 */
-        case 3:
-            if (s_menu_confirm_mode) {
-                snprintf(s_menu_dyn_lbl, sizeof(s_menu_dyn_lbl), "切到%s？再按K3",
-                         (player_mode() == PLAYER_MODE_ONLINE) ? "离线" : "在线");
-            } else {
-                snprintf(s_menu_dyn_lbl, sizeof(s_menu_dyn_lbl), "模式: %s",
-                         player_mode_name());
-            }
-            return s_menu_dyn_lbl;
+            snprintf(s_menu_mode_lbl, sizeof(s_menu_mode_lbl), "模式: %s",
+                     player_mode_name(player_mode()));
+            return s_menu_mode_lbl;
+        case 1:
+            snprintf(s_menu_back_lbl, sizeof(s_menu_back_lbl), "来源: %s",
+                     player_back_name(player_back()));
+            return s_menu_back_lbl;
+        case 2: return "搜索";
+        case 3: return "屏幕亮度";
         /* ★ 2026-10-01：这里原来是"重连 WiFi"，用户要求换成"设置"，
          *   重连挪进设置二级菜单（并且在那边加了二次确认）。 */
         case 4: return "设置";
@@ -229,21 +220,20 @@ static const char *menu_name(int i)
 
 static void menu_render(void)
 {
-    /* "来源"和"模式"这两行是动态的，任一变（含模式确认态）就把菜单标脏；
-     * 否则要等到用户翻页才刷新 —— 用户会以为"换了但屏幕上没反应"。 */
+    /* 「模式」和「来源」两行都是动态的。任一变就把菜单标脏，否则要等到用户翻页才刷新
+     * —— 用户会以为"换了来源但屏幕上没反应"。 */
     {
-        static char prev[80];
-        char now[80];
-        snprintf(now, sizeof(now), "%s|%s|%d",
-                 player_src_name(player_source()), player_mode_name(),
-                 s_menu_confirm_mode ? 1 : 0);
+        static char prev[128];
+        char now[128];
+        snprintf(now, sizeof(now), "%s|%s",
+                 player_back_name(player_back()), player_mode_name(player_mode()));
         if (strcmp(now, prev) != 0) {
             strlcpy(prev, now, sizeof(prev));
             s_menu_dirty = true;
         }
     }
 
-    /* 窗口跟随选中项（MENU_N=6 正好一屏，这里只是保底逻辑不生效） */
+    /* 窗口跟随选中项（菜单 8 项、屏上 6 行，滚到最后一项时窗口下移一行） */
     int top = s_menu_win;
     if (s_menu_sel < top) top = s_menu_sel;
     if (s_menu_sel >= top + MENU_ROWS) top = s_menu_sel - MENU_ROWS + 1;
@@ -285,6 +275,7 @@ ui_page_t ui_page_parent(ui_page_t p)
     switch (p) {
         case UI_PAGE_MENU:        return UI_PAGE_PLAY;
         case UI_PAGE_SRC:         return UI_PAGE_MENU;
+        case UI_PAGE_BACK:        return UI_PAGE_MENU;   /* 来源二级菜单的上一级也是主菜单 */
         case UI_PAGE_SETTINGS:    return UI_PAGE_MENU;   /* 设置页的上一级 = 菜单 */
         case UI_PAGE_SEARCH_MODE: return UI_PAGE_MENU;
         case UI_PAGE_SEARCH_IN:   return UI_PAGE_SEARCH_MODE;   /* 用户要的：回输入页要先过方式选择 */
@@ -298,26 +289,43 @@ ui_page_t ui_page_parent(ui_page_t p)
     }
 }
 
-/* ============================================================ 来源二级菜单
+/* ============================================================ 「模式」二级菜单
  *
- * 用户要求：主菜单里"来源"只占一项（冒号后面显示当前来源），
+ * 2026-10-11 改名 + 改成动态：
+ *   · 这一页原来叫"来源"，但它切的是"最近播放 / 我的收藏 / 随机30首" —— 那是**模式**。
+ *     真正的"来源"（Navidrome / QQ 音乐）是主菜单新加的那一行。
+ *   · 项数和文字现在**随后端动态变**（QQ 6 个 / Navidrome 3 个），
+ *     所以不再写死项数，一律用 player_mode_count()/player_mode_name() 现取。
+ *     → 以后服务端加模式（改 qqmusic 的 k_modes 表）时，**UI 一行都不用改**。
+ *
+ * 用户要求：主菜单里"模式"只占一项（冒号后面显示当前模式），
  * 按 K3 进这一页，K1/K2 选、K3 确定并退出、K4 返回。
  * 底图/高亮条直接复用菜单页的（同一套视觉，不额外做素材）。
  */
-#define SRC_N  3
+#define MODE_MAX  MENU_ROWS          /* 一屏就 6 行 —— QQ 的模式数正好也是 6 */
 
-static lv_obj_t *s_scr_src, *s_src_hl, *s_src_lbl[SRC_N];
+static lv_obj_t *s_scr_src, *s_src_hl, *s_src_lbl[MODE_MAX];
 static int       s_src_sel;
 static int       s_src_r_sel = -1;
 
 static void src_render(void)
 {
-    for (int i = 0; i < SRC_N; i++) {
+    int n = player_mode_count();
+    if (n > MODE_MAX) {
+        /* 一屏放不下就先截断（当前两边都不会触发：QQ 6 个、Navidrome 3 个）。
+         * 真要更多模式，这页得加滚动 —— 但别默默藏掉，至少日志里说一声。 */
+        ESP_LOGW(TAG, "模式有 %d 个，一屏只显示 %d 个", n, MODE_MAX);
+        n = MODE_MAX;
+    }
+    for (int i = 0; i < MODE_MAX; i++) {
+        if (i >= n) { ui_set_text(s_src_lbl[i], ""); continue; }   /* 用不到的行清空 */
         char buf[48];
-        bool cur = (player_source() == (player_src_t)i);
-        bool empty = (i == PLAYER_SRC_RECENT && player_recent_count() == 0);
-        /* 标出"现在是哪个"，来源为空也标出来 —— 不然用户会奇怪为什么选了没反应 */
-        snprintf(buf, sizeof(buf), "%s%s%s", player_src_name((player_src_t)i),
+        bool cur = (player_mode() == i);
+        /* "（空）"只对 Navidrome 的"最近播放"有意义：一首歌都没听过时提醒一下，
+         * 不然用户会奇怪"选了怎么没反应"。QQ 的模式都由服务端给，不存在空。 */
+        bool empty = (player_back() == PLAYER_BACK_NAV && i == PLAYER_SRC_RECENT
+                      && player_recent_count() == 0);
+        snprintf(buf, sizeof(buf), "%s%s%s", player_mode_name(i),
                  cur ? "（当前）" : "", empty ? "（空）" : "");
         ui_set_text(s_src_lbl[i], buf);
     }
@@ -336,38 +344,109 @@ static void build_src_screen(void)
 
     ui_put_img(scr, ASSET_BG_MENU, 0, 0);
     ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
-    ui_put_label_1line(scr, "来源", 20, 2, 134, ui_font_16, 0x1C1C1E);
+    ui_put_label_1line(scr, "模式", 20, 2, 134, ui_font_16, 0x1C1C1E);
 
     s_src_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
-    for (int i = 0; i < SRC_N; i++) {
+    for (int i = 0; i < MODE_MAX; i++) {
         s_src_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
                                          136, ui_font_12, 0x1C1C1E);
     }
-    ESP_LOGI(TAG, "来源二级菜单已建好（%d 项：K1/K2 选、K3 确定、K4 返回）", SRC_N);
+    ESP_LOGI(TAG, "模式二级菜单已建好（最多 %d 项：K1/K2 选、K3 确定、K4 返回）", MODE_MAX);
 }
 
 void ui_srcmenu_open(void)
 {
-    /* 光标默认停在【当前来源】上，用户一进来就知道自己在哪 */
-    s_src_sel = (int)player_source();
-    if (s_src_sel < 0 || s_src_sel >= SRC_N) s_src_sel = 0;
+    /* 光标默认停在【当前模式】上，用户一进来就知道自己在哪 */
+    s_src_sel = player_mode();
+    if (s_src_sel < 0 || s_src_sel >= player_mode_count()) s_src_sel = 0;
     s_src_r_sel = -1;
     ui_page_show(UI_PAGE_SRC);
 }
 
 void ui_srcmenu_move(int delta)
 {
-    s_src_sel = (s_src_sel + delta + SRC_N) % SRC_N;
+    int n = player_mode_count();
+    if (n <= 0) return;
+    s_src_sel = (s_src_sel + delta + n) % n;
 }
 
 void ui_srcmenu_activate(void)
 {
     char buf[48];
-    snprintf(buf, sizeof(buf), "正在获取: %.16s", player_src_name((player_src_t)s_src_sel));
+    snprintf(buf, sizeof(buf), "正在获取: %.16s", player_mode_name(s_src_sel));
     ui_toast(buf);
-    player_set_source((player_src_t)s_src_sel, true);   /* 立刻播第一首 */
-    s_menu_dirty = true;      /* 主菜单那行"来源: X"要跟着变 */
-    ui_page_show(UI_PAGE_MENU);                          /* 确定并退出（回上级菜单） */
+    player_set_mode(s_src_sel, true);     /* 立刻播第一首 */
+    s_menu_dirty = true;                  /* 主菜单那行"模式: X"要跟着变 */
+    ui_page_show(UI_PAGE_MENU);           /* 确定并退出（回上级菜单） */
+}
+
+/* ============================================================ 「来源」二级菜单（切后端）
+ *
+ * 2026-10-11 新增。只有两项：Navidrome / QQ 音乐。
+ * ⚠️ 切过去**不一定成功**（Navidrome 没配、QQ 服务连不上都会失败）——
+ *    player 那边会回退状态、队列不动，所以提示语用"正在切换"而不是"已切换到"，
+ *    别让用户在失败时以为切成功了。
+ */
+#define BACK_N  ((int)PLAYER_BACK_COUNT)
+
+static lv_obj_t *s_scr_back, *s_back_hl, *s_back_lbl[BACK_N];
+static int       s_back_sel;
+static int       s_back_r_sel = -1;
+
+static void back_render(void)
+{
+    for (int i = 0; i < BACK_N; i++) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%s%s", player_back_name((player_back_t)i),
+                 (player_back() == (player_back_t)i) ? "（当前）" : "");
+        ui_set_text(s_back_lbl[i], buf);
+    }
+    int y = MENU_Y0 + s_back_sel * MENU_ROW_H;
+    if (s_back_r_sel < 0 || lv_obj_get_y(s_back_hl) != y) {
+        ui_anim_slide_obj(s_back_hl, y, 120);
+    }
+    s_back_r_sel = s_back_sel;
+}
+
+static void build_back_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    s_scr_back = scr;
+    ui_page_register(UI_PAGE_BACK, scr);
+
+    ui_put_img(scr, ASSET_BG_MENU, 0, 0);
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    ui_put_label_1line(scr, "来源", 20, 2, 134, ui_font_16, 0x1C1C1E);
+
+    s_back_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
+    for (int i = 0; i < BACK_N; i++) {
+        s_back_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
+                                           136, ui_font_12, 0x1C1C1E);
+    }
+    ESP_LOGI(TAG, "来源二级菜单已建好（%d 项）", BACK_N);
+}
+
+void ui_backmenu_open(void)
+{
+    s_back_sel = (int)player_back();
+    if (s_back_sel < 0 || s_back_sel >= BACK_N) s_back_sel = 0;
+    s_back_r_sel = -1;
+    ui_page_show(UI_PAGE_BACK);
+}
+
+void ui_backmenu_move(int delta)
+{
+    s_back_sel = (s_back_sel + delta + BACK_N) % BACK_N;
+}
+
+void ui_backmenu_activate(void)
+{
+    char buf[48];
+    snprintf(buf, sizeof(buf), "正在切换: %.16s", player_back_name((player_back_t)s_back_sel));
+    ui_toast(buf);
+    player_set_back((player_back_t)s_back_sel, true);   /* 换了后端就重建队列并起播 */
+    s_menu_dirty = true;      /* 主菜单那两行（来源/模式）都要跟着变 */
+    ui_page_show(UI_PAGE_MENU);
 }
 
 /* ============================================================ 设置二级菜单
@@ -378,59 +457,43 @@ void ui_srcmenu_activate(void)
  * 重连为什么要二次确认：重连会把当前连接掐掉、正在放的歌会中断。原来它直接摆在
  * 主菜单里按一下就执行，往上翻菜单很容易误触。现在第一次按 K3 只是把这一行变成
  * "重连 WiFi？再按K3确认"，再按一次才真的动网络，K4 随时退出。
- *
- * 2026-10-06 加第 2 项，内容按模式变：
- *   在线模式 →「同步收藏到离线」
- *   离线模式 →「扫描 TF 卡」
- * ⚠️ 确认态从"一个 bool"改成"记哪一项在确认"（s_set_confirm_sel）：
- *    加到两项之后，一个 bool 会让"在第 1 项确认完、移到第 2 项"带着确认态。
  */
-#define SET_N  2
+#define SET_N  3
 
 static lv_obj_t *s_scr_set, *s_set_hl, *s_set_lbl[SET_N];
 static int       s_set_sel;
 static int       s_set_r_sel = -1;
-static int       s_set_confirm_sel = -1;   /* -1 = 没在任何确认态 */
+static bool      s_set_confirm;      /* true = 正停在某一项的确认态 */
+/* 扫描 TF 卡的进度显示：只在"上一次 tick 还在扫"时才算进度，
+ * 并负责在扫完的那一次弹结果（不这样的话 toast 会在扫描期间被反复覆盖）。 */
+static bool      s_tf_was_busy;
 
 static void set_render(void)
 {
     /* 确认态下把提示直接写在行里 —— 这个屏幕上没有独立的弹窗层，
-     * 复用同一行最省事，也不会盖住别的东西。
-     * ⚠️ 行宽只有 136px（12px 字）：「同步收藏到离线？再按K3确认」约 158px
-     *    会被截掉"确认"，所以确认态换成更短的「同步到离线？再按K3确认」（约 134px）。 */
-    for (int i = 0; i < SET_N; i++) {
-        char buf[48];
-        bool cf = (s_set_confirm_sel == i);
-        if (i == 0) {
-            snprintf(buf, sizeof(buf), "重连 WiFi%s", cf ? "？再按K3确认" : "");
-        } else if (player_mode() == PLAYER_MODE_OFFLINE) {
-            /* 扫描进度直接写进这一行（屏幕没有弹窗层）。
-             * ⚠️ 别用 "…"：那个字符本字体画不出来（开机自检会报），用空格代替。 */
-            if (musiclib_scan_busy()) {
-                snprintf(buf, sizeof(buf), "扫描中 %d 首", musiclib_scan_found());
-            } else if (cf) {
-                snprintf(buf, sizeof(buf), "扫描 TF 卡？再按K3确认");
-            } else {
-                int n = musiclib_count();
-                if (n > 0) snprintf(buf, sizeof(buf), "扫描 TF 卡（%d 首）", n);
-                else       snprintf(buf, sizeof(buf), "扫描 TF 卡");
-            }
-        } else {
-            if (player_sync_offline_busy()) {
-                snprintf(buf, sizeof(buf), "同步中");
-            } else if (cf) {
-                snprintf(buf, sizeof(buf), "同步到离线？再按K3确认");
-            } else if (player_sync_offline_done()) {
-                /* 把上次结果留在行里，用户回设置页还能看到 */
-                snprintf(buf, sizeof(buf), "上次同步 %d/%d",
-                         player_sync_offline_synced(),
-                         player_sync_offline_synced() + player_sync_offline_skipped());
-            } else {
-                snprintf(buf, sizeof(buf), "同步收藏到离线");
-            }
-        }
-        ui_set_text(s_set_lbl[i], buf);
+     * 复用同一行最省事，也不会盖住别的东西。 */
+    char buf[48];
+    snprintf(buf, sizeof(buf), "重连 WiFi%s",
+             (s_set_confirm && s_set_sel == 0) ? "？再按K3确认" : "");
+    ui_set_text(s_set_lbl[0], buf);
+    /* 清空缓存：清掉封面缓存（可再生）。加在设置里是因为它属于"偶尔要清一下"
+     * 的维护动作，不配占用主菜单一行。 */
+    snprintf(buf, sizeof(buf), "清空缓存%s",
+             (s_set_confirm && s_set_sel == 1) ? "？再按K3确认" : "");
+    ui_set_text(s_set_lbl[1], buf);
+
+    /* 扫描 TF 卡：曲库索引同样是可再生的（重扫一次就有）。
+     * 往卡里拷了新歌、或者换了卡，都要跑一次才看得见。
+     * 扫描进行中时这一行直接当进度条用（见 set_tick）。 */
+    if (s_tf_was_busy) {
+        int sc = 0, fd = 0;
+        player_tf_scan_progress(&sc, &fd);
+        snprintf(buf, sizeof(buf), "扫描中 %d/%d", fd, sc);
+    } else {
+        snprintf(buf, sizeof(buf), "扫描 TF 卡%s",
+                 (s_set_confirm && s_set_sel == 2) ? "？再按K3确认" : "");
     }
+    ui_set_text(s_set_lbl[2], buf);
 
     int y = MENU_Y0 + s_set_sel * MENU_ROW_H;
     if (s_set_r_sel < 0 || lv_obj_get_y(s_set_hl) != y) {
@@ -459,63 +522,91 @@ static void build_set_screen(void)
 
 void ui_setmenu_open(void)
 {
-    s_set_sel         = 0;
-    s_set_r_sel       = -1;
-    s_set_confirm_sel = -1;     /* 每次进来都从"没在确认"开始 */
+    s_set_sel     = 0;
+    s_set_r_sel   = -1;
+    s_set_confirm = false;      /* 每次进来都从"没在确认"开始 */
     set_render();
     ui_page_show(UI_PAGE_SETTINGS);
 }
 
 void ui_setmenu_move(int delta)
 {
-    if (s_set_confirm_sel >= 0) return;  /* 确认态下锁住移动：手一抖移开就取消了，反而更迷惑 */
+    if (s_set_confirm) return;  /* 确认态下锁住移动：手一抖移开就取消了，反而更迷惑 */
     s_set_sel = (s_set_sel + delta + SET_N) % SET_N;
     set_render();
 }
 
 void ui_setmenu_activate(void)
 {
-    /* 第一段：进入确认态（两项共用这套交互） */
-    if (s_set_confirm_sel != s_set_sel) {
-        s_set_confirm_sel = s_set_sel;
-        if (s_set_sel == 0) {
-            ui_toast("再按 K3 确认重连");
-        } else if (player_mode() == PLAYER_MODE_OFFLINE) {
-            ui_toast("再按 K3 开始扫描");
-        } else {
-            ui_toast("再按 K3 开始同步");
-        }
+    /* 两段式：第一次按 K3 只是"进入确认态"，再按一次才真的执行。
+     * 这两项都有副作用（断网 / 删文件），不该一按就中。 */
+    if (!s_set_confirm) {
+        s_set_confirm = true;
+        ui_toast(s_set_sel == 0 ? "再按 K3 确认重连" :
+                 s_set_sel == 1 ? "再按 K3 确认清空" : "再按 K3 确认扫描");
         set_render();
         return;
     }
+    s_set_confirm = false;
 
-    /* 第二段：真动作 */
-    s_set_confirm_sel = -1;
-
-    if (s_set_sel == 0) {                       /* 重连 WiFi */
+    if (s_set_sel == 0) {
         net_mgr_reconnect();
         ui_toast("正在重连 WiFi...");
-        ui_page_show(UI_PAGE_MENU);             /* 确认后退出，让它自己去连 */
+    } else if (s_set_sel == 1) {
+        /* ★ 只清**封面缓存**：它是纯粹的可再生数据（下次看到那首歌会自动重新下载）。
+         *   最近播放 / 收藏镜像**不清** —— 那里面有用户的东西，清掉会莫名其妙。 */
+        uint64_t before = store_free_kb();
+        int n = store_evict("COVER", 0);        /* keep=0 = 全删 */
+        uint64_t after = store_free_kb();
+        char t[48];
+        snprintf(t, sizeof(t), "清了 %d 个封面，释放 %u KB", n, (unsigned)(after - before));
+        ui_toast(t);
+        ESP_LOGW(TAG, "清空封面缓存：删 %d 个，%u KB → %u KB 可用",
+                 n, (unsigned)before, (unsigned)after);
+        /* 内存里还留着"这些封面取不到"的黑名单 —— 不清掉的话，
+         * 清完缓存那些歌**依然不会重新去取**，等于白清。 */
+        ui_cover_cache_cleared();
+    } else {
+        /* ★ 扫描 TF 卡：**不在这里等** —— player_tf_scan() 只是往 player 命令队列里
+         *   塞一条命令，真正的扫描在 player 任务里跑（几百毫秒到几秒）。
+         *   进度由 set_tick() 显示，完成后由它弹结果。 */
+        if (!player_tf_present()) {
+            ui_toast("没插 TF 卡，扫不了");
+        } else {
+            player_tf_scan();
+            s_tf_was_busy = true;
+            ui_toast("开始扫描 TF 卡...");
+            set_render();
+            return;                 /* 停在设置页看进度，不退回主菜单 */
+        }
+    }
+    ui_page_show(UI_PAGE_MENU);     /* 执行完退出 */
+}
+
+/* 设置页的周期刷新（ui_pages_tick 调）。
+ * 存在的唯一理由：扫描 TF 卡是异步的，界面要显示进度、并在扫完时弹结果。 */
+static void set_tick(void)
+{
+    bool busy = player_tf_scan_busy();
+    if (busy) {
+        s_tf_was_busy = true;
+        set_render();               /* 把 "扫描中 n/m" 刷出来 */
         return;
     }
+    if (!s_tf_was_busy) return;     /* 平时什么都没发生，不白刷 */
 
-    /* 第 2 项：按模式分派。
-     *   在线 → 把在线收藏同步到离线（只同步标记，不下载音频）
-     *   离线 → 扫描 TF 卡建曲库索引
-     * 两者都是几百毫秒到几秒的活，所以都起后台任务、界面只轮询进度。 */
-    if (player_mode() == PLAYER_MODE_OFFLINE) {
-        esp_err_t err = musiclib_scan_start();
-        if (err == ESP_OK) {
-            ui_toast("开始扫描 TF 卡");
-        } else if (err == ESP_ERR_INVALID_STATE) {
-            ui_toast("没挂上 TF 卡，扫不了");
-        } else {
-            ui_toast("扫描起不来");
-        }
+    /* 刚刚扫完（busy 从 true 变 false）—— 报告结果 */
+    s_tf_was_busy = false;
+    int sc = 0, fd = 0;
+    player_tf_scan_progress(&sc, &fd);
+    esp_err_t e = player_tf_scan_err();
+    char t[48];
+    if (e != ESP_OK) {
+        snprintf(t, sizeof(t), "扫描失败：%s", esp_err_to_name(e));
     } else {
-        player_sync_to_offline();
-        ui_toast("开始同步收藏到离线");
+        snprintf(t, sizeof(t), "曲库 %d 首（遍历 %d 个文件）", fd, sc);
     }
+    ui_toast(t);
     set_render();
 }
 
@@ -561,8 +652,9 @@ static void info_line(int i, char *buf, size_t len)
                      player_brightness());
             break;
         case 5:
-            snprintf(buf, len, "曲目  %d/%d  %s", st.queue_index + 1, st.queue_count,
-                     player_src_name(player_source()));
+            /* 同样要用"模式名"（QQ 后端下 player_src_name 会给出不相干的名字） */
+            snprintf(buf, len, "曲目  %d/%d  %.16s", st.queue_index + 1, st.queue_count,
+                     player_mode_name(player_mode()));
             break;
         case 6:
             snprintf(buf, len, "运行  %u时%u分  设置待存 %d",
@@ -754,42 +846,14 @@ static void build_info_screen(void)
 }
 
 
-static void menu_pick_source(player_src_t src)
-{
-    char buf[64];
-    snprintf(buf, sizeof(buf), "正在获取: %.16s", player_src_name(src));
-    ui_toast(buf);
-    player_set_source(src, true);      /* 立刻播第一首 */
-    ui_page_show(UI_PAGE_PLAY);
-}
-
 static void menu_activate(int i)
 {
     switch (i) {
-        case 0: ui_srcmenu_open(); break;        /* 来源 → 二级菜单 */
-        case 1: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
-        case 2: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
-        /* 模式切换：两段式。第一次按 K3 只把这一行变成提示，再按一次才真动。
-         * 为什么也要两段：切换会停播、清队列、重建列表，误触代价大；
-         * 而且和设置页的"重连 WiFi"保持同一种交互（用户已经熟悉）。 */
-        case 3: {
-            if (!s_menu_confirm_mode) {
-                s_menu_confirm_mode = true;
-                s_menu_dirty = true;
-                ui_toast((player_mode() == PLAYER_MODE_ONLINE) ? "再按 K3 切到离线"
-                                                              : "再按 K3 切到在线");
-                break;
-            }
-            player_mode_t target = (player_mode() == PLAYER_MODE_ONLINE)
-                                     ? PLAYER_MODE_OFFLINE : PLAYER_MODE_ONLINE;
-            s_menu_confirm_mode = false;
-            s_menu_dirty = true;
-            player_set_mode(target);
-            ui_toast("正在切换模式...");
-            ui_page_show(UI_PAGE_PLAY);     /* 回播放页：模式一变，来源列表也换了 */
-            break;
-        }
-        case 4: ui_setmenu_open(); break;        /* 设置 → 二级菜单 */
+        case 0: ui_srcmenu_open(); break;      /* 模式 → 二级菜单（最近播放… / 每日30首…） */
+        case 1: ui_backmenu_open(); break;     /* ★ 新增：来源 → 二级菜单（Navidrome / QQ 音乐） */
+        case 2: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
+        case 3: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
+        case 4: ui_setmenu_open(); break;      /* 设置 → 二级菜单 */
         case 5: ui_page_show(UI_PAGE_INFO); break;
         default: break;
     }
@@ -799,8 +863,6 @@ void ui_menu_activate(void) { menu_activate(s_menu_sel); }
 
 void ui_menu_move(int delta)
 {
-    /* 一移动就取消确认态（两段确认的通用规矩，见 ui_setmenu_move） */
-    if (s_menu_confirm_mode) { s_menu_confirm_mode = false; s_menu_dirty = true; }
     int sel = s_menu_sel + delta;
     if (sel < 0) sel = 0;
     if (sel > MENU_N - 1) sel = MENU_N - 1;
@@ -1001,7 +1063,8 @@ void ui_pages_build(void)
     build_vol_screen();
     build_info_screen();
     build_bt_screen();
-    build_src_screen();
+    build_src_screen();              /* 「模式」二级菜单（项数随后端动态） */
+    build_back_screen();             /* 「来源」二级菜单（Navidrome / QQ 音乐） */
     build_set_screen();              /* 设置二级菜单（开机续播 / 重连 WiFi）*/
     /* 音质二级菜单已按用户要求删除（固定用最高：无损优先）*/
     build_mem_screen();              /* 内存用量图表（系统信息页长按 K3 进）*/             /* 音质二级菜单（5 个挡位）*/
@@ -1045,6 +1108,10 @@ void ui_pages_enter(ui_page_t p)
             s_src_r_sel = -1;
             src_render();
             break;
+        case UI_PAGE_BACK:
+            s_back_r_sel = -1;
+            back_render();
+            break;
         case UI_PAGE_SEARCH_MODE:
         case UI_PAGE_SEARCH_IN:
         case UI_PAGE_SEARCH_RES:
@@ -1074,41 +1141,18 @@ void ui_bt_mode_follow(void)
     }
 }
 
-/* ★ 模式（在线/离线）变了之后让界面跟上。
- *
- * 菜单里"模式: X"那一行、以及设置页第 2 项（扫描 TF 卡 / 同步收藏到离线）
- * 的文字都随模式变。模式可能从几处被改（屏幕菜单、以后的网页接口、
- * 以后的开机恢复）—— 让界面来对齐，比要求每个改模式的人都记得刷新界面可靠。
- *
- * ⚠️ 和 ui_bt_mode_follow 同样的坑：必须由 ui.c 的 tick 【无条件】调用。
- *    塞进 ui_pages_tick() 的话，停留在播放页时它根本不跑（那个函数只在
- *    非播放页被调），于是"模式切了但屏幕一直不动"。 */
-void ui_mode_follow(void)
-{
-    static int seen = -1;
-    int now = (int)player_mode();
-    if (now == seen) return;          /* 没变就什么都不做（250ms 一次的便宜判断）*/
-    seen = now;
-
-    s_menu_dirty = true;              /* 菜单里"模式: X"要跟着变 */
-    if (ui_page_current() == UI_PAGE_SETTINGS) {
-        set_render();                 /* 设置页第 2 项：扫描 / 同步 二选一 */
-    }
-    ESP_LOGI(TAG, "模式已切到 %s：菜单与设置页文案已刷新", player_mode_name());
-}
-
 void ui_pages_tick(void)
 {
     switch (ui_page_current()) {
         case UI_PAGE_LIST: list_render(false); break;
         case UI_PAGE_MENU: menu_render();      break;
-        /* 设置页现在有动态内容（扫描进度 / 上次同步结果），要周期性重画 */
-        case UI_PAGE_SETTINGS: set_render();   break;
         case UI_PAGE_VOL:  vol_render(false);  break;
         case UI_PAGE_INFO: info_render();      break;
         case UI_PAGE_MEM:  mem_render();       break;
         case UI_PAGE_BT:   bt_render();        break;
         case UI_PAGE_SRC:  src_render();       break;
+        case UI_PAGE_BACK: back_render();      break;
+        case UI_PAGE_SETTINGS: set_tick();     break;
         case UI_PAGE_SEARCH_MODE:
         case UI_PAGE_SEARCH_IN:
         case UI_PAGE_SEARCH_RES:

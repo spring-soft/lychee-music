@@ -40,26 +40,75 @@ typedef enum {
 
 const char *player_src_name(player_src_t s);
 
-/* ---------------- 在线 / 离线 双模式 ----------------
+/* ============================================================ 「来源」= 后端
  *
- * 单一真相源在 player；UI / 网页只读 player_mode()，不要各自缓存一份。
+ * 主菜单里的「来源」切的就是它，现在是三个：
+ *   Navidrome  走 Subsonic 协议（subsonic.c）
+ *   QQ 音乐     走自建的契约层服务（qqmusic.c）
+ *   TF 卡      走本地文件（musiclib.c 的离线曲库，不联网）
  *
- * 两种模式的【曲库、收藏、最近播放、搜索后端】都是分开的，但**来源枚举不变**：
- * 同一个 RECENT/STARRED/RANDOM 在两种模式下指向不同的数据源。这样 NVS 里的
- * 来源下标、来源二级菜单、网页 /api/sources 全都不用动。
+ * 三者**共用同一个播放引擎和歌曲结构**，区别只有两处：列表从哪来、播放源怎么建。
+ * 后者靠 sub_song_t.back 逐首判断（队列里可能混着几种歌），前者靠这个全局状态。
  *
- * player_set_mode() 是异步的（命令队列）。真正发生的顺序：
- *   停播 → 卸载/挂载 SD → 按新模式的当前来源重建列表 → 写 NVS
- * **不自动播**：跨模式那首歌未必存在。
+ * ★ 2026-10 的合并：这条 PCB 线原来叫「在线 / 离线 双模式」（PLAYER_MODE_ONLINE /
+ *   OFFLINE），面包板线叫「来源 ⌄ 后端」。两条线其实是同一个轴的两种叫法，
+ *   合并后统一成【来源 = 后端】，TF 卡就是第三个后端 ——
+ *   原来那个"在线/离线"开关随之删掉，不再单独存在。
  */
 typedef enum {
-    PLAYER_MODE_ONLINE = 0,   /* 走 Navidrome */
-    PLAYER_MODE_OFFLINE,      /* 走 TF 卡曲库 */
-} player_mode_t;
+    PLAYER_BACK_NAV = 0,     /* Navidrome（默认） */
+    PLAYER_BACK_QQ,          /* QQ 音乐 */
+    PLAYER_BACK_TF,          /* TF 卡离线曲库 */
+    PLAYER_BACK_COUNT,
+} player_back_t;
 
-player_mode_t player_mode(void);
-const char   *player_mode_name(void);         /* "在线" / "离线" */
-void          player_set_mode(player_mode_t m);
+const char *player_back_name(player_back_t b);
+player_back_t player_back(void);
+
+/* 换后端并重建队列（和换模式走同一条路径）。
+ * ⚠️ Navidrome 没配的时候切到它只会失败并保留原队列，不会把当前播放打断。
+ * ⚠️ 切到 TF 会**挂载**卡并读索引，切走会**卸载** —— 见 sd_card.h 的内存账。 */
+void player_set_back(player_back_t b, bool autoplay);
+
+/* 「收藏」模式跳过前 N 首 —— 给 QQ「我喜欢」里的**置顶歌**用。
+ * 用户需求：他置顶了 5 首，希望进收藏时**直接播第 6 首**。
+ * ★ 只影响"起播位置"，队列内容和顺序一点不变
+ *   （置顶那几首还在列表里，想听随时能点）。n 存 NVS，重启保留；0 = 不跳。 */
+int  player_fav_skip(void);
+void player_set_fav_skip(int n);
+
+/* ---------------- 「模式」= 当前后端下的曲目来源
+ *
+ * ★ 「模式」的含义**随后端而变**，而且只由后端决定项数：
+ *     Navidrome: 0=最近播放  1=我的收藏  2=随机30首
+ *     QQ 音乐:   0=收藏  1=每日30首  2=百万收藏  3=新歌推荐  4=刷歌  5=雷达
+ *     TF 卡:     0=全部曲目  1=随机30首
+ *
+ * UI 只用下面四个函数渲染二级菜单 —— **不需要知道有几项、叫什么**，
+ * 以后服务端加模式（改 qqmusic 的 k_modes 表）UI 一行都不用动。 */
+int         player_mode_count(void);
+const char *player_mode_name(int i);       /* 越界返回 "" */
+void        player_set_mode(int i, bool autoplay);
+int         player_mode(void);             /* 当前模式下标 */
+
+/* 每个后端各自记住自己上次的模式：切到 QQ 再切回来，Navidrome 还是原来那个模式。 */
+
+/* ---------------- TF 卡离线曲库的维护操作 ----------------
+ *
+ * 三个都是**非阻塞**（塞进 player 命令队列），进度靠下面的查询接口轮询 ——
+ * 扫描一张满卡要好几秒，UI 任务不能等。 */
+
+/* 重新扫描 TF 卡：重建索引（曲库名/艺术家来自文件名，不解析标签）。
+ * 要求卡已挂载 —— 会先确保挂载。扫完 musiclib_scan_result() 给结果码。 */
+void player_tf_scan(void);
+bool player_tf_scan_busy(void);
+/* 扫描进度：已遍历的文件数 / 已入库的曲目数 */
+void player_tf_scan_progress(int *scanned, int *found);
+esp_err_t player_tf_scan_err(void);
+/* 曲库现有几首（未挂卡/没索引时为 0） */
+int  player_tf_count(void);
+bool player_tf_present(void);      /* 卡插着没 */
+bool player_tf_mounted(void);
 
 esp_err_t player_init(void);
 
@@ -114,24 +163,6 @@ const char *player_search_query(void);       /* 上次搜的词（结果页顶�
 /* 请求后台把收藏列表跟 Navidrome 对一次（异步，在 player 任务里跑）。
  * force=false 时只有"过期了（>2 分钟）/ 从没成功过 / 有待重试操作"才真拉。 */
 void player_starred_refresh(bool force);
-
-/* ---------------- 收藏同步：在线 → 离线 ----------------
- *
- * 把【在线收藏】按「标题 + 艺术家」到 TF 卡曲库里找，找到的写进【离线收藏】，
- * 找不到的跳过（用户确认过：只同步"收藏标记"，不下载音频）。
- *
- * 三个刻意的行为：
- *   1) 只在在线模式有意义；离线模式下调用会直接返回（那时内存里的就是离线收藏）。
- *   2) 要临时挂卡 + 读索引（在线模式平时是**卸载**状态的，见 sd_card.h 的内存账），
- *      同步完立刻还原 —— 所以"同步一下"不会永久占着 SD 驱动的内部 SRAM。
- *   3) 只写离线收藏文件，**不动在线收藏、不改当前模式**；已经被收藏过的不会重复添加。
- */
-void player_sync_to_offline(void);          /* 非阻塞：塞进命令队列 */
-int  player_sync_offline_busy(void);        /* 正在同步 */
-int  player_sync_offline_done(void);        /* 本次开机跑完过至少一次 */
-int  player_sync_offline_synced(void);      /* 上次"已同步"几首 */
-int  player_sync_offline_skipped(void);     /* 上次"卡上没有，跳过"几首 */
-esp_err_t player_sync_offline_err(void);    /* 上次结果码 */
 
 /* ---------------- 只读查询（给 UI / 网页用） ---------------- */
 int          player_queue_count(void);

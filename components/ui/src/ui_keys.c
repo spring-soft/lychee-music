@@ -23,12 +23,12 @@
 #include "player.h"
 #include "app_core.h"
 #include "board.h"
-#include "encoder.h"
 #include "hid_remote.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "iot_button.h"
 #include "button_gpio.h"
+#include "encoder.h"
 
 static const char *TAG = "ui.keys";
 
@@ -126,15 +126,26 @@ static void key_short(int k)
                 case 0: player_next();   break;
                 case 1: player_toggle();  break;
                 case 2: player_prev();   break;
-                case 3: {                        /* 换来源（下一个），立刻播 */
-                    player_src_t nx = (player_src_t)((player_source() + 1) % PLAYER_SRC_COUNT);
-                    if (nx == PLAYER_SRC_RECENT && player_recent_count() == 0) {
-                        nx = (player_src_t)((nx + 1) % PLAYER_SRC_COUNT);   /* 还没播过任何歌 */
+                case 3: {                        /* 换「模式」（下一个），立刻播 */
+                    /* ⚠️⚠️ 这段原来是**写死 Navidrome 三个来源**的：
+                     *     `(player_source() + 1) % PLAYER_SRC_COUNT` + `player_src_name()`。
+                     *   切到 QQ 音乐后端后就全错了（用户实测报的"QQ 下切模式有问题"）：
+                     *     · QQ 有 **6 个**模式，它只在前 3 个里转 ——
+                     *       **永远切不到「新歌推荐 / 刷歌 / 雷达」**；
+                     *     · toast 显示的是 Navidrome 的名字，跟实际模式对不上（等于骗人）。
+                     *   现在一律走 player_mode_* —— 项数和名字都跟着后端走。 */
+                    int n = player_mode_count();
+                    if (n <= 0) break;
+                    int nx = (player_mode() + 1) % n;
+                    /* Navidrome 的"最近播放"在一首歌都没播过时是空的，跳过它 */
+                    if (player_back() == PLAYER_BACK_NAV
+                        && nx == PLAYER_SRC_RECENT && player_recent_count() == 0) {
+                        nx = (nx + 1) % n;
                     }
                     char buf[48];
-                    snprintf(buf, sizeof(buf), "来源: %s", player_src_name(nx));
+                    snprintf(buf, sizeof(buf), "模式: %.16s", player_mode_name(nx));
                     ui_toast(buf);
-                    player_set_source(nx, true);
+                    player_set_mode(nx, true);
                     break;
                 }
             }
@@ -158,11 +169,20 @@ static void key_short(int k)
             }
             break;
 
-        case UI_PAGE_SRC:                       /* 来源二级菜单 */
+        case UI_PAGE_SRC:                       /* 「模式」二级菜单（项数随后端动态） */
             switch (k) {
                 case 0: ui_srcmenu_move(-1); break;
                 case 1: ui_srcmenu_move(+1); break;
                 case 2: ui_srcmenu_activate(); break;   /* 确定并退回主菜单 */
+                default: break;              /* K4 由 k4_navigate 管 */
+            }
+            break;
+
+        case UI_PAGE_BACK:                      /* 「来源」二级菜单（Navidrome / QQ 音乐） */
+            switch (k) {
+                case 0: ui_backmenu_move(-1); break;
+                case 1: ui_backmenu_move(+1); break;
+                case 2: ui_backmenu_activate(); break;  /* 确定并退回主菜单 */
                 default: break;              /* K4 由 k4_navigate 管 */
             }
             break;
@@ -280,24 +300,17 @@ void ui_keys_init(void)
              k_pins[0], k_pins[1], k_pins[2], k_pins[3], HOLD_REPEAT_MS);
 }
 
-/* ============================================================ 旋转编码器（仅 V2 板）
+/* ============================================================ 旋转编码器（V2 板）
  *
- * ⚠️ 与 K4 同一条教训：**规则只能写在一处**。所以旋转和按下都在下面这两个函数里
- *    映射一次，各页面自己不要再散着处理编码器 —— 否则"某个页面的编码器忘了改"
- *    会重演当年 K4 那个坑（见上面 k4_navigate 的说明）。
+ * 编码器**不重新定义一套页面语义**，而是把"转"和"按"翻译成和 K1/K2/K3 完全相同的
+ * 动作函数 —— 于是它天然和按键保持一致，以后按键语义改了它也跟着改。
  *
- * 键位表（顺时针 CW = 界面里的"向下 / 向右"）：
- *   播放页         转 = 下一首 / 上一首      ｜ 按 = 播放暂停
- *   列表页         转 = 上下移行            ｜ 按 = 播放选中
- *   菜单/来源/设置  转 = 上下移             ｜ 按 = 确认（含两段确认状态机）
- *   音量页         转 = 音量 ±5（顺时针=加） ｜ 按 = 静音切换
- *   搜索方式/结果页 转 = 上下移             ｜ 按 = 确认
- *   搜索输入页     转 = 光标向右 / 向左      ｜ 按 = 输入该字母
- *   蓝牙遥控页     转 = 对端上一首/下一首     ｜ 按 = 对端播放暂停
- *   系统信息/内存页 转 = 无                 ｜ 按 = 无
- *   任意页长按     = 回播放器（= 长按 K4 的语义）
+ *   转 = K1/K2（翻行/翻项/切歌/调音量）
+ *   按 = K3（确定/进下一级/播放暂停）
+ *   长按 = K4 长按（回播放器，复用 k4_navigate —— 连带"离开遥控页要关模式"、
+ *          "离开音量页要立刻落盘"这些副作用一起继承，不在这里重写一遍）
  *
- * ⚠️ 搜索输入页是**横向**光标（用户指定 K1=向右），所以"顺时针 → K1"和列表页相反。
+ * ⚠️ 音量页**故意反着来**：顺时针（down=true）是加音量，不是"下一项"。
  *    这里按页面显式映射，不要试图找一条统一规律。
  *
  * 面包板变体下这一整段不编译（BOARD_HAS_ENCODER=0），K1/K2/K3 语义一字不改。
@@ -322,7 +335,8 @@ static void enc_rotate_one(bool down)
         case UI_PAGE_PLAY:     if (down) player_next(); else player_prev(); break;
         case UI_PAGE_LIST:     ui_list_move(down ? +1 : -1);                break;
         case UI_PAGE_MENU:     ui_menu_move(down ? +1 : -1);                break;
-        case UI_PAGE_SRC:      ui_srcmenu_move(down ? +1 : -1);             break;
+        case UI_PAGE_SRC:      ui_srcmenu_move(down ? +1 : -1);             break;  /* 「模式」 */
+        case UI_PAGE_BACK:     ui_backmenu_move(down ? +1 : -1);            break;  /* 「来源」 */
         case UI_PAGE_SETTINGS: ui_setmenu_move(down ? +1 : -1);             break;
         case UI_PAGE_VOL:      ui_vol_step(down ? +5 : -5);                 break;  /* 顺时针=加 */
         default: break;       /* 系统信息 / 内存图表页：旋钮不做事 */
@@ -337,7 +351,8 @@ static void enc_press_short(void)
         case UI_PAGE_PLAY:       player_toggle();         break;
         case UI_PAGE_LIST:       ui_list_play_selected(); break;
         case UI_PAGE_MENU:       ui_menu_activate();      break;
-        case UI_PAGE_SRC:        ui_srcmenu_activate();   break;
+        case UI_PAGE_SRC:        ui_srcmenu_activate();   break;  /* 「模式」 */
+        case UI_PAGE_BACK:       ui_backmenu_activate();  break;  /* 「来源」 */
         case UI_PAGE_SETTINGS:   ui_setmenu_activate();   break;
         case UI_PAGE_VOL:        ui_vol_toggle_mute();    break;
         case UI_PAGE_SEARCH_MODE:

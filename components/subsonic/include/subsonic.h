@@ -21,23 +21,38 @@ extern "C" {
 
 #define SUB_SONGS_MAX 64
 
-/* 本地文件路径上限（离线曲库的歌）。UTF-8：中文名一个字 3 字节，
+/* 本地文件路径上限（TF 卡离线曲库的歌）。UTF-8：中文名一个字 3 字节，
  * 所以 192 大约能放 60 个汉字 + 目录层级，够用。 */
 #define SUB_SONG_PATH_MAX 192
+
+/* 这首歌来自哪个后端。
+ *
+ * 设备现在有**三个音乐源**，而且队列/搜索/最近播放里都可能混着几种歌
+ * （比如在 QQ 上听了几首，又切回 Navidrome 看"最近播放"）。
+ * 所以后端标记必须**跟着歌走**，不能只靠一个全局变量 ——
+ * 全局变量只能表示"现在切到哪个后端"，拼不出队列里那首老歌该用哪条 URL。
+ */
+typedef enum {
+    SUB_BACK_NAV = 0,      /* Navidrome（Subsonic 协议） */
+    SUB_BACK_QQ  = 1,      /* QQ 音乐（自建契约层服务） */
+    SUB_BACK_TF  = 2,      /* TF 卡离线曲库（本地文件，不走网络） */
+} sub_back_t;
 
 typedef struct {
     char     id[48];
     char     title[160];
     char     artist[96];
     char     album[96];
-    char     cover[48];     /* coverArt id，请求封面用它而不是歌曲 id */
+    char     cover[48];     /* 封面 id：Navidrome 是 coverArt id；QQ 是专辑 mid；
+                             * TF 卡留空（不解析内嵌封面，见 musiclib.h 的取舍）。
+                             * 都是"短且稳定"，固件按它拼 URL / 做缓存 key。 */
     uint32_t duration_s;
     uint32_t size;
     char     suffix[8];
     bool     starred;
-    /* ★ 非空 = 本地文件（VFS 路径，如 "/sdcard/音乐/周杰伦 - 稻香.flac"），
-     *   空 = Navidrome 上的歌。
-     *   离线模式的歌全部非空；在线模式的歌永远为空。
+    uint8_t  back;          /* sub_back_t：这首歌来自哪个后端（老数据默认 0 = Navidrome） */
+    /* ★ 非空 = 本地文件（VFS 路径，如 "/sdcard/音乐/周杰伦 - 稻香.flac"）。
+     *   只有 back == SUB_BACK_TF 的歌会填它；其余后端永远为空。
      *   player 靠它决定"拼 URL 走 HTTP" 还是 "直接开文件"。
      *   ⚠️ 它会被一起落盘（JSON 键 "p"），否则重启后离线列表变成
      *      "有歌名但放不了"。 */
@@ -58,6 +73,9 @@ int         subsonic_max_kbps(void);
  *    而续播带 timeOffset，按规则必然落到转码 —— 所以直出播放中途一旦断流，
  *    这个值会翻成 false，屏幕上就会看到"转码"。 */
 bool subsonic_last_raw(void);
+/* ★ 给别的后端标一次"这次是直连、不是转码"（QQ 音乐走这条）。
+ * 不调它的话，屏幕上那个"直出/转码"指示器会一直停在初值 → **永远显示"转码"**。 */
+void subsonic_note_direct(const char *why);
 /* 最近一次"为什么直出/为什么转码"的短说明（"直出" / "后缀=''" / "码率234>300KB/s" /
  * "seek@139s" / "设置=raw"）。排查"这歌怎么变 MP3 了"时看 /api/debug 的 stream_why。 */
 const char *subsonic_last_why(void);
@@ -130,6 +148,15 @@ esp_err_t subsonic_get_song(const char *song_id, sub_song_t *out);
  * cover_id 用歌曲的 coverArt 字段（不是歌曲 id）。
  * out 需自行提供（PSRAM），建议 size=96 时给 96*96*2 = 18KB。 */
 esp_err_t subsonic_get_cover_rgb565(const char *cover_id, int size_px,
+                                    uint8_t *out, size_t out_cap,
+                                    uint16_t *w_out, uint16_t *h_out);
+
+/* ---- 按【完整 URL】取封面：QQ 音乐走这两个 ----
+ * QQ 的封面不在 Subsonic 服务器上，是 y.qq.com 直链（用 qqmusic_cover_url() 拼）。
+ * 和上面两个的区别只有"图片从哪来"，后面的限尺寸/验魔数/解码完全共用。 */
+esp_err_t subsonic_cover_raw_url(const char *url, int size_px,
+                                 uint8_t **out, size_t *len_out);
+esp_err_t subsonic_cover_rgb565_url(const char *url, int size_px,
                                     uint8_t *out, size_t out_cap,
                                     uint16_t *w_out, uint16_t *h_out);
 

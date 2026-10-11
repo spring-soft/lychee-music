@@ -25,7 +25,8 @@ typedef enum {
     UI_PAGE_VOL,
     UI_PAGE_INFO,      /* 系统信息整页（一行 toast 装不下，用户要求能看到本机 IP） */
     UI_PAGE_BT,        /* M7 蓝牙控制模式（独立模式：进去以后按键只管对方，不显示本机歌名） */
-    UI_PAGE_SRC,       /* 来源二级菜单（主菜单里"来源"那一项按 K3 进来的） */
+    UI_PAGE_SRC,       /* 「模式」二级菜单（主菜单"模式"那一项按 K3 进来的） */
+    UI_PAGE_BACK,      /* 「来源」二级菜单：Navidrome / QQ 音乐 */
     UI_PAGE_SEARCH_MODE,  /* M8：搜索方式选择（字母直搜 / 拼音输入）*/
     UI_PAGE_SEARCH_IN,    /* M8：输入页（字母格 + 拼音候选字，两种模式共用一页）*/
     UI_PAGE_SEARCH_RES,   /* M8：搜索结果列表 */
@@ -76,24 +77,33 @@ void ui_pages_enter(ui_page_t p);   /* 切进页面时强制刷新一次 */
 void ui_pages_tick(void);           /* 当前页面可见时的周期刷新（UI 任务里调） */
 /* 让页面跟随"蓝牙控制模式"（模式是状态源，网页也能改它）。
  * ⚠️ 必须由 ui.c 无条件调用 —— 别塞进 ui_pages_tick()，那个在播放页不跑。 */
-/* 蓝牙控制模式 / 在线离线模式切换后，把页面跟过去。
- * ⚠️ 两个都必须由 ui.c 的 tick 无条件调用（不能塞进 ui_pages_tick）。 */
 void ui_bt_mode_follow(void);
-void ui_mode_follow(void);
 
 /* ---------------- 各页面内的按键动作（ui_keys.c 调） ---------------- */
 void ui_list_move(int delta);
 void ui_list_play_selected(void);
 void ui_menu_move(int delta);
 void ui_menu_activate(void);
-void ui_srcmenu_open(void);         /* 来源二级菜单：主菜单按 K3 进来 */
+void ui_srcmenu_open(void);         /* 「模式」二级菜单：主菜单按 K3 进来。
+                                     * ⚠️ 项数与文字**随后端动态变**（QQ 6 个 / Navidrome 3 个），
+                                     *    渲染时用 player_mode_count/player_mode_name 现取，
+                                     *    这样服务端加模式时 UI 一行都不用改。 */
 void ui_srcmenu_move(int delta);    /* K1 / K2 */
 void ui_srcmenu_activate(void);     /* K3：确定并退回主菜单 */
+
+/* 「来源」二级菜单：切后端（Navidrome / QQ 音乐） */
+void ui_backmenu_open(void);
+void ui_backmenu_move(int delta);
+void ui_backmenu_activate(void);
 
 /* 设置二级菜单：开机续播（开/关）+ 重连 WiFi（需二次确认）*/
 void ui_setmenu_open(void);
 void ui_setmenu_move(int delta);
 void ui_setmenu_activate(void);
+
+/* 清空封面缓存后调它：把内存里的"封面黑名单"一起清掉。
+ * ⚠️ 不清的话那些歌不会重新去取封面 —— 等于白清。 */
+void ui_cover_cache_cleared(void);
 /* 开机续播已按用户要求取消（不再提供开关，player.c 一律从 0:00 开始放）*/
 
 /* 内存用量图表页：系统信息页长按 K3 进来，只画 PSRAM（flash 基本不变，用户说不用）*/

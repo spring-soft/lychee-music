@@ -24,10 +24,12 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_ota_ops.h"
 #include "board.h"
 #include "audio_engine.h"
 #include "net_mgr.h"
 #include "subsonic.h"
+#include "qqmusic.h"
 #include "app_core.h"
 #include "player.h"
 #include "settings.h"
@@ -132,39 +134,6 @@ static void key_selftest_task(void *arg)
         { 3, 0, "短按K4 回播放页" },
         { 3, 1, "长按K4(在播放页=进菜单)" },
         { 3, 1, "长按K4 回播放器" },
-
-        /* ---- 2026-10-06 新增：模式切换 + 设置页第 2 项（扫描 TF 卡）----
-         *
-         * 为什么要加：这两处都是"两段确认 + 页面跳转 + 后台动作"，而我看不见屏幕。
-         * 自检会把每一步前后的页面名打出来，读串口就能确认：
-         *   · 模式项第 1 次 K3 只变文案、第 2 次才真的切
-         *   · 设置页第 2 项在离线模式下确实是「扫描 TF 卡」
-         *   · 面包板无卡时扫描给出的是"没挂上 TF 卡"而不是"扫描起不来"
-         *
-         * ⚠️ 这一段会把设备切到离线模式、最后再切回在线（中间会写 NVS）——
-         *    它是编译开关（平时 0），只在排障时打开，可以接受。
-         * ⚠️ 进菜单时选中项【不会复位】（ui_pages_enter 只标脏不重置），
-         *    所以用"K1 连按 6 次回顶 + K2 下移"来定位，不假设上次停在哪。 */
-        { 3, 1, "长按K4 进菜单" },
-        { 0, 0, "K1 连按回第1项 (1)" },
-        { 0, 0, "K1 (2)" }, { 0, 0, "K1 (3)" }, { 0, 0, "K1 (4)" },
-        { 0, 0, "K1 (5)" }, { 0, 0, "K1 (6) → 现在停在第1项(来源)" },
-        { 1, 0, "K2 → 搜索" },
-        { 1, 0, "K2 → 屏幕亮度" },
-        { 1, 0, "K2 → 模式（应显示『模式: 在线』）" },
-        { 2, 0, "K3 第1段（应变成『切到离线？再按K3』，不该切换）" },
-        { 2, 0, "K3 第2段（切到离线，回播放页）" },
-        { 3, 1, "长按K4 进菜单（这一行应已显示『模式: 离线』）" },
-        { 1, 0, "K2 → 设置" },
-        { 2, 0, "K3 进设置（第2项应显示『扫描 TF 卡』）" },
-        { 1, 0, "K2 到第2项" },
-        { 2, 0, "K3 第1段（应变成『扫描 TF 卡？再按K3确认』）" },
-        { 2, 0, "K3 第2段（面包板无卡：应提示『没挂上 TF 卡，扫不了』）" },
-        { 3, 1, "长按K4 回播放页" },
-        { 3, 1, "长按K4 进菜单（选中项仍停在 设置）" },
-        { 0, 0, "K1 → 模式（应显示『模式: 离线』）" },
-        { 2, 0, "K3 第1段（准备切回在线）" },
-        { 2, 0, "K3 第2段（切回在线，回播放页）—— 自检结束时设备是在线模式" },
     };
     for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
         ui_page_t before = ui_page_current();
@@ -180,14 +149,6 @@ static void key_selftest_task(void *arg)
     vTaskDelete(NULL);
 }
 #endif
-
-/* 曲库文件名解析自检（纯函数，不碰硬件）。
- *
- * 为什么要有：离线曲库的歌名/艺术家全靠文件名解析，而这条规则我这边看不到真机、
- * 板子也还没到 —— 改了解析规则想验证，只要把这个开关改成 1、烧一次、读串口，
- * 就能看到逐条的「[OK]/[FAIL] + 期望值」。第一次上板也建议顺手看一眼。
- * ⚠️ 平时必须是 0（不改行为，只是没必要每次开机刷几十行日志）。 */
-#define MUSICLIB_SELFTEST 0
 
 /* M0 的基线测试音。⚠️ 实测它阻塞 2.8 秒，把网络初始化往后推了 3 秒，
  * 而且每次开机都"嘟"一声 —— 默认关掉，需要排查音频链路时再打开。 */
@@ -267,16 +228,34 @@ static void splash_watch_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     ESP_LOGI(TAG, "启动完成，用时 %" PRIu32 " ms", (uint32_t)(esp_timer_get_time() / 1000) - t0);
+
+    /* ★ OTA 自动回滚的"我还活着"声明（背景见 sdkconfig.forced 里那段说明）。
+     *
+     * 为什么偏偏放在这里：上面那个循环要等到**真的出声了**才走到这 ——
+     * 播放链路（网络→解码→I2S→ES8388）任何一环坏掉都到不了，
+     * 所以它是"这次固件真的能用"最硬的判据。
+     * 放 app_main 末尾反而太早：那只能说明"初始化没崩"，说明不了能出声。
+     *
+     * ⚠️ 必须和 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 配对：只开配置不调本函数，
+     *    每次升级都会被回滚（表现为"升级完重启又变回旧版本"），很费解。 */
+#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    esp_err_t oerr = esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGW(TAG, "OTA：本次启动已标记为有效，回滚取消（%s）", esp_err_to_name(oerr));
+#endif
+
     ui_splash_finish();
     vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
+    /* ★ 第一件事就把"网络日志"打开：设备平时独立供电、不接电脑，
+     *   没串口就等于瞎了。这里钩住 esp_log，把输出抄一份进 PSRAM 环形缓冲，
+     *   之后网页 GET /api/log?since=N 能拉到 —— 放最前面是为了把
+     *   **开机全过程**都录下来（否则只能看到网络起来之后的那段）。 */
+    web_log_init();
+
     log_chip_info();
-#if MUSICLIB_SELFTEST
-    musiclib_selftest();      /* 纯函数自检：文件名解析 + 扩展名过滤 */
-#endif
     log_memory("boot");
     player_status_init();
 
@@ -329,8 +308,8 @@ void app_main(void)
      *    第一次上电分区里没有文件系统，这里会格式化（一次性，约 1 秒）。 */
     splash("准备存储...", 6);
     store_init();
-    /* TF 卡：这里【只配卡检测引脚，不挂载】。真正挂载发生在切到离线模式那一刻
-     * （懒挂载 —— 在线模式用不到卡，不该占着 SDSPI 的那份内部 SRAM，
+    /* TF 卡：这里【只配卡检测引脚，不挂载】。真正挂载发生在切到「来源 = TF 卡」
+     * 那一刻（懒挂载 —— 在线播放用不到卡，不该占着 SDSPI 的那份内部 SRAM，
      *  理由与内存账见 components/sd_card/include/sd_card.h）。 */
     sd_card_init();
 
@@ -338,6 +317,17 @@ void app_main(void)
      * 2026-10-01 砍掉 BLE 换 WiFi 吞吐（内部 SRAM 从 7KB 涨到 49KB），那一步没了。
      * 原来的位置改成了「同步曲库」——但它必须排在 player_init 之后
      * （那时 s_recent / s_lock 才分配好），所以挪到下面第 7 步。 */
+
+    /* ---- 音乐服务后端 ----
+     * Navidrome（Subsonic 协议）和 QQ 音乐（自建契约层服务）是**两个后端**，
+     * 设备侧共用同一个播放引擎和歌曲结构，由菜单里的「来源」切换。
+     * 先初始化 QQ 那边（只是读 NVS/Kconfig 里的地址 + 打日志，不联网）——
+     * 放在 Navidrome 的检查**之前**，因为 QQ 可以单独用（不配 Navidrome 也行）。 */
+    if (qqmusic_init() == ESP_OK) {
+        ESP_LOGI(TAG, "QQ 音乐服务: %s", qqmusic_host());
+    } else {
+        ESP_LOGW(TAG, "没配 QQ 音乐服务地址（菜单里切到 QQ 会取不到歌）");
+    }
 
     /* ---- M4: 起播（之后按键/网页都通过 player 命令层控制）---- */
     if (subsonic_init() != ESP_OK || !subsonic_configured()) {

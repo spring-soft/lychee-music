@@ -5,7 +5,6 @@
  * 不碰 LVGL、不碰音频引擎内部。所以"网页点下一首"和"按键按下一首"走的是同一条路。
  */
 #include <string.h>
-#include <strings.h>          /* strcasecmp：mode 参数要大小写不敏感 */
 #include <stdlib.h>
 #include <inttypes.h>
 #include "web_console.h"
@@ -13,14 +12,19 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "esp_system.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include "assets.h"
 #include "app_core.h"
 #include "audio_engine.h"
 #include "player.h"
-#include "musiclib.h"
-#include "sd_card.h"
 #include "subsonic.h"
+#include "qqmusic.h"
 #include "net_mgr.h"
 #include "settings.h"
 #include "store.h"
@@ -121,10 +125,23 @@ static const char *json_str(cJSON *o, const char *key)
 
 static bool query_int(httpd_req_t *req, const char *key, int *out)
 {
-    char val[32];
+    /* ⚠️⚠️ 这里的缓冲原来是 **32 字节**，踩过一个极隐蔽的坑：
+     *   `httpd_req_get_url_query_str()` 在缓冲不够时会**静默截断**（不报错），
+     *   于是超长的查询串里，**排在后面的参数直接消失**，取不到就用调用方的默认值 ——
+     *   症状是"这个参数改了没用"，而且毫无提示。
+     *
+     *   实际踩到的：封面请求 `/api/cover?id=<14位mid>&size=144&back=1` = **33 字节**，
+     *   只超一个字节 → 截断成 `...&back`（没有 `=1`）→ back 取到 0 →
+     *   设备去 Navidrome 取 QQ 的封面 → 404。**同时**歌词请求只有 25 字节，
+     *   能塞下 → 歌词是好的。于是现象变成"歌词有了、封面没有"，
+     *   加上屏幕走的是内部调用（不经过 HTTP query）也正常 —— 三条线索互相矛盾，极难查。
+     *
+     *   教训：**这种"边界差一个字节"的参数解析，宁可用大缓冲**。
+     *   现在是 192 字节（够放 id + size + back 这类组合），栈上多这 160 字节无所谓。 */
+    char val[192];
     if (httpd_req_get_url_query_len(req) == 0) return false;
     if (httpd_req_get_url_query_str(req, val, sizeof(val)) != ESP_OK) return false;
-    char got[32];
+    char got[64];
     if (httpd_query_key_value(val, key, got, sizeof(got)) != ESP_OK) return false;
     *out = atoi(got);
     return true;
@@ -165,13 +182,6 @@ static bool query_str(httpd_req_t *req, const char *key, char *out, size_t len)
     return true;
 }
 
-/* 模式的外部 slug（"online"/"offline"）。给前端比字符串用；
- * 中文名走 player_mode_name() —— 名字只在 player 里定义一次，网页不要自己再映射一遍。 */
-static const char *mode_slug(player_mode_t m)
-{
-    return (m == PLAYER_MODE_OFFLINE) ? "offline" : "online";
-}
-
 /* 往数组里加一首歌（多种接口共用同一形状，前端只写一套渲染） */
 static void add_song(cJSON *arr, int i, const sub_song_t *s, int playing_index)
 {
@@ -190,18 +200,34 @@ static void add_song(cJSON *arr, int i, const sub_song_t *s, int playing_index)
     if (s->suffix[0]) cJSON_AddStringToObject(o, "suffix", s->suffix);
     if (s->size)      cJSON_AddNumberToObject(o, "size", (double)s->size);
     if (s->starred) cJSON_AddBoolToObject(o, "starred", true);
+    /* ★ 这首歌属于哪个后端（sub_back_t）。前端拿封面/歌词时要把这个带上 ——
+     *   Navidrome 的 cover 是 coverArt id，QQ 的是**专辑 mid**，
+     *   同一个字段、两条完全不同的取图路子。不带给后端的话 QQ 歌就没封面/没歌词。 */
+    cJSON_AddNumberToObject(o, "back", s->back);
     if (i >= 0 && i == playing_index) cJSON_AddBoolToObject(o, "playing", true);
     cJSON_AddItemToArray(arr, o);
 }
 
 /* ============================================================ 页面本体 */
 
+/* ★★ 网页现在**内嵌在 app 里**（由 tools/gen_assets.py 生成这个 C 数组）。
+ *
+ * 为什么不继续从 assets 分区读（以前是这样）：
+ *   assets 是**独立分区**，而 **OTA 只更新 app 分区** —— 实测踩到过：
+ *   OTA 上传成功、槽也换了，但页面一点没变（网页还在 assets 里）。
+ *   把网页编进 app 之后，"改网页"也能跟着 OTA 走 —— 而网页恰恰是最常改的。
+ *   字库/图标仍留在 assets 分区（几百 KB，且很少改）。
+ *
+ * 代价：app 体积 +几十 KB（gzip 后的 HTML），3MB 的槽装得下。
+ * ⚠️ 内容是**生成**的，改网页要跑 tools/gen_assets.py 再编译。 */
+extern const unsigned char web_index_gz[];
+extern const unsigned int  web_index_gz_len;
+
 static esp_err_t h_index(httpd_req_t *req)
 {
-    asset_t a;
-    if (!assets_get_by_name("index.html.gz", &a) || a.fmt != ASSET_FMT_WEB_GZ) {
+    if (web_index_gz_len == 0) {
         return fail(req, "503 Service Unavailable",
-                    "网页资源没烧进 assets 分区（跑 tools/gen_assets.py 后 idf.py flash）");
+                    "内嵌网页为空（跑 tools/gen_assets.py 再编译）");
     }
     /* 浏览器声明支持 gzip 才发压缩体（手机上都会声明） */
     char enc[32];
@@ -215,8 +241,7 @@ static esp_err_t h_index(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     if (gz) {
-        /* ★ mmap 的指针直接发给 socket，零拷贝（httpd 内部会分块发） */
-        return httpd_resp_send(req, (const char *)a.data, a.size);
+        return httpd_resp_send(req, (const char *)web_index_gz, web_index_gz_len);
     }
     return fail(req, "406 Not Acceptable", "请用支持 gzip 的浏览器");
 }
@@ -253,21 +278,6 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(o, "bright", player_brightness());
     cJSON_AddNumberToObject(o, "gen", st.gen);      /* ★ 每次换歌 +1，前端靠它对账 */
 
-    /* M9：在线 / 离线双模式 + TF 卡曲库。
-     * 前端靠 mode 决定设置页给"扫卡"还是"同步收藏"，靠 lib 显示"曲库 N 首"。
-     * ⚠️ 卡没挂上时 count=0 / index_ok=false 是【正常状态】不是错误 ——
-     *    在线模式平时就是卸载状态（见 sd_card.h 的内存账），前端不要弹错。
-     * mode_name 是给浏览器看的中文名，不用前端自己映射（player 是唯一真相源）。 */
-    cJSON_AddStringToObject(o, "mode", mode_slug(player_mode()));
-    cJSON_AddStringToObject(o, "mode_name", player_mode_name());
-    cJSON *lib = cJSON_AddObjectToObject(o, "lib");
-    int lib_n = musiclib_count();
-    cJSON_AddNumberToObject(lib, "count", lib_n);
-    cJSON_AddBoolToObject(lib, "scan_busy", musiclib_scan_busy());
-    cJSON_AddNumberToObject(lib, "scan_found", musiclib_scan_found());
-    cJSON_AddNumberToObject(lib, "scanned", musiclib_scan_scanned());
-    cJSON_AddBoolToObject(lib, "index_ok", lib_n > 0);   /* 索引里有没有东西 */
-
     cJSON *song = cJSON_AddObjectToObject(o, "song");
     cJSON_AddStringToObject(song, "id", st.song_id);
     cJSON_AddStringToObject(song, "title", st.title);
@@ -275,6 +285,8 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(song, "album", st.album);
     cJSON_AddStringToObject(song, "cover", st.cover_id);
     cJSON_AddBoolToObject(song, "starred", st.starred);
+    /* ★ 当前歌属于哪个后端 —— 前端拿封面/歌词时要带上（QQ 和 Navidrome 两条路） */
+    cJSON_AddNumberToObject(song, "back", st.back);
 
     /* ★ 音频规格：解码格式 / 采样率 / 位深 / 是否直出 / 缓冲水位 / 欠载次数。
      *   屏幕播放页右栏已经有一份同样的信息，网页这边也要能看 ——
@@ -310,7 +322,13 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON *q = cJSON_AddObjectToObject(o, "queue");
     cJSON_AddNumberToObject(q, "index", player_queue_index());
     cJSON_AddNumberToObject(q, "count", player_queue_count());
-    cJSON_AddStringToObject(q, "source", player_src_name(player_source()));
+    /* ⚠️ "source" 这个字段名是**老前端在用**的，现在它指的是「模式」（最近播放…/每日30首…）。
+     *    真正的「来源」（后端）在下面 back/back_name。保留旧字段名以免老前端显示空白。 */
+    cJSON_AddStringToObject(q, "source", player_mode_name(player_mode()));
+    cJSON_AddNumberToObject(q, "mode", player_mode());
+    cJSON_AddStringToObject(q, "mode_name", player_mode_name(player_mode()));
+    cJSON_AddNumberToObject(q, "back", (int)player_back());
+    cJSON_AddStringToObject(q, "back_name", player_back_name(player_back()));
     cJSON_AddNumberToObject(q, "gen", player_queue_gen());
 
     /* M6：收藏镜像的状态。前端靠 starred.gen 变化决定要不要重拉 /api/starred
@@ -422,23 +440,11 @@ static esp_err_t h_search(httpd_req_t *req)
     sub_song_t *songs = heap_caps_malloc(SUB_SONGS_MAX * sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
     if (songs == NULL) return fail(req, "500 Internal Server Error", "内存不足");
     int got = 0;
-    esp_err_t err;
-    /* ★ 离线模式必须搜本地曲库，不能直连 Navidrome：
-     *   ① 离线模式的契约就是"只用 TF 卡曲库，不碰网络"；
-     *   ② 更要紧的是 —— 在线搜出来的歌没有本地路径，点它会走 HTTP，
-     *      于是"离线模式"下放出了网络流，而且它会被排进本地队列让"下一首"串台。 */
-    const bool offline = (player_mode() == PLAYER_MODE_OFFLINE);
-    if (offline) {
-        got = musiclib_search(q, songs, SUB_SONGS_MAX);
-        err = ESP_OK;                       /* 离线 0 条 = 没找到，不是错误 */
-    } else {
-        err = subsonic_search(q, songs, SUB_SONGS_MAX, &got);
-    }
+    esp_err_t err = subsonic_search(q, songs, SUB_SONGS_MAX, &got);
     cJSON *o = cJSON_CreateObject();
     cJSON *items = cJSON_AddArrayToObject(o, "items");
     for (int i = 0; i < got; i++) add_song(items, -1, &songs[i], -1);
     cJSON_AddNumberToObject(o, "total", got);
-    cJSON_AddBoolToObject(o, "local", offline);   /* 真机排障时一眼看出这次搜的是哪边 */
     heap_caps_free(songs);
     if (err != ESP_OK && got == 0) {
         cJSON_Delete(o);
@@ -450,13 +456,29 @@ static esp_err_t h_search(httpd_req_t *req)
 static esp_err_t h_sources(httpd_req_t *req)
 {
     cJSON *o = cJSON_CreateObject();
-    cJSON_AddNumberToObject(o, "current", (int)player_source());
-    cJSON_AddStringToObject(o, "current_name", player_src_name(player_source()));
-    cJSON *items = cJSON_AddArrayToObject(o, "items");
-    for (int i = 0; i < PLAYER_SRC_COUNT; i++) {
+    /* 「来源」（后端）和「模式」**分开报**，和屏幕上的菜单一一对应：
+     *   来源 = 从哪个服务来（Navidrome / QQ 音乐）
+     *   模式 = 这个服务下的哪类曲目（项数与名字**随后端变**：QQ 6 个 / Navidrome 3 个）
+     * 老前端只认 items/current/current_name（那三个现在指的是"模式"），字段名保持兼容。 */
+    cJSON_AddNumberToObject(o, "back", (int)player_back());
+    cJSON_AddStringToObject(o, "back_name", player_back_name(player_back()));
+
+    cJSON *backs = cJSON_AddArrayToObject(o, "backs");
+    for (int i = 0; i < (int)PLAYER_BACK_COUNT; i++) {
         cJSON *it = cJSON_CreateObject();
         cJSON_AddNumberToObject(it, "i", i);
-        cJSON_AddStringToObject(it, "name", player_src_name((player_src_t)i));
+        cJSON_AddStringToObject(it, "name", player_back_name((player_back_t)i));
+        cJSON_AddItemToArray(backs, it);
+    }
+
+    cJSON_AddNumberToObject(o, "current", player_mode());
+    cJSON_AddStringToObject(o, "current_name", player_mode_name(player_mode()));
+    cJSON *items = cJSON_AddArrayToObject(o, "items");
+    int n = player_mode_count();
+    for (int i = 0; i < n; i++) {
+        cJSON *it = cJSON_CreateObject();
+        cJSON_AddNumberToObject(it, "i", i);
+        cJSON_AddStringToObject(it, "name", player_mode_name(i));
         cJSON_AddItemToArray(items, it);
     }
     return send_json(req, o);
@@ -475,12 +497,29 @@ static esp_err_t h_cover(httpd_req_t *req)
     }
     int size = 144;
     query_int(req, "size", &size);
+    /* ★ 后端分派：Navidrome 的封面走 /rest/getCoverArt；QQ 的是 y.qq.com 直链。
+     *   前端把这首歌的 `back` 带上来（列表项里就有）。
+     *   不带的话默认 0=Navidrome，保持老行为。 */
+    int back = 0;
+    query_int(req, "back", &back);
 
     /* ★ 转发的是【原始 JPEG 字节】，不是 RGB565 —— 浏览器不认 RGB565。
      *   顺带也做了格式校验（Navidrome 对 WebP 封面转不了码，会原样透传）。 */
     uint8_t *jpg = NULL;
     size_t len = 0;
-    esp_err_t err = subsonic_get_cover_raw(id, size, &jpg, &len);
+    esp_err_t err;
+    if (back == SUB_BACK_TF) {
+        /* TF 卡曲库不解析标签（见 musiclib.h 的取舍①），没有封面可取。
+         * 明确 404，别去碰 Navidrome —— 拿一个空 id 请求它是白等一次网络超时。 */
+        return fail(req, "404 Not Found", "离线曲目没有封面");
+    }
+    if (back == SUB_BACK_QQ) {
+        char url[192];
+        err = qqmusic_cover_url(id, size, url, sizeof(url));
+        if (err == ESP_OK) err = subsonic_cover_raw_url(url, size, &jpg, &len);
+    } else {
+        err = subsonic_get_cover_raw(id, size, &jpg, &len);
+    }
     if (err != ESP_OK) {
         /* 404 很常见（WebP 封面），前端会退到占位图，不要刷错误日志 */
         return fail(req, "404 Not Found", "取不到封面");
@@ -500,6 +539,40 @@ static esp_err_t h_lyrics(httpd_req_t *req)
     if (!query_str(req, "id", id, sizeof(id)) || id[0] == 0) {
         return fail(req, "400 Bad Request", "缺少 id 参数");
     }
+    /* ★ 后端分派（前端带上歌曲的 back）：QQ 的歌词要的是归一化 JSON，
+     *   Navidrome 那边 subsonic_get_lyrics() 直接就给同一格式的 JSON。 */
+    int back = 0;
+    query_int(req, "back", &back);
+
+    if (back == SUB_BACK_TF) {
+        /* 同封面：离线曲目不解析标签，没有歌词。回 200 + 空 lines，
+         * 网页照常渲染"暂无歌词"（而不是弹一个取歌词失败）。 */
+        no_keepalive(req);
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        return httpd_resp_sendstr(req, "{\"synced\":false,\"total\":0,\"lines\":[]}");
+    }
+
+    if (back == SUB_BACK_QQ) {
+        char *json = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+        if (json == NULL) return fail(req, "500", "没有内存取歌词");
+        esp_err_t qe = qqmusic_lyrics_json(id, json, 8192);
+        if (qe != ESP_OK) {
+            heap_caps_free(json);
+            /* 没歌词不是错误：回一个空 lines 的 200，网页照常渲染"暂无歌词" */
+            no_keepalive(req);
+            httpd_resp_set_type(req, "application/json; charset=utf-8");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+            return httpd_resp_sendstr(req, "{\"synced\":false,\"total\":0,\"lines\":[]}");
+        }
+        no_keepalive(req);
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        esp_err_t e = httpd_resp_sendstr(req, json);
+        heap_caps_free(json);
+        return e;
+    }
+
     char *json = NULL;
     esp_err_t err = subsonic_get_lyrics(id, &json);
     if (err != ESP_OK || json == NULL) {
@@ -668,8 +741,111 @@ static esp_err_t h_source(httpd_req_t *req)
     int i = json_int(b, "i", -1);
     bool autoplay = json_bool(b, "autoplay", true);
     cJSON_Delete(b);
-    if (i < 0 || i >= PLAYER_SRC_COUNT) return fail(req, "400 Bad Request", "来源下标越界");
-    player_set_source((player_src_t)i, autoplay);
+    /* 「模式」的下标范围**随后端变**（QQ 6 个 / Navidrome 3 个），
+     * 所以在这里按当前后端校验；player 任务里还会再校验一次（它才是唯一改状态的地方）。 */
+    int n = player_mode_count();
+    if (i < 0 || i >= n) return fail(req, "400 Bad Request", "模式下标越界");
+    player_set_mode(i, autoplay);
+    return ok_json(req);
+}
+
+/* 换「来源」= 换后端（Navidrome / QQ 音乐）。
+ * ⚠️ 切换**不一定成功**（Navidrome 没配、QQ 服务连不上都会失败，player 会回退状态），
+ *    所以这里只回"已下发"，真正的结果要看 /api/status 里的 back/back_name。 */
+/* 清空封面缓存（POST /api/cache）。
+ * ★ 只清**封面缓存** —— 它是纯可再生数据（下次看到那首歌会自动重新下载）。
+ *   最近播放 / 收藏镜像**不清**：那里有用户的东西，清掉会莫名其妙地丢历史。
+ * 返回清了多少、释放了多少，前端能给出真实反馈（而不是"点了没反应"）。 */
+static esp_err_t h_cache(httpd_req_t *req)
+{
+    uint64_t before = store_free_kb();
+    int n = store_evict("COVER", 0);            /* keep=0 = 全删 */
+    uint64_t after = store_free_kb();
+    ESP_LOGW(TAG, "清空封面缓存：删 %d 个，%u KB → %u KB 可用",
+             n, (unsigned)before, (unsigned)after);
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "removed", n);
+    cJSON_AddNumberToObject(o, "freed_kb", (double)(after - before));
+    cJSON_AddNumberToObject(o, "free_kb", (double)after);
+    return send_json(req, o);
+}
+
+/* TF 卡离线曲库：状态查询 + 触发扫描。
+ *
+ * GET  /api/tf  → {present, mounted, count, scanning, scanned, found, err}
+ * POST /api/tf  → 触发一次扫描（非阻塞：塞进 player 命令队列就返回，
+ *                 前端按 scanning/scanned/found 轮询进度）
+ *
+ * 为什么要独立一个接口而不是塞进 /api/sources：扫描是"要把卡取下来重扫"的
+ * 重量级动作，而 /api/sources 是网页每秒都在拉的轻量状态，不该混在一起。 */
+static esp_err_t h_tf(httpd_req_t *req)
+{
+    if (req->method == HTTP_POST) {
+        if (!player_tf_present()) {
+            return fail(req, "409 Conflict", "没插 TF 卡");
+        }
+        if (player_tf_scan_busy()) {
+            return fail(req, "409 Conflict", "扫描已在进行中");
+        }
+        player_tf_scan();                      /* 非阻塞，直接返回 */
+        ESP_LOGW(TAG, "网页触发了 TF 卡扫描");
+        return ok_json(req);
+    }
+
+    int scanned = 0, found = 0;
+    player_tf_scan_progress(&scanned, &found);
+    esp_err_t e = player_tf_scan_err();
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "present", player_tf_present());
+    cJSON_AddBoolToObject(o, "mounted", player_tf_mounted());
+    cJSON_AddNumberToObject(o, "count", player_tf_count());
+    cJSON_AddBoolToObject(o, "scanning", player_tf_scan_busy());
+    cJSON_AddNumberToObject(o, "scanned", scanned);
+    cJSON_AddNumberToObject(o, "found", found);
+    cJSON_AddBoolToObject(o, "ok", e == ESP_OK);
+    cJSON_AddStringToObject(o, "err", e == ESP_OK ? "" : esp_err_to_name(e));
+    return send_json(req, o);
+}
+
+/* QQ 音乐契约层服务的地址（改完立刻生效并存 NVS，不用重刷固件）。
+ * 为什么需要它：那个服务可能跑在别的机器/端口上，装机时不该要求重编固件。
+ * 存进 NVS 后优先于 Kconfig 默认值（见 qqmusic_init）。 */
+static esp_err_t h_qq(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "host", qqmusic_host());
+        cJSON_AddBoolToObject(o, "configured", qqmusic_configured());
+        /* 「收藏」跳过前 N 首（QQ 我喜欢里的置顶歌）—— 和设备上的设置同一个值 */
+        cJSON_AddNumberToObject(o, "fav_skip", player_fav_skip());
+        return send_json(req, o);
+    }
+    cJSON *b = read_body(req);
+    if (b == NULL) return fail(req, "400 Bad Request", "请求体不是合法 JSON");
+    const char *host = json_str(b, "host");
+    /* ⚠️ 必须**先拷出来再 cJSON_Delete** —— json_str 返回的是树里的指针 */
+    char buf[QQ_HOST_MAX] = {0};
+    if (host != NULL) strlcpy(buf, host, sizeof(buf));
+    /* fav_skip 可选：不传就只改地址（老调用方不会因为少个字段而失败） */
+    const cJSON *fs = cJSON_GetObjectItem(b, "fav_skip");
+    bool has_fs = cJSON_IsNumber(fs);
+    int skip = has_fs ? (int)fs->valuedouble : 0;
+    cJSON_Delete(b);
+    if (has_fs) player_set_fav_skip(skip);
+    if (buf[0] == 0) return has_fs ? ok_json(req) : fail(req, "400 Bad Request", "host 不能为空");
+    if (qqmusic_set_config(buf, true) != ESP_OK) return fail(req, "500", "保存失败");
+    return ok_json(req);
+}
+
+static esp_err_t h_back(httpd_req_t *req)
+{
+    cJSON *b = read_body(req);
+    if (b == NULL) return fail(req, "400 Bad Request", "请求体不是合法 JSON");
+    int i = json_int(b, "i", -1);
+    bool autoplay = json_bool(b, "autoplay", true);
+    cJSON_Delete(b);
+    if (i < 0 || i >= (int)PLAYER_BACK_COUNT) return fail(req, "400 Bad Request", "来源下标越界");
+    player_set_back((player_back_t)i, autoplay);
     return ok_json(req);
 }
 
@@ -690,163 +866,6 @@ static esp_err_t h_star(httpd_req_t *req)
         player_star_song(idbuf, on);
     }
     return ok_json(req);
-}
-
-/* ============================================================ 在线 / 离线 与 TF 卡曲库 */
-
-/* 模式参数解析：接受 online / offline（大小写不敏感）和 0 / 1。
- * 两种写法都收是刻意的 —— 网页表单发字符串更好读，命令行 curl 敲 0/1 更省事。 */
-static bool parse_mode(const char *s, player_mode_t *out)
-{
-    if (s == NULL || s[0] == 0) return false;
-    if (strcasecmp(s, "online") == 0 || strcmp(s, "0") == 0) {
-        *out = PLAYER_MODE_ONLINE;
-        return true;
-    }
-    if (strcasecmp(s, "offline") == 0 || strcmp(s, "1") == 0) {
-        *out = PLAYER_MODE_OFFLINE;
-        return true;
-    }
-    return false;
-}
-
-/* 在线 / 离线模式：GET 读、POST 写（同一个处理器按 method 分支，同 /api/quality）。
- *
- * ⚠️ 切换是【异步】的（player_set_mode 只往命令队列塞一条），真做完要
- *    停播 → 挂/卸 SD → 重建列表 → 写 NVS，实测几百毫秒。
- *    所以这里立刻返回，**不等切换完成** —— httpd 的 recv/send 超时都是 5 秒，
- *    在这里等就等于把网页卡住。前端要看结果就轮询 /api/status 的 mode
- *    （切换期间它可能还是旧值，这是刻意的）。 */
-static esp_err_t h_mode(httpd_req_t *req)
-{
-    player_mode_t cur = player_mode();
-
-    if (req->method == HTTP_GET) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "mode", mode_slug(cur));
-        cJSON_AddStringToObject(o, "mode_name", player_mode_name());
-        return send_json(req, o);
-    }
-
-    /* mode 两处都收：JSON 体（网页）和 query（curl / 书签更顺手）。体优先 ——
-     * 带了体说明调用方是按 POST 的契约来的。体解析不了就当没带，退回 query。 */
-    char mbuf[16] = {0};
-    cJSON *b = read_body(req);
-    if (b != NULL) {
-        cJSON *mi = cJSON_GetObjectItem(b, "mode");
-        if (mi && cJSON_IsString(mi) && mi->valuestring[0]) {
-            strlcpy(mbuf, mi->valuestring, sizeof(mbuf));
-        } else if (mi && cJSON_IsNumber(mi)) {
-            /* {"mode":0} 也认：前端可能直接透传 /api/status 的数字形式 */
-            snprintf(mbuf, sizeof(mbuf), "%d", (int)mi->valuedouble);
-        }
-        cJSON_Delete(b);
-    }
-    if (mbuf[0] == 0) query_str(req, "mode", mbuf, sizeof(mbuf));
-
-    player_mode_t want;
-    if (!parse_mode(mbuf, &want)) {
-        return fail(req, "400 Bad Request", "mode 只认 online / offline / 0 / 1");
-    }
-
-    bool changed = (want != cur);
-    if (changed) player_set_mode(want);
-
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddBoolToObject(o, "ok", true);
-    cJSON_AddStringToObject(o, "mode", mode_slug(want));
-    cJSON_AddBoolToObject(o, "changed", changed);
-    return send_json(req, o);
-}
-
-/* TF 卡曲库扫描：POST 起一次扫描，GET 查进度（同一个处理器按 method 分支，同 /api/quality）。
- *
- * ⚠️ 扫描是【后台任务】（上千首要几秒），这个处理器绝不等它扫完 —— 同上，
- *    httpd 的超时是 5 秒，等下去前端只会拿到超时。想知道扫完没有，轮询 GET。
- *
- * ⚠️ musiclib_scan_start() 对"正在扫"和"卡没挂上"返回的是【同一个】
- *    ESP_ERR_INVALID_STATE（见 musiclib.c 开头那两行判断），而网页要把这两种
- *    说清楚（"稍等"和"去插卡"是两回事），所以这里事后自己判一次：
- *    顺序刻意跟 musiclib 里的判断一致 —— 先看是不是在扫，再看卡。 */
-static esp_err_t h_scan(httpd_req_t *req)
-{
-    if (req->method == HTTP_GET) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddBoolToObject(o, "busy", musiclib_scan_busy());
-        cJSON_AddNumberToObject(o, "scanned", musiclib_scan_scanned());
-        cJSON_AddNumberToObject(o, "found", musiclib_scan_found());
-        cJSON_AddNumberToObject(o, "count", musiclib_count());
-        /* last_err 是【上一次扫描】的结果码，不是"当前这次"的（扫描中它还是旧值）。
-         * 这里刻意用 scan_result() 而不是 musiclib_last_err()：后者还包含 load 的错，
-         * 对"扫完了没、扫成功没"这个问题不够准，卡状态留给 /api/debug。 */
-        cJSON_AddNumberToObject(o, "last_err", (int)musiclib_scan_result());
-        return send_json(req, o);
-    }
-
-    /* 先记下"调之前是不是就在扫"：调用返回 INVALID_STATE 后状态可能刚好翻掉，
-     * 只看事后状态会把"你点的太急了"误报成"卡没插"。 */
-    bool was_busy = musiclib_scan_busy();
-    esp_err_t err = musiclib_scan_start();
-
-    /* why 是给前端直接显示的短标识，四种"没扫起来"刻意分开：
-     *   started     = 已经在后台扫了
-     *   busy        = 本来就在扫（这次点击是多余的，不需要用户做任何事）
-     *   no_card     = 卡检测脚（CD）说没插卡 → 让用户去插
-     *   not_mounted = 卡在、但驱动没挂上（接触不良 / 卡上文件系统认不出）→ 让用户重插
-     * 其余错误码直接给 esp_err_to_name()（例如 ESP_ERR_NO_MEM = PSRAM 不够）。 */
-    const char *why;
-    bool started = false;
-    if (err == ESP_OK) {
-        why = "started";
-        started = true;
-    } else if (err == ESP_ERR_INVALID_STATE) {
-        if (was_busy || musiclib_scan_busy()) why = "busy";
-        else if (!sd_card_present())         why = "no_card";
-        else if (!sd_card_mounted())         why = "not_mounted";
-        /* 卡在、也没在扫，却报"状态不对"：只能是状态刚被别的路径（模式切换）动过。
-         * 报 busy 最不误导 —— 让前端过一会儿重试，而不是让用户去动卡。 */
-        else                                 why = "busy";
-        ESP_LOGW(TAG, "扫描没起来: %s（present=%d mounted=%d）",
-                 why, (int)sd_card_present(), (int)sd_card_mounted());
-    } else {
-        why = esp_err_to_name(err);
-        ESP_LOGE(TAG, "扫描起不来: %s", why);
-    }
-
-    /* 刻意不用 fail()：这是"业务上没起来"而不是"请求不合法"，前端要读 why
-     * 才能显示对应的提示，所以依旧 200 + 结构化结果（同 h_wifi_scan 的思路）。 */
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddBoolToObject(o, "ok", started);
-    cJSON_AddBoolToObject(o, "started", started);
-    cJSON_AddBoolToObject(o, "busy", musiclib_scan_busy());
-    cJSON_AddStringToObject(o, "why", why);
-    cJSON_AddNumberToObject(o, "count", musiclib_count());
-    cJSON_AddNumberToObject(o, "found", musiclib_scan_found());
-    return send_json(req, o);
-}
-
-/* 收藏同步进度：POST / GET 共用（GET 只是不发命令），省得前端写两套解析。
- * ⚠️ err 给的是【整数错误码】而不是字符串：前端拿它跟 0 比就行，
- *    想知道名字去看 /api/debug（那边给的是 esp_err_to_name）。 */
-static void sync_fill(cJSON *o)
-{
-    cJSON_AddBoolToObject(o, "busy", player_sync_offline_busy());
-    cJSON_AddBoolToObject(o, "done", player_sync_offline_done());
-    cJSON_AddNumberToObject(o, "synced", player_sync_offline_synced());
-    cJSON_AddNumberToObject(o, "skipped", player_sync_offline_skipped());
-    cJSON_AddNumberToObject(o, "err", (int)player_sync_offline_err());
-}
-
-/* 在线收藏 → 离线收藏。POST 起一次同步，GET 查进度。
- * 同步要临时挂卡 + 读索引，是几百毫秒到几秒的活，所以同样立刻返回、只轮询进度。 */
-static esp_err_t h_sync_offline(httpd_req_t *req)
-{
-    if (req->method != HTTP_GET) player_sync_to_offline();
-
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddBoolToObject(o, "ok", true);   /* 只是"命令收到了"，不表示已经同步完 */
-    sync_fill(o);
-    return send_json(req, o);
 }
 
 /* ============================================================ 配置 */
@@ -1107,31 +1126,331 @@ static esp_err_t h_debug(httpd_req_t *req)
     cJSON_AddNumberToObject(fs, "last_errno", store_last_errno());
     cJSON_AddNumberToObject(fs, "recent", player_recent_count());
 
-    /* M9：TF 卡 + 离线曲库。"离线模式里一首歌都没有"这类问题基本就在这两块：
-     *   present=卡检测脚怎么说（低电平=有卡）、mounted=驱动挂上没、
-     *   mount_count=累计挂成功几次（能看出是不是反复挂/卸，比如卡接触不良）。
-     * ⚠️ 在线模式平时就是**卸载**状态，那时 mounted=false 是正常的。 */
-    cJSON *sd = cJSON_AddObjectToObject(o, "sd");
-    cJSON_AddBoolToObject(sd, "present", sd_card_present());
-    cJSON_AddBoolToObject(sd, "mounted", sd_card_mounted());
-    cJSON_AddNumberToObject(sd, "mount_count", sd_card_mount_count());
-    cJSON_AddStringToObject(sd, "last_err", esp_err_to_name(sd_card_last_err()));
-
-    /* 索引状态。count=0 只说明"索引里没歌"（没扫过 / 卡换了 / 索引文件校验不过），
-     * 不等于出错 —— 真出错看 last_err。 */
-    cJSON *ml = cJSON_AddObjectToObject(o, "musiclib");
-    cJSON_AddNumberToObject(ml, "count", musiclib_count());
-    cJSON_AddBoolToObject(ml, "scan_busy", musiclib_scan_busy());
-    cJSON_AddNumberToObject(ml, "scanned", musiclib_scan_scanned());
-    cJSON_AddNumberToObject(ml, "found", musiclib_scan_found());
-    cJSON_AddStringToObject(ml, "last_err", esp_err_to_name(musiclib_last_err()));
-
     cJSON *bt = cJSON_AddObjectToObject(o, "hid");
     hid_fill(bt);
     return send_json(req, o);
 }
 
 /* ============================================================ 注册 */
+
+/* ============================================================ 固件升级（OTA）
+ *
+ * 为什么现在做：分区表里那对 3MB 的 ota_0/ota_1 从项目一开始就留着
+ * （注释写着"以后改 UI 走 WiFi 升级"），但一直没实现 ——
+ * 结果每次改固件都得插 USB 烧录，实测一轮改了十几次就得插十几次。
+ *
+ * 流程：POST /api/update?confirm=1，**请求体就是 esp-music.bin 的原始字节** →
+ *       写进"下一个" OTA 分区 → esp_ota_end() 校验 → 切换启动分区 → 1 秒后重启。
+ *
+ * 为什么刷不成砖：
+ *   · `esp_ota_set_boot_partition()` **只在 esp_ota_end() 校验通过之后**才调用。
+ *     中途断电 / 上传截断 / 传错文件，都只是"这次升级失败"，重启还是跑旧固件。
+ *   · 升级全程只写"下一个"分区，**当前正在跑的那个分区一个字节都不碰**。
+ *
+ * ⚠️ 分块缓冲必须放 PSRAM：起播后内部 SRAM 只剩几十 KB，而 httpd 任务栈只有 4KB，
+ *    在那儿放 4KB 的局部数组会直接爆栈。
+ * ⚠️ esp_ota_write 要求每块长度是 4 的倍数（最后一块除外），所以按 4096 收。
+ * ⚠️ 依赖 `partitions.csv` 里 ota_0/ota_1 这对槽 —— 它们**不能删**，
+ *    删了就没法再远程升级，只能插 USB 救。
+ */
+static volatile int s_ota_pct = -1;      /* -1 = 没在升级；0..100 = 进度 */
+
+static esp_err_t h_update_status(httpd_req_t *req)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "busy", s_ota_pct >= 0);
+    cJSON_AddNumberToObject(o, "pct", s_ota_pct);
+    /* 顺带报两个 app 槽，排查"这次升到哪个槽了"很方便 */
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    const esp_partition_t *nxt = esp_ota_get_next_update_partition(NULL);
+    cJSON_AddStringToObject(o, "running", run ? run->label : "?");
+    cJSON_AddStringToObject(o, "next",    nxt ? nxt->label : "?");
+    return send_json(req, o);
+}
+
+static void ota_reboot_cb(void *arg) { esp_restart(); }
+
+static esp_err_t h_update(httpd_req_t *req)
+{
+    /* 防误触：别人随手 POST 一下不该触发升级 */
+    char cf[8] = {0};
+    if (!query_str(req, "confirm", cf, sizeof(cf)) || strcmp(cf, "1") != 0) {
+        return fail(req, "400 Bad Request", "升级要带 ?confirm=1（防误触）");
+    }
+    if (req->content_len <= 0) {
+        return fail(req, "400 Bad Request", "请求体是空的（要把 .bin 的原始字节作为 body）");
+    }
+    if (s_ota_pct >= 0) return fail(req, "409 Conflict", "已经有一次升级在进行");
+
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (part == NULL) return fail(req, "500", "没有可用的 OTA 分区（partitions.csv 里 ota_0/ota_1 还在吗？）");
+    if ((size_t)req->content_len > part->size) {
+        return fail(req, "413", "固件比 OTA 分区还大，装不下");
+    }
+
+    ESP_LOGW(TAG, "OTA 开始：%u 字节 → 分区 %s（%u KB）",
+             (unsigned)req->content_len, part->label, (unsigned)(part->size / 1024));
+    s_ota_pct = 0;
+
+    const size_t CHUNK = 4096;
+    char *buf = heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
+    if (buf == NULL) { s_ota_pct = -1; return fail(req, "500", "没有内存收固件"); }
+
+    esp_ota_handle_t ota = 0;
+    esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &ota);
+    if (err != ESP_OK) {
+        heap_caps_free(buf);
+        s_ota_pct = -1;
+        ESP_LOGE(TAG, "ota_begin 失败: %s", esp_err_to_name(err));
+        return fail(req, "500", "ota_begin 失败");
+    }
+
+    int total = req->content_len;
+    int got = 0;
+    while (got < total) {
+        int want = total - got;
+        if (want > (int)CHUNK) want = (int)CHUNK;
+        int n = httpd_req_recv(req, buf, want);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;      /* 网络抖动：重试这一块 */
+        if (n <= 0) {
+            ESP_LOGE(TAG, "收包中断（%d/%d）", got, total);
+            err = ESP_FAIL;
+            break;
+        }
+        err = esp_ota_write(ota, buf, n);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ota_write 失败: %s", esp_err_to_name(err));
+            break;
+        }
+        got += n;
+        s_ota_pct = got * 100 / total;
+    }
+    heap_caps_free(buf);
+
+    if (err != ESP_OK || got != total) {
+        esp_ota_abort(ota);
+        s_ota_pct = -1;
+        return fail(req, "500", "写入失败/中断，已放弃 —— 旧固件不受影响，重启还是它");
+    }
+
+    /* ★ 校验：镜像损坏、或者传错文件（比如把 assets.bin 传上来）会在这里被挡下 */
+    err = esp_ota_end(ota);
+    if (err != ESP_OK) {
+        s_ota_pct = -1;
+        ESP_LOGE(TAG, "ota_end 校验失败: %s", esp_err_to_name(err));
+        return fail(req, "400", "镜像校验失败 —— 是不是传错文件了？（要传 build/esp-music.bin）");
+    }
+
+    err = esp_ota_set_boot_partition(part);
+    if (err != ESP_OK) {
+        s_ota_pct = -1;
+        ESP_LOGE(TAG, "set_boot_partition 失败: %s", esp_err_to_name(err));
+        return fail(req, "500", "切换启动分区失败，这次升级没生效");
+    }
+
+    ESP_LOGW(TAG, "OTA 完成：下次从 %s 启动，1 秒后重启", part->label);
+    s_ota_pct = 100;
+
+    /* 先把响应发出去，客户端才知道成功了；重启放到定时器里做 ——
+     * 否则"响应还没发完就重启"，浏览器只看到连接断开，会以为升级失败。 */
+    esp_timer_handle_t t = NULL;
+    const esp_timer_create_args_t targs = { .callback = ota_reboot_cb, .name = "ota_reboot" };
+    if (esp_timer_create(&targs, &t) == ESP_OK) esp_timer_start_once(t, 1000 * 1000);
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddStringToObject(o, "note", "1 秒后重启到新固件");
+    return send_json(req, o);
+}
+
+/* ============================================================ 网络日志
+ *
+ * 为什么需要它：这台设备平时**独立供电、不接电脑** —— 没插串口就等于瞎了。
+ * 而开发时几乎所有的 bug 都是靠串口日志抓到的（接口静默注册失败、
+ * 封面尺寸坑、"QQ 到底拉到歌没有"）。把日志搬到网页上，
+ * 不插线也能看，手机连设备热点也能看。
+ *
+ * 做法：钩住 `esp_log_set_vprintf()` —— 除了照常往串口打，再抄一份进 PSRAM 环形缓冲。
+ * 缓冲按**行**存，每行带一个只增不减的序号；网页用 `?since=<序号>` 增量拉，
+ * 所以每秒轮询也只传新增的那几行。
+ *
+ * ⚠️ 三条硬约束（vprintf 钩子会在**任意任务、甚至中断上下文**被调用）：
+ *   1. 只做 memcpy 和索引运算 —— **不加锁、不 malloc、不做 I/O**，
+ *      否则某个任务在打日志时持锁，别的任务再来打日志就死锁。
+ *   2. 缓冲区启动时一次性分配在 PSRAM。
+ *   3. 覆盖写：满了冲掉最旧的。日志要的是"最近发生了什么"，旧的不重要。
+ */
+#define LOG_LINE_MAX   192                      /* 单行截断长度 */
+#define LOG_LINES      160                      /* 160 × 192 ≈ 30 KB PSRAM */
+
+typedef struct {
+    volatile uint32_t seq;                      /* 只增不减的行号（0 = 这个槽还没用过） */
+    volatile uint16_t len;
+    char              text[LOG_LINE_MAX];
+} log_rec_t;
+
+static log_rec_t *s_log;                        /* PSRAM 环形数组 */
+static volatile uint32_t s_log_next;            /* 下一个要写的行号（从 1 开始） */
+static vprintf_like_t    s_old_vprintf;         /* 原来的输出（串口），必须继续调 */
+
+/* ---------- 崩溃现场：放在 RTC 慢速内存里 ----------
+ *
+ * 为什么是 RTC RAM 而不是写 flash/cache 分区：
+ *   · **软复位、看门狗、异常崩溃都不丢** —— 只有彻底断电才丢。
+ *     而我们要覆盖的场景（"新固件能启动但一启动就崩，反复重启"）**正是软复位循环**，
+ *     RTC RAM 完全够用。
+ *   · 没有 flash 磨损顾虑，所以可以**每行都写**，崩溃瞬间的日志还在；
+ *     写 flash 的话要在"多久落一次盘"里两难（太快伤 flash、太慢丢现场）。
+ *
+ * ⚠️ RTC 慢速内存总共只有 8KB（启动日志里 RTCRAM 是 7KB），所以这里只留 2KB ——
+ *    够放"最后 10~20 行"，而那通常正好包含崩因。
+ * ⚠️ 必须用魔数判断"这块内存是本次开机刚上电（内容随机）还是上次留下的"，
+ *    否则上电会把随机字节当日志打出来。 */
+#define RTC_LOG_SIZE  2048
+#define RTC_LOG_MAGIC 0x45534C47u               /* "ESLG" */
+static RTC_NOINIT_ATTR char     s_rtc_log[RTC_LOG_SIZE];
+static RTC_NOINIT_ATTR uint32_t s_rtc_magic;
+static RTC_NOINIT_ATTR uint32_t s_rtc_len;
+static RTC_NOINIT_ATTR uint32_t s_rtc_boots;    /* 累计开机次数：反复重启一眼可见 */
+static RTC_NOINIT_ATTR int32_t  s_rtc_reason;
+
+/* 往 RTC 环形里追加一行（软复位后还能读到） */
+static void rtc_log_append(const char *s, size_t n)
+{
+    if (n == 0) return;
+    if (s_rtc_magic != RTC_LOG_MAGIC) {         /* 上电首次：初始化 */
+        s_rtc_magic = RTC_LOG_MAGIC;
+        s_rtc_len = 0;
+        s_rtc_boots = 0;
+        s_rtc_reason = -1;
+    }
+    if (n > RTC_LOG_SIZE / 2) {                 /* 单行太长就截断（保尾部） */
+        s += n - RTC_LOG_SIZE / 2;
+        n = RTC_LOG_SIZE / 2;
+    }
+    if (s_rtc_len + n > RTC_LOG_SIZE) {         /* 满了：整体前移，冲掉最旧的 */
+        size_t drop = s_rtc_len + n - RTC_LOG_SIZE;
+        memmove(s_rtc_log, s_rtc_log + drop, s_rtc_len - drop);
+        s_rtc_len -= drop;
+    }
+    memcpy(s_rtc_log + s_rtc_len, s, n);
+    s_rtc_len += n;
+}
+
+/* 把上一次运行的尾部日志打出来（在钩子装好之后调，这样它自己也会进新日志）。 */
+static void rtc_log_dump_prev(void)
+{
+    esp_reset_reason_t rr = esp_reset_reason();
+    if (s_rtc_magic == RTC_LOG_MAGIC && s_rtc_len > 0) {
+        ESP_LOGW(TAG, "===== 上次运行的尾部日志（RTC 内存，共 %u 字节；"
+                      "上一次复位原因=%d，累计开机 %u 次）=====",
+                 (unsigned)s_rtc_len, (int)s_rtc_reason, (unsigned)s_rtc_boots);
+        /* 按行打出来，保留原本的换行 */
+        size_t i = 0;
+        while (i < s_rtc_len) {
+            size_t j = i;
+            while (j < s_rtc_len && s_rtc_log[j] != '\n') j++;
+            char line[200];
+            size_t n = j - i;
+            if (n > sizeof(line) - 1) n = sizeof(line) - 1;
+            memcpy(line, s_rtc_log + i, n);
+            line[n] = 0;
+            if (n > 0) ESP_LOGW(TAG, "  [上次] %s", line);
+            i = (j < s_rtc_len) ? j + 1 : j;
+        }
+        ESP_LOGW(TAG, "===== 上次日志结束 =====");
+    } else {
+        ESP_LOGI(TAG, "RTC 里没有上次的日志（本次是上电冷启动）");
+    }
+    /* ★ 记下"本次开机"的信息，供下次崩溃时回看。
+     *   ⚠️ 复位原因是**读上一次**的，所以要先读再覆盖自己的。 */
+    s_rtc_reason = (int32_t)rr;
+    s_rtc_boots++;
+}
+
+static void log_line(const char *s, size_t n)
+{
+    if (n == 0) return;
+    rtc_log_append(s, n);                       /* 先存崩溃现场（哪怕下面没缓冲） */
+    if (s_log == NULL) return;
+    if (n > LOG_LINE_MAX - 1) n = LOG_LINE_MAX - 1;
+    uint32_t seq = s_log_next;
+    log_rec_t *r = &s_log[seq % LOG_LINES];
+    /* 先写内容，最后再写 seq —— 读的人靠 seq 判断这条是不是新的/写完的 */
+    memcpy(r->text, s, n);
+    r->text[n] = 0;
+    r->len = (uint16_t)n;
+    r->seq = seq + 1;                           /* 行号从 1 开始，0 表示空槽 */
+    s_log_next = seq + 1;
+}
+
+/* vprintf 钩子：串口照打，另抄一份进环形缓冲 */
+static int log_vprintf(const char *fmt, va_list ap)
+{
+    va_list cp;
+    va_copy(cp, ap);
+    char tmp[LOG_LINE_MAX];
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, cp);
+    va_end(cp);
+    if (n > 0) log_line(tmp, (size_t)(n < (int)sizeof(tmp) ? n : (int)sizeof(tmp) - 1));
+    /* ★ 串口输出必须继续走原来的路子，不能因为加了网页日志就丢掉串口 */
+    return s_old_vprintf ? s_old_vprintf(fmt, ap) : n;
+}
+
+void web_log_init(void)
+{
+    if (s_log != NULL) return;
+    s_log = heap_caps_calloc(LOG_LINES, sizeof(log_rec_t), MALLOC_CAP_SPIRAM);
+    if (s_log == NULL) {
+        ESP_LOGW(TAG, "日志环形缓冲分配失败（%u KB）—— 网页日志不可用",
+                 (unsigned)(LOG_LINES * sizeof(log_rec_t) / 1024));
+        return;
+    }
+    s_log_next = 1;
+    s_old_vprintf = esp_log_set_vprintf(log_vprintf);
+    ESP_LOGW(TAG, "网络日志已启用：%d 行 × %d 字节（PSRAM），GET /api/log?since=N",
+             LOG_LINES, LOG_LINE_MAX);
+
+    /* ★ 钩子装好【之后】再回放上次崩溃的尾部日志 —— 这样这段回放本身
+     *   也会进本次的网络日志，网页上连着看就是"上次怎么崩的 + 这次开机"。 */
+    rtc_log_dump_prev();
+}
+
+/* GET /api/log?since=<上次拿到的最大行号> → 纯文本，每行 "<行号> <内容>"
+ * 为什么要带行号：客户端拿最大行号当地标，下次只拉新的 —— 每秒轮询也不费流量。 */
+static esp_err_t h_log(httpd_req_t *req)
+{
+    char q[16] = {0};
+    uint32_t since = 0;
+    if (query_str(req, "since", q, sizeof(q))) since = (uint32_t)strtoul(q, NULL, 10);
+
+    if (s_log == NULL) return fail(req, "503 Service Unavailable", "网络日志没启用（缓冲分配失败）");
+
+    /* 先算最老还有效的行号；since 比它还旧就从最老的开始（中间的被覆盖了） */
+    uint32_t next = s_log_next;
+    uint32_t oldest = (next > LOG_LINES) ? (next - LOG_LINES) : 1;
+    if (since + 1 > oldest) oldest = since + 1;
+
+    /* 拼进 PSRAM（最多 30KB）—— 不占内部 SRAM，也不做 chunked 的麻烦事 */
+    size_t cap = (size_t)LOG_LINES * (LOG_LINE_MAX + 16) + 64;
+    char *out = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (out == NULL) return fail(req, "500", "没有内存拼日志");
+    size_t o = 0;
+    for (uint32_t s = oldest; s < next; s++) {
+        const log_rec_t *r = &s_log[(s - 1) % LOG_LINES];
+        if (r->seq != s || r->len == 0) continue;      /* 被覆盖了或还没写完 */
+        /* ⚠️ 日志行**自带换行**，所以这里不加 \n —— 加了每行之间会多一个空行。
+         *    但没有换行的（极少）补一个，否则两行会粘在一起。 */
+        bool nl = (r->text[r->len - 1] == '\n');
+        o += snprintf(out + o, cap - o, "%" PRIu32 " %s%s", s, r->text, nl ? "" : "\n");
+        if (cap - o < LOG_LINE_MAX + 24) break;
+    }
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    esp_err_t e = httpd_resp_send(req, out, o);
+    heap_caps_free(out);
+    return e;
+}
 
 esp_err_t web_console_start(void)
 {
@@ -1146,13 +1465,17 @@ esp_err_t web_console_start(void)
     cfg.max_open_sockets   = 6;
     cfg.lru_purge_enable   = true;      /* 满了就踢最久没动的连接，别拒绝新请求 */
     cfg.stack_size         = 4096;
-    /* ⚠️ 这是"最多能注册多少条 uri_handler"，而 httpd 是【同一个 uri 的每种 method
-     * 各占一条】的（/api/quality、/api/wifi、/api/hid 都是 GET+POST 两条）。
-     * 加 M9 三个接口前，表里已经正好 33 条 —— 超了 32，最后注册的 /api/hid/send
-     * 一直在静默失败（只在串口留一行 warn，网页那边就是 404）。
-     * 所以这里放到 40：32 条太紧，而且每条只是一个指针 + 一个几十字节的结构
-     * （hd_calls 存的是指针数组，4B/条），放宽这点换"接口不会莫名其妙 404"很划算。 */
-    cfg.max_uri_handlers   = 40;
+    /* ⚠️ 这个数字**必须大于 uris[] 的项数**，而且要有余量。
+     *
+     * 血泪教训（2026-10-11 真机验证抓到）：这里原来是 32，而 uris[] 已经有 **33** 项 ——
+     * 超出的部分会**静默注册失败**，而且失败的是**数组末尾那几个**，不是新加的那个。
+     * 当时的症状是 `/api/hid`、`/api/hid/send`（蓝牙遥控）一直注册不上，
+     * 只在日志里留一行 `no slots left for registering handler`（W 级），
+     * 平时看启动日志很容易划过去。我加 `/api/back` 把它从"少 1 个"变成"少 2 个"才发现。
+     *
+     * 内存代价：每项只是一个指针（sizeof(httpd_uri_t*)），48 项 = 192 字节，可以忽略。
+     * 所以这里给足余量，宁可多留也别再踩一次。 */
+    cfg.max_uri_handlers   = 48;
     cfg.recv_wait_timeout  = 5;
     cfg.send_wait_timeout  = 5;
 
@@ -1165,6 +1488,14 @@ esp_err_t web_console_start(void)
     }
 
     static const httpd_uri_t uris[] = {
+        { .uri = "/api/cache",           .method = HTTP_POST, .handler = h_cache },
+        { .uri = "/api/log",             .method = HTTP_GET,  .handler = h_log },
+        { .uri = "/api/qq",              .method = HTTP_GET,  .handler = h_qq },
+        { .uri = "/api/qq",              .method = HTTP_POST, .handler = h_qq },
+        { .uri = "/api/tf",              .method = HTTP_GET,  .handler = h_tf },
+        { .uri = "/api/tf",              .method = HTTP_POST, .handler = h_tf },
+        { .uri = "/api/update",          .method = HTTP_POST, .handler = h_update },
+        { .uri = "/api/update",          .method = HTTP_GET,  .handler = h_update_status },
         { .uri = "/",                    .method = HTTP_GET,  .handler = h_index },
         { .uri = "/api/status",          .method = HTTP_GET,  .handler = h_status },
         { .uri = "/api/lyrics",          .method = HTTP_GET,  .handler = h_lyrics },
@@ -1192,6 +1523,7 @@ esp_err_t web_console_start(void)
         { .uri = "/api/mute",            .method = HTTP_POST, .handler = h_mute },
         { .uri = "/api/bright",          .method = HTTP_POST, .handler = h_bright },
         { .uri = "/api/source",          .method = HTTP_POST, .handler = h_source },
+        { .uri = "/api/back",            .method = HTTP_POST, .handler = h_back },
         /* 音质挡位：GET 读、POST 写，同一个处理器按 method 分支 */
         { .uri = "/api/quality",         .method = HTTP_GET,  .handler = h_quality },
         { .uri = "/api/quality",         .method = HTTP_POST, .handler = h_quality },
@@ -1199,17 +1531,6 @@ esp_err_t web_console_start(void)
         { .uri = "/api/hid",             .method = HTTP_GET,  .handler = h_hid },
         { .uri = "/api/hid",             .method = HTTP_POST, .handler = h_hid_set },
         { .uri = "/api/hid/send",        .method = HTTP_GET,  .handler = h_hid_send },
-        /* M9：在线/离线模式、TF 卡扫描、收藏同步。
-         * ⚠️ httpd 是【按 method 分别占槽】的（同一个 uri 注册 GET+POST 就是两条，
-         *    见 httpd_register_uri_handler），所以这三个接口要占 6 个槽，不是 3 个。
-         *    槽位不够时后面的注册会静默失败（只在日志里留一行），接口直接 404 ——
-         *    所以下面 max_uri_handlers 跟着放宽了，改这几行时记得一起数。 */
-        { .uri = "/api/mode",            .method = HTTP_GET,  .handler = h_mode },
-        { .uri = "/api/mode",            .method = HTTP_POST, .handler = h_mode },
-        { .uri = "/api/scan",            .method = HTTP_GET,  .handler = h_scan },
-        { .uri = "/api/scan",            .method = HTTP_POST, .handler = h_scan },
-        { .uri = "/api/sync_offline",    .method = HTTP_GET,  .handler = h_sync_offline },
-        { .uri = "/api/sync_offline",    .method = HTTP_POST, .handler = h_sync_offline },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         esp_err_t e = httpd_register_uri_handler(srv, &uris[i]);

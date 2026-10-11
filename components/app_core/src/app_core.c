@@ -31,7 +31,7 @@ void player_status_get(player_status_t *out)
 
 void player_status_set_song(const char *song_id, const char *title, const char *artist,
                             const char *album, const char *cover_id, uint32_t duration_ms,
-                            bool starred)
+                            bool starred, uint8_t back)
 {
     if (s_lock == NULL) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -40,6 +40,7 @@ void player_status_set_song(const char *song_id, const char *title, const char *
     strlcpy(s_st.artist,   artist   ? artist   : "", sizeof(s_st.artist));
     strlcpy(s_st.album,    album    ? album    : "", sizeof(s_st.album));
     strlcpy(s_st.cover_id, cover_id ? cover_id : "", sizeof(s_st.cover_id));
+    s_st.back        = back;          /* 拼封面 URL 要用（QQ 和 Navidrome 完全不同） */
     s_st.duration_ms = duration_ms;
     s_st.position_ms = 0;
     s_st.starred     = starred;
@@ -88,13 +89,5 @@ void player_status_set_volume(int vol)
     if (s_lock == NULL) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_st.volume = vol;
-    xSemaphoreGive(s_lock);
-}
-
-void player_status_set_mode(int mode)
-{
-    if (s_lock == NULL) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_st.mode = (uint8_t)mode;
     xSemaphoreGive(s_lock);
 }

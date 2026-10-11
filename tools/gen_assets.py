@@ -36,6 +36,37 @@ ENTRY_SZ = 44
 HDR_SZ = 16
 
 
+WEB_C_OUT = os.path.join(ROOT, "components", "web_console", "src", "web_index_gz.c")
+
+
+def gen_web_c(gz: bytes) -> None:
+    """把 gzip 后的网页写成 C 数组，编进 **app 二进制**。
+
+    为什么必须这么绕一道：`assets` 是【独立分区】，而 OTA 只更新 app 分区 ——
+    网页放在 assets 里的话，"改一次网页就得插一次 USB 刷"。
+    实测踩到过：OTA 上传成功、重启也换了槽，但页面一点没变。
+    塞进 app 之后，网页改动就能跟着 OTA 走了（gzip 后只有几十 KB，不值一提）。
+    字库/图标仍留在 assets 分区：它们几百 KB，而且很少改。
+    """
+    lines = []
+    for i in range(0, len(gz), 16):
+        chunk = gz[i:i + 16]
+        lines.append("    " + ",".join(f"0x{b:02x}" for b in chunk) + ",")
+    with open(WEB_C_OUT, "w", encoding="utf-8") as fh:
+        fh.write(
+            "/* 自动生成，别手改 —— 见 tools/gen_assets.py 的 gen_web_c()。\n"
+            " *\n"
+            " * 为什么网页要编进 app：assets 是【独立分区】，而 OTA 只更新 app 分区 ——\n"
+            " * 网页放 assets 里的话，「改一次网页就得插一次 USB」，而网页恰恰是最常改的。\n"
+            " * 塞进 app 后，网页改动也能跟着 OTA 走（gzip 后只有几十 KB）。\n"
+            " * 字库/图标仍留在 assets 分区：几百 KB，且很少改。 */\n"
+            "const unsigned char web_index_gz[] = {\n"
+            + "\n".join(lines) + "\n};\n"
+            f"const unsigned int web_index_gz_len = {len(gz)}u;\n"
+        )
+    print(f"  内嵌网页 → components/web_console/src/web_index_gz.c（{len(gz)} 字节）")
+
+
 def name_to_id(name: str) -> str:
     """文件名 → C 枚举名。
     ⚠️ 要去掉【所有】扩展名并把非法字符换掉：网页是 "index.html.gz"，
@@ -102,6 +133,16 @@ def main():
             # 名字记成 "<原名>.gz"，http_console 按 "index.html" 也能查到
             items.append((f + ".gz", gz, FMT_WEB_GZ, 0, 0))
             print(f"  网页 {f}: {len(raw)} → gzip {len(gz)} 字节（{100*len(gz)//max(len(raw),1)}%）")
+            # ★★ 同时生成一份【内嵌进 app 二进制】的 C 数组（2026-10-11）。
+            #
+            # 为什么必须这么做：assets 是**独立分区**，而 OTA 只更新 app 分区
+            # （那次实测就是"上传成功了、页面却没变"，因为网页在 assets 里）。
+            # 网页塞进 app 之后，"改网页"也能跟着 OTA 走 —— 而这正是最常改的东西。
+            #
+            # 字库/图标**继续留在 assets 分区**：它们几百 KB（塞进 app 太浪费），
+            # 而且很少改；换它们插一次 USB 可以接受。
+            if f == "index.html":
+                gen_web_c(gz)
 
     # --- 拼音表（tools/gen_pinyin.py 生成的通用 blob）---
     if os.path.isdir(PINYIN_DIR):

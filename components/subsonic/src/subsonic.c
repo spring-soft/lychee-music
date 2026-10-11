@@ -96,6 +96,19 @@ bool subsonic_last_raw(void) { return s_last_raw; }
 static char s_last_why[48] = "?";
 const char *subsonic_last_why(void) { return s_last_why; }
 
+/* ★ 给【别的后端】标一次"这次是直连、不是转码"。
+ *
+ * 为什么需要它（真机踩到的）：屏幕/网页上那个"直出 / 转码"指示器读的就是 s_last_raw，
+ * 而它**只在 subsonic_stream_url() 里被写过**。QQ 音乐走的是 qqmusic_stream_url()，
+ * 根本不经过这里 —— 于是这个变量一直是初值 false，屏幕**永远显示"转码"**，
+ * 哪怕实际放的是 CDN 上的无损原文件（用户报的"QQ 一直显示转码"就是这个）。
+ * QQ 那条路把 URL 拼好后调一次本函数即可。 */
+void subsonic_note_direct(const char *why)
+{
+    s_last_raw = true;
+    strlcpy(s_last_why, why ? why : "直连", sizeof(s_last_why));
+}
+
 /* ---------- 音质挡位 ----------
  * ⚠️ 放在这一层而不是 UI 层：屏幕菜单和网页控制台共用同一套挡位。
  *    网页控制台在 ui 的下层结构里不能 include ui，各写一份必然会不一致。
@@ -787,6 +800,23 @@ esp_err_t subsonic_get_cover_raw(const char *cover_id, int size_px,
     char url[384];
     snprintf(url, sizeof(url), "%s/rest/getCoverArt.view?id=%s&size=%d", s_host, cover_id, size_px);
     append_auth(url, sizeof(url));
+    return subsonic_cover_raw_url(url, size_px, out, len_out);
+}
+
+/* 按【完整 URL】取封面原始 JPEG。
+ *
+ * 为什么单独开这个入口：**QQ 音乐的封面不在 Subsonic 服务器上** ——
+ * 它是 y.qq.com 的直链（`qqmusic_cover_url()` 拼），跟 /rest/getCoverArt 毫无关系。
+ * 但"限尺寸 / 验魔数 / 是不是 JPEG"这几道闸两条路完全一样，所以抽出来共用，
+ * 免得 QQ 那条路重新踩一遍 WebP / 非 JPEG 的坑。 */
+esp_err_t subsonic_cover_raw_url(const char *url, int size_px,
+                                 uint8_t **out, size_t *len_out)
+{
+    *out = NULL;
+    *len_out = 0;
+    if (url == NULL || url[0] == 0) return ESP_ERR_INVALID_ARG;
+    if (size_px <= 0) size_px = 96;
+    if (size_px > 300) size_px = 300;
 
     /* ⚠️ ⚠️ Navidrome 对【内嵌封面是 WebP 的专辑】会原样透传 WebP，且无视 size 参数。
      *    原因是它用的 Go 图像库（disintegration/imaging）没有 WebP 解码器，转不了码，
@@ -802,8 +832,8 @@ esp_err_t subsonic_get_cover_raw(const char *cover_id, int size_px,
     size_t jpeg_len = 0;
     esp_err_t err = http_get_body_lim(url, &jpeg, &jpeg_len, &status, cap_bytes);
     if (err == ESP_ERR_INVALID_SIZE) {
-        ESP_LOGW(TAG, "封面 %s: 服务端没按 size=%d 转码（多半是 WebP，Navidrome 转不了）—— 用占位图",
-                 cover_id, size_px);
+        ESP_LOGW(TAG, "封面: 服务端没按 size=%d 转码（多半是 WebP，Navidrome 转不了）—— 用占位图",
+                 size_px);
         return err;
     }
     if (err != ESP_OK) {
@@ -811,9 +841,14 @@ esp_err_t subsonic_get_cover_raw(const char *cover_id, int size_px,
         return err;
     }
     if (jpeg_len < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) {
-        ESP_LOGW(TAG, "封面 %s 不是 JPEG（前 4 字节 %02X %02X %02X %02X）—— 用占位图",
-                 cover_id, jpeg[0], jpeg_len > 1 ? jpeg[1] : 0,
-                 jpeg_len > 2 ? jpeg[2] : 0, jpeg_len > 3 ? jpeg[3] : 0);
+        /* ⚠️ 把 URL 一起打出来 —— 真机踩到过：QQ 封面回来 232 字节的 HTML
+         *    （前 4 字节 `<sub`），主机上同一个 URL 却是 JPEG。
+         *    不打 URL 就只能干瞪眼，排查要多花一小时。 */
+        ESP_LOGW(TAG, "封面不是 JPEG（前 4 字节 %02X %02X %02X %02X，共 %u 字节）—— 用占位图\n"
+                      "          请求的是: %.150s",
+                 jpeg[0], jpeg_len > 1 ? jpeg[1] : 0,
+                 jpeg_len > 2 ? jpeg[2] : 0, jpeg_len > 3 ? jpeg[3] : 0,
+                 (unsigned)jpeg_len, url);
         heap_caps_free(jpeg);
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -861,16 +896,12 @@ esp_err_t subsonic_get_song(const char *song_id, sub_song_t *out)
     return n ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t subsonic_get_cover_rgb565(const char *cover_id, int size_px,
-                                    uint8_t *out, size_t out_cap,
-                                    uint16_t *w_out, uint16_t *h_out)
+/* 把已经下好的 JPEG 解码成 RGB565-BE。
+ * 两个入口共用：按 cover_id 的（Navidrome）和按完整 URL 的（QQ 音乐）。 */
+static esp_err_t cover_decode_rgb565(uint8_t *jpeg, size_t jpeg_len,
+                                     uint8_t *out, size_t out_cap,
+                                     uint16_t *w_out, uint16_t *h_out)
 {
-    uint8_t *jpeg = NULL;
-    size_t jpeg_len = 0;
-    esp_err_t err = subsonic_get_cover_raw(cover_id, size_px, &jpeg, &jpeg_len);
-    if (err != ESP_OK) return err;
-
-
     jpeg_dec_config_t cfg = {
         .output_type = JPEG_PIXEL_FORMAT_RGB565_BE,   /* 大端：与本机屏幕字节序一致 */
         .scale       = { 0, 0 },
@@ -918,4 +949,30 @@ esp_err_t subsonic_get_cover_rgb565(const char *cover_id, int size_px,
     ESP_LOGI(TAG, "封面 %dx%d 解码完成（%u 字节 RGB565-BE）",
              info.width, info.height, (unsigned)need);
     return ESP_OK;
+}
+
+/* Navidrome 的封面：cover_id 是 coverArt id，走 /rest/getCoverArt */
+esp_err_t subsonic_get_cover_rgb565(const char *cover_id, int size_px,
+                                    uint8_t *out, size_t out_cap,
+                                    uint16_t *w_out, uint16_t *h_out)
+{
+    uint8_t *jpeg = NULL;
+    size_t jpeg_len = 0;
+    esp_err_t err = subsonic_get_cover_raw(cover_id, size_px, &jpeg, &jpeg_len);
+    if (err != ESP_OK) return err;
+    return cover_decode_rgb565(jpeg, jpeg_len, out, out_cap, w_out, h_out);
+}
+
+/* QQ 音乐的封面：url 是 y.qq.com 直链（qqmusic_cover_url() 拼好）
+ * ⚠️ 那个 CDN 的 Content-Type 也是乱的（和音频一样），但这不影响 ——
+ *    下面的解码路径本来就只认魔数，不认头部。 */
+esp_err_t subsonic_cover_rgb565_url(const char *url, int size_px,
+                                    uint8_t *out, size_t out_cap,
+                                    uint16_t *w_out, uint16_t *h_out)
+{
+    uint8_t *jpeg = NULL;
+    size_t jpeg_len = 0;
+    esp_err_t err = subsonic_cover_raw_url(url, size_px, &jpeg, &jpeg_len);
+    if (err != ESP_OK) return err;
+    return cover_decode_rgb565(jpeg, jpeg_len, out, out_cap, w_out, h_out);
 }

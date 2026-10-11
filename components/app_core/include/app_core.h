@@ -24,6 +24,8 @@ typedef struct {
     char     artist[96];
     char     album[96];
     char     cover_id[48];
+    uint8_t  back;           /* sub_back_t：这首歌来自哪个后端（拼封面 URL 要用 ——
+                              * QQ 的封面是 y.qq.com 直链，Navidrome 的是 /rest/getCoverArt） */
     uint32_t duration_ms;
     uint32_t position_ms;
     bool     playing;        /* 正在出声（非暂停/非结束） */
@@ -41,10 +43,6 @@ typedef struct {
     uint32_t queue_gen;      /* 队列内容变化计数：列表页靠它决定要不要重建行 */
     char     source[20];     /* 来源名（"最近播放" / "我的收藏" / "随机 30 首"） */
     char     song_id[48];    /* 当前歌 id，收藏/网页控制要用 */
-
-    /* 在线/离线模式（0=在线 1=离线）。UI 和网页据此显示"模式: X"、
-     * 以及决定"扫描 TF 卡 / 同步收藏到离线"该显示哪一个。 */
-    uint8_t  mode;
 } player_status_t;
 
 void player_status_init(void);
@@ -55,7 +53,7 @@ void player_status_get(player_status_t *out);
 /* 换歌：写入歌曲信息并 gen++（封面等异步结果会用 gen 对账） */
 void player_status_set_song(const char *song_id, const char *title, const char *artist,
                             const char *album, const char *cover_id, uint32_t duration_ms,
-                            bool starred);
+                            bool starred, uint8_t back);
 
 /* 只更新位置/播放状态（高频，轻量） */
 void player_status_set_progress(uint32_t position_ms, bool playing, bool paused, bool finished);
@@ -65,8 +63,6 @@ void player_status_set_queue(int index, int count, const char *source, bool cont
 
 void player_status_set_starred(bool starred);
 void player_status_set_volume(int vol);
-/* 在线/离线模式（0=在线 1=离线）。真相源在 player，这里只是给 UI/网页的快照。 */
-void player_status_set_mode(int mode);
 
 #ifdef __cplusplus
 }

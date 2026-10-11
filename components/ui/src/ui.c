@@ -23,6 +23,7 @@
 #include "player.h"
 #include "audio_engine.h"
 #include "subsonic.h"
+#include "qqmusic.h"
 #include "board.h"
 #include "store.h"
 #include "esp_log.h"
@@ -235,11 +236,12 @@ const char *ui_page_name(ui_page_t p)
         case UI_PAGE_INFO:        return "系统信息";
         case UI_PAGE_MEM:         return "内存用量";
         case UI_PAGE_BT:          return "蓝牙控制";
-        case UI_PAGE_SRC:         return "来源二级";
+        case UI_PAGE_SRC:         return "模式二级";
+        case UI_PAGE_BACK:        return "来源二级";
+        case UI_PAGE_SETTINGS:    return "设置";     /* 以前漏了这一项，日志里一直是 "?" */
         case UI_PAGE_SEARCH_MODE: return "搜索方式";
         case UI_PAGE_SEARCH_IN:   return "搜索输入";
         case UI_PAGE_SEARCH_RES:  return "搜索结果";
-        case UI_PAGE_SETTINGS:    return "设置";     /* 以前漏了这一项，日志里一直是 "?" */
         default:                  return "?";
     }
 }
@@ -667,10 +669,10 @@ static void play_refresh(void)
         static uint64_t last_bytes;
         static uint32_t last_ms;
         bool raw = subsonic_last_raw();
-        /* ⚠️ 离线模式没有"直出还是转码"这回事 —— 直接读卡上的文件。
+        /* ⚠️ TF 卡上的歌是**直接读卡上的文件**，没有"直出还是转码"这回事。
          *    不分支的话这里会显示【上一次在线播放留下的 stale 值】（通常是"转码"），
-         *    用户会以为离线模式下也在转码。 */
-        bool offline = (player_mode() == PLAYER_MODE_OFFLINE);
+         *    用户会以为本地文件也在转码。 */
+        bool local = (player_back() == PLAYER_BACK_TF);
 
         uint32_t now = lv_tick_get();
         uint64_t bytes = audio_engine_fetch_bytes();
@@ -682,9 +684,9 @@ static void play_refresh(void)
         last_ms = now;
 
         /* 上行：只有模式（用户要求：把速率挪到下一行，缓存那行删掉）*/
-        ui_set_text(s_lbl_mode, offline ? "本地文件" : (raw ? "直出" : "转码"));
+        ui_set_text(s_lbl_mode, local ? "本地文件" : (raw ? "直出" : "转码"));
         lv_obj_set_style_text_color(s_lbl_mode,
-                                    lv_color_hex((offline || raw) ? 0x1B7F3B : 0xC77700), 0);
+                                    lv_color_hex((local || raw) ? 0x1B7F3B : 0xC77700), 0);
 
         /* 下行：网络拉流速率。
          * ⚠️ 单位写死 "/s" —— 之前只写 "80K"，用户完全看不出这是"速度"还是"用量"，
@@ -879,6 +881,15 @@ static bool cover_is_bad(const char *id)
     return false;
 }
 
+/* ★ 清空缓存后必须调用：把"这些封面取不到"的黑名单也清掉。
+ * 不清的话，清完缓存那些歌**依然不会重新去取** —— 等于白清。
+ * （黑名单是为了避免对同一个坏封面反复发请求，但缓存被清后前提已经变了。） */
+void ui_cover_cache_cleared(void)
+{
+    s_cover_bad_n = 0;
+    ESP_LOGW(TAG, "封面黑名单已清空，之前取不到的封面会重新尝试");
+}
+
 static void cover_mark_bad(const char *id)
 {
     if (cover_is_bad(id)) return;
@@ -915,6 +926,30 @@ static void cover_mark_bad(const char *id)
 
 /* 像素数据在缓冲里的位置（缓冲前面 48 字节是文件头） */
 #define COVER_PIX (s_cover_buf + COVER_HDR)
+
+/* ★ QQ 音乐的封面尺寸问题（真机踩到才发现的）：
+ *   y.qq.com 的 photo_new **只认 90/120/150/300/500/800** —— 没有 72。
+ *   所以请求 72 时 qqmusic_cover_url() 会取最近可用的 **90**，回来的就是 90×90
+ *   （需要 16200 字节），而 s_cover_buf 是按 72×72（10368）分的 →
+ *   解不下、报"封面缓冲不够"，还会把这首歌的封面**拉进黑名单**（以后不再重试）。
+ *   对策：QQ 的封面先解到这个 90×90 的临时缓冲，再**中心裁**成 72×72。
+ *   （PSRAM 多花 16 KB，可接受。） */
+#define QQ_COVER_PX  90
+static uint8_t *s_cover_tmp;                    /* QQ 封面的中转缓冲（PSRAM） */
+
+/* 从 src(sw×sh, RGB565-BE) 中心裁一块 size×size 到 dst */
+static void cover_center_crop(const uint8_t *src, int sw, int sh, uint8_t *dst, int size)
+{
+    int ox = (sw - size) / 2;
+    int oy = (sh - size) / 2;
+    if (ox < 0) ox = 0;
+    if (oy < 0) oy = 0;
+    for (int y = 0; y < size; y++) {
+        memcpy(dst + (size_t)y * size * 2,
+               src + ((size_t)(y + oy) * sw + ox) * 2,
+               (size_t)size * 2);
+    }
+}
 
 /* 数目录的开销（一次 FATFS 目录遍历）不值得每存一张就做一次，也不该在
  * ui_start 时数一次就当真 —— store_init() 排在 ui_start 之后，那时还没挂载。
@@ -1005,8 +1040,37 @@ static void cover_task(void *arg)
                 ESP_LOGI(TAG, "封面命中缓存: %s", st.cover_id);
             } else {
                 uint16_t w = 0, h = 0;
-                esp_err_t ce = subsonic_get_cover_rgb565(st.cover_id, COVER_PX, COVER_PIX,
-                                                         COVER_BYTES, &w, &h);
+                /* ★ 封面来源按后端分派：同一个 `cover_id` 字段，
+                 *   Navidrome 装的是 coverArt id（走 /rest/getCoverArt），
+                 *   QQ 音乐装的是**专辑 mid**（走 y.qq.com 直链）。
+                 *   缓存/去重/占位图都还是按 cover_id 走，两条路共用。 */
+                esp_err_t ce;
+                if (st.back == SUB_BACK_QQ) {
+                    char purl[192];
+                    esp_err_t ue = qqmusic_cover_url(st.cover_id, COVER_PX, purl, sizeof(purl));
+                    if (ue != ESP_OK || s_cover_tmp == NULL) {
+                        ce = ue;
+                    } else {
+                        /* QQ 最小只给 90×90（没有 72），所以先解到临时缓冲再中心裁 */
+                        uint16_t qw = 0, qh = 0;
+                        ce = subsonic_cover_rgb565_url(purl, COVER_PX, s_cover_tmp,
+                                                       (size_t)QQ_COVER_PX * QQ_COVER_PX * 2,
+                                                       &qw, &qh);
+                        if (ce == ESP_OK) {
+                            if (qw == COVER_PX && qh == COVER_PX) {
+                                memcpy(COVER_PIX, s_cover_tmp, COVER_BYTES);
+                            } else if (qw >= COVER_PX && qh >= COVER_PX) {
+                                cover_center_crop(s_cover_tmp, qw, qh, COVER_PIX, COVER_PX);
+                            } else {
+                                ce = ESP_ERR_INVALID_SIZE;   /* 比画框还小，用不了 */
+                            }
+                            if (ce == ESP_OK) { w = COVER_PX; h = COVER_PX; }
+                        }
+                    }
+                } else {
+                    ce = subsonic_get_cover_rgb565(st.cover_id, COVER_PX, COVER_PIX,
+                                                   COVER_BYTES, &w, &h);
+                }
                 if (ce == ESP_OK && w == COVER_PX && h == COVER_PX) {
                     cover_publish(st.gen);
                     cover_cache_store(st.cover_id); /* 存下来给下次/下次开机 */
@@ -1195,7 +1259,6 @@ static void ui_tick_cb(lv_timer_t *t)
     if (s_splash_active) return;      /* 还在启动页：先不管别的页面 */
 
     ui_bt_mode_follow();              /* 蓝牙控制模式切了就把页面跟过去（无条件！） */
-    ui_mode_follow();                 /* 在线/离线模式切了，菜单与设置页文案跟上（无条件！） */
 
     if (s_page == UI_PAGE_PLAY) {
         play_refresh();
@@ -1311,6 +1374,14 @@ esp_err_t ui_start(void)
     /* ⚠️ JPEG 解码器要求 outbuf 16 字节对齐；PSRAM malloc 只保证 8 字节，
      *    用 aligned_alloc 明确对齐（否则会返回 -4 INVALID_PARAM） */
     s_cover_buf = heap_caps_aligned_alloc(16, COVER_HDR + COVER_BYTES, MALLOC_CAP_SPIRAM);
+    /* QQ 封面的中转缓冲（它最小只给 90×90，见 QQ_COVER_PX 的说明）。
+     * 分配失败也不致命 —— 只是 QQ 的封面显示不出来，Navidrome 那条路照旧。 */
+    s_cover_tmp = heap_caps_aligned_alloc(16, (size_t)QQ_COVER_PX * QQ_COVER_PX * 2,
+                                          MALLOC_CAP_SPIRAM);
+    if (s_cover_tmp == NULL) {
+        ESP_LOGW(TAG, "QQ 封面中转缓冲分配失败（%u 字节）—— QQ 封面将不可用",
+                 (unsigned)(QQ_COVER_PX * QQ_COVER_PX * 2));
+    }
     if (s_cover_buf == NULL) {
         ESP_LOGE(TAG, "封面缓冲分配失败（%u 字节）", COVER_HDR + COVER_BYTES);
     } else {

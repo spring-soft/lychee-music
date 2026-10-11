@@ -6,6 +6,7 @@ idf_component_register(
         app_core
         audio_engine
         subsonic
+        qqmusic
         settings
         store
         sd_card
