@@ -458,12 +458,15 @@ void ui_backmenu_activate(void)
  * 主菜单里按一下就执行，往上翻菜单很容易误触。现在第一次按 K3 只是把这一行变成
  * "重连 WiFi？再按K3确认"，再按一次才真的动网络，K4 随时退出。
  */
-#define SET_N  2
+#define SET_N  3
 
 static lv_obj_t *s_scr_set, *s_set_hl, *s_set_lbl[SET_N];
 static int       s_set_sel;
 static int       s_set_r_sel = -1;
 static bool      s_set_confirm;      /* true = 正停在某一项的确认态 */
+/* 扫描 TF 卡的进度显示：只在"上一次 tick 还在扫"时才算进度，
+ * 并负责在扫完的那一次弹结果（不这样的话 toast 会在扫描期间被反复覆盖）。 */
+static bool      s_tf_was_busy;
 
 static void set_render(void)
 {
@@ -478,6 +481,19 @@ static void set_render(void)
     snprintf(buf, sizeof(buf), "清空缓存%s",
              (s_set_confirm && s_set_sel == 1) ? "？再按K3确认" : "");
     ui_set_text(s_set_lbl[1], buf);
+
+    /* 扫描 TF 卡：曲库索引同样是可再生的（重扫一次就有）。
+     * 往卡里拷了新歌、或者换了卡，都要跑一次才看得见。
+     * 扫描进行中时这一行直接当进度条用（见 set_tick）。 */
+    if (s_tf_was_busy) {
+        int sc = 0, fd = 0;
+        player_tf_scan_progress(&sc, &fd);
+        snprintf(buf, sizeof(buf), "扫描中 %d/%d", fd, sc);
+    } else {
+        snprintf(buf, sizeof(buf), "扫描 TF 卡%s",
+                 (s_set_confirm && s_set_sel == 2) ? "？再按K3确认" : "");
+    }
+    ui_set_text(s_set_lbl[2], buf);
 
     int y = MENU_Y0 + s_set_sel * MENU_ROW_H;
     if (s_set_r_sel < 0 || lv_obj_get_y(s_set_hl) != y) {
@@ -526,7 +542,8 @@ void ui_setmenu_activate(void)
      * 这两项都有副作用（断网 / 删文件），不该一按就中。 */
     if (!s_set_confirm) {
         s_set_confirm = true;
-        ui_toast(s_set_sel == 0 ? "再按 K3 确认重连" : "再按 K3 确认清空");
+        ui_toast(s_set_sel == 0 ? "再按 K3 确认重连" :
+                 s_set_sel == 1 ? "再按 K3 确认清空" : "再按 K3 确认扫描");
         set_render();
         return;
     }
@@ -535,7 +552,7 @@ void ui_setmenu_activate(void)
     if (s_set_sel == 0) {
         net_mgr_reconnect();
         ui_toast("正在重连 WiFi...");
-    } else {
+    } else if (s_set_sel == 1) {
         /* ★ 只清**封面缓存**：它是纯粹的可再生数据（下次看到那首歌会自动重新下载）。
          *   最近播放 / 收藏镜像**不清** —— 那里面有用户的东西，清掉会莫名其妙。 */
         uint64_t before = store_free_kb();
@@ -549,8 +566,48 @@ void ui_setmenu_activate(void)
         /* 内存里还留着"这些封面取不到"的黑名单 —— 不清掉的话，
          * 清完缓存那些歌**依然不会重新去取**，等于白清。 */
         ui_cover_cache_cleared();
+    } else {
+        /* ★ 扫描 TF 卡：**不在这里等** —— player_tf_scan() 只是往 player 命令队列里
+         *   塞一条命令，真正的扫描在 player 任务里跑（几百毫秒到几秒）。
+         *   进度由 set_tick() 显示，完成后由它弹结果。 */
+        if (!player_tf_present()) {
+            ui_toast("没插 TF 卡，扫不了");
+        } else {
+            player_tf_scan();
+            s_tf_was_busy = true;
+            ui_toast("开始扫描 TF 卡...");
+            set_render();
+            return;                 /* 停在设置页看进度，不退回主菜单 */
+        }
     }
     ui_page_show(UI_PAGE_MENU);     /* 执行完退出 */
+}
+
+/* 设置页的周期刷新（ui_pages_tick 调）。
+ * 存在的唯一理由：扫描 TF 卡是异步的，界面要显示进度、并在扫完时弹结果。 */
+static void set_tick(void)
+{
+    bool busy = player_tf_scan_busy();
+    if (busy) {
+        s_tf_was_busy = true;
+        set_render();               /* 把 "扫描中 n/m" 刷出来 */
+        return;
+    }
+    if (!s_tf_was_busy) return;     /* 平时什么都没发生，不白刷 */
+
+    /* 刚刚扫完（busy 从 true 变 false）—— 报告结果 */
+    s_tf_was_busy = false;
+    int sc = 0, fd = 0;
+    player_tf_scan_progress(&sc, &fd);
+    esp_err_t e = player_tf_scan_err();
+    char t[48];
+    if (e != ESP_OK) {
+        snprintf(t, sizeof(t), "扫描失败：%s", esp_err_to_name(e));
+    } else {
+        snprintf(t, sizeof(t), "曲库 %d 首（遍历 %d 个文件）", fd, sc);
+    }
+    ui_toast(t);
+    set_render();
 }
 
 
@@ -1095,6 +1152,7 @@ void ui_pages_tick(void)
         case UI_PAGE_BT:   bt_render();        break;
         case UI_PAGE_SRC:  src_render();       break;
         case UI_PAGE_BACK: back_render();      break;
+        case UI_PAGE_SETTINGS: set_tick();     break;
         case UI_PAGE_SEARCH_MODE:
         case UI_PAGE_SEARCH_IN:
         case UI_PAGE_SEARCH_RES:

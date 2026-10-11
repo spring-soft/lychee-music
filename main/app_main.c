@@ -34,6 +34,8 @@
 #include "player.h"
 #include "settings.h"
 #include "store.h"
+#include "sd_card.h"
+#include "musiclib.h"
 #include "hid_remote.h"
 #include "ui.h"
 #include "ui_internal.h"
@@ -306,6 +308,10 @@ void app_main(void)
      *    第一次上电分区里没有文件系统，这里会格式化（一次性，约 1 秒）。 */
     splash("准备存储...", 6);
     store_init();
+    /* TF 卡：这里【只配卡检测引脚，不挂载】。真正挂载发生在切到「来源 = TF 卡」
+     * 那一刻（懒挂载 —— 在线播放用不到卡，不该占着 SDSPI 的那份内部 SRAM，
+     *  理由与内存账见 components/sd_card/include/sd_card.h）。 */
+    sd_card_init();
 
     /* 这里原来是 M7「蓝牙遥控」那一步（K1-K4 当 BLE HID 外设）。
      * 2026-10-01 砍掉 BLE 换 WiFi 吞吐（内部 SRAM 从 7KB 涨到 49KB），那一步没了。

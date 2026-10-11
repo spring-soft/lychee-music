@@ -120,6 +120,18 @@ static void http_close(ae_source_t *s)
     }
 }
 
+static void http_free(ae_source_t *s)
+{
+    if (s == NULL) return;
+    if (s->ctx) {
+        http_ctx_t *c = s->ctx;
+        if (c->cli) { esp_http_client_close(c->cli); esp_http_client_cleanup(c->cli); }
+        heap_caps_free(c);
+    }
+    if (s->uri) heap_caps_free((void *)s->uri);
+    heap_caps_free(s);
+}
+
 ae_source_t *ae_source_http_new(const char *url)
 {
     ae_source_t *s = heap_caps_calloc(1, sizeof(ae_source_t), MALLOC_CAP_SPIRAM);
@@ -137,6 +149,7 @@ ae_source_t *ae_source_http_new(const char *url)
             s->open  = http_open;
             s->read  = http_read;
             s->close = http_close;
+            s->free  = http_free;        /* 让 player 能用统一的 ae_source_free() */
             return s;
         }
     }
@@ -146,10 +159,4 @@ ae_source_t *ae_source_http_new(const char *url)
     return NULL;
 }
 
-void ae_source_http_free(ae_source_t *s)
-{
-    if (!s) return;
-    if (s->uri) heap_caps_free((void *)s->uri);
-    if (s->ctx) heap_caps_free(s->ctx);
-    heap_caps_free(s);
-}
+void ae_source_http_free(ae_source_t *s) { http_free(s); }

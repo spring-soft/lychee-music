@@ -142,6 +142,9 @@ bool ui_search_key_hold(int k);
 
 /* ---------------- ui_keys.c ---------------- */
 void ui_keys_init(void);
+/* 旋转编码器（仅 V2 板；面包板变体下是空实现，调用方不需要 #if）。
+ * 与 ui_keys_init 分开是为了让"按键"和"编码器"各自有明确的初始化点。 */
+void ui_keys_encoder_init(void);
 /* 注入按键事件（k: 0..3 = K1..K4；kind: 0=短按 1=长按 2=保持）。
  * 只给开机自检用 —— 走的是和真实按键完全相同的分发路径。 */
 void ui_keys_inject(int k, int kind);

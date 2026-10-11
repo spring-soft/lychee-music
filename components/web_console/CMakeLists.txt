@@ -15,6 +15,8 @@ idf_component_register(
         player
         subsonic
         qqmusic
+        musiclib
+        sd_card
         net_mgr
         settings
         store

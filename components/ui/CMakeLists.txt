@@ -20,6 +20,8 @@ idf_component_register(
         settings
         store
         hid_remote
+        encoder
+        musiclib
         esp_partition
         esp_lcd
         esp_driver_spi

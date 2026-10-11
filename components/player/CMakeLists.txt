@@ -9,6 +9,8 @@ idf_component_register(
         qqmusic
         settings
         store
+        sd_card
+        musiclib
         json
         freertos
         esp_hw_support

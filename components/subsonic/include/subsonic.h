@@ -21,9 +21,13 @@ extern "C" {
 
 #define SUB_SONGS_MAX 64
 
+/* 本地文件路径上限（TF 卡离线曲库的歌）。UTF-8：中文名一个字 3 字节，
+ * 所以 192 大约能放 60 个汉字 + 目录层级，够用。 */
+#define SUB_SONG_PATH_MAX 192
+
 /* 这首歌来自哪个后端。
  *
- * 设备现在有**两个音乐源**，而且队列/搜索/最近播放里都可能混着两种歌
+ * 设备现在有**三个音乐源**，而且队列/搜索/最近播放里都可能混着几种歌
  * （比如在 QQ 上听了几首，又切回 Navidrome 看"最近播放"）。
  * 所以后端标记必须**跟着歌走**，不能只靠一个全局变量 ——
  * 全局变量只能表示"现在切到哪个后端"，拼不出队列里那首老歌该用哪条 URL。
@@ -31,6 +35,7 @@ extern "C" {
 typedef enum {
     SUB_BACK_NAV = 0,      /* Navidrome（Subsonic 协议） */
     SUB_BACK_QQ  = 1,      /* QQ 音乐（自建契约层服务） */
+    SUB_BACK_TF  = 2,      /* TF 卡离线曲库（本地文件，不走网络） */
 } sub_back_t;
 
 typedef struct {
@@ -38,13 +43,20 @@ typedef struct {
     char     title[160];
     char     artist[96];
     char     album[96];
-    char     cover[48];     /* 封面 id：Navidrome 是 coverArt id；QQ 是专辑 mid。
-                             * 两者都是"短且稳定"，固件按它拼 URL / 做缓存 key。 */
+    char     cover[48];     /* 封面 id：Navidrome 是 coverArt id；QQ 是专辑 mid；
+                             * TF 卡留空（不解析内嵌封面，见 musiclib.h 的取舍）。
+                             * 都是"短且稳定"，固件按它拼 URL / 做缓存 key。 */
     uint32_t duration_s;
     uint32_t size;
     char     suffix[8];
     bool     starred;
     uint8_t  back;          /* sub_back_t：这首歌来自哪个后端（老数据默认 0 = Navidrome） */
+    /* ★ 非空 = 本地文件（VFS 路径，如 "/sdcard/音乐/周杰伦 - 稻香.flac"）。
+     *   只有 back == SUB_BACK_TF 的歌会填它；其余后端永远为空。
+     *   player 靠它决定"拼 URL 走 HTTP" 还是 "直接开文件"。
+     *   ⚠️ 它会被一起落盘（JSON 键 "p"），否则重启后离线列表变成
+     *      "有歌名但放不了"。 */
+    char     path[SUB_SONG_PATH_MAX];
 } sub_song_t;
 
 /* 从 NVS(ns "nav") 读配置，Kconfig 兜底 */

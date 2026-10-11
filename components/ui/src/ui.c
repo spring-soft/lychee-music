@@ -238,6 +238,7 @@ const char *ui_page_name(ui_page_t p)
         case UI_PAGE_BT:          return "蓝牙控制";
         case UI_PAGE_SRC:         return "模式二级";
         case UI_PAGE_BACK:        return "来源二级";
+        case UI_PAGE_SETTINGS:    return "设置";     /* 以前漏了这一项，日志里一直是 "?" */
         case UI_PAGE_SEARCH_MODE: return "搜索方式";
         case UI_PAGE_SEARCH_IN:   return "搜索输入";
         case UI_PAGE_SEARCH_RES:  return "搜索结果";
@@ -668,6 +669,10 @@ static void play_refresh(void)
         static uint64_t last_bytes;
         static uint32_t last_ms;
         bool raw = subsonic_last_raw();
+        /* ⚠️ TF 卡上的歌是**直接读卡上的文件**，没有"直出还是转码"这回事。
+         *    不分支的话这里会显示【上一次在线播放留下的 stale 值】（通常是"转码"），
+         *    用户会以为本地文件也在转码。 */
+        bool local = (player_back() == PLAYER_BACK_TF);
 
         uint32_t now = lv_tick_get();
         uint64_t bytes = audio_engine_fetch_bytes();
@@ -679,9 +684,9 @@ static void play_refresh(void)
         last_ms = now;
 
         /* 上行：只有模式（用户要求：把速率挪到下一行，缓存那行删掉）*/
-        ui_set_text(s_lbl_mode, raw ? "直出" : "转码");
+        ui_set_text(s_lbl_mode, local ? "本地文件" : (raw ? "直出" : "转码"));
         lv_obj_set_style_text_color(s_lbl_mode,
-                                    lv_color_hex(raw ? 0x1B7F3B : 0xC77700), 0);
+                                    lv_color_hex((local || raw) ? 0x1B7F3B : 0xC77700), 0);
 
         /* 下行：网络拉流速率。
          * ⚠️ 单位写死 "/s" —— 之前只写 "80K"，用户完全看不出这是"速度"还是"用量"，
@@ -1363,6 +1368,7 @@ esp_err_t ui_start(void)
     s_splash_active = true;      /* 先置位：按键回调里靠它挡住"启动页期间乱跳页" */
     lv_screen_load(s_scr_splash);
     ui_keys_init();              /* K1-K4 按键（esp_timer 驱动，不占任务） */
+    ui_keys_encoder_init();      /* 旋转编码器（仅 V2 板；面包板变体是空实现） */
 
     /* 封面缓冲（PSRAM）与 dsc —— 数据由 cover_task 填，UI 只换 src */
     /* ⚠️ JPEG 解码器要求 outbuf 16 字节对齐；PSRAM malloc 只保证 8 字节，

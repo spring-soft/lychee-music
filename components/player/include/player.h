@@ -42,16 +42,23 @@ const char *player_src_name(player_src_t s);
 
 /* ============================================================ 「来源」= 后端
  *
- * 设备有两个音乐源，主菜单里的「来源」切的就是它：
+ * 主菜单里的「来源」切的就是它，现在是三个：
  *   Navidrome  走 Subsonic 协议（subsonic.c）
- *   QQ 音乐    走自建的契约层服务（qqmusic.c）
+ *   QQ 音乐     走自建的契约层服务（qqmusic.c）
+ *   TF 卡      走本地文件（musiclib.c 的离线曲库，不联网）
  *
- * 两者**共用同一个播放引擎和歌曲结构**，区别只有两处：列表从哪来、播放地址怎么拼。
- * 后者靠 sub_song_t.back 逐首判断（队列里可能混着两种歌），前者靠这个全局状态。
+ * 三者**共用同一个播放引擎和歌曲结构**，区别只有两处：列表从哪来、播放源怎么建。
+ * 后者靠 sub_song_t.back 逐首判断（队列里可能混着几种歌），前者靠这个全局状态。
+ *
+ * ★ 2026-10 的合并：这条 PCB 线原来叫「在线 / 离线 双模式」（PLAYER_MODE_ONLINE /
+ *   OFFLINE），面包板线叫「来源 ⌄ 后端」。两条线其实是同一个轴的两种叫法，
+ *   合并后统一成【来源 = 后端】，TF 卡就是第三个后端 ——
+ *   原来那个"在线/离线"开关随之删掉，不再单独存在。
  */
 typedef enum {
     PLAYER_BACK_NAV = 0,     /* Navidrome（默认） */
     PLAYER_BACK_QQ,          /* QQ 音乐 */
+    PLAYER_BACK_TF,          /* TF 卡离线曲库 */
     PLAYER_BACK_COUNT,
 } player_back_t;
 
@@ -59,7 +66,8 @@ const char *player_back_name(player_back_t b);
 player_back_t player_back(void);
 
 /* 换后端并重建队列（和换模式走同一条路径）。
- * ⚠️ Navidrome 没配的时候切到它只会失败并保留原队列，不会把当前播放打断。 */
+ * ⚠️ Navidrome 没配的时候切到它只会失败并保留原队列，不会把当前播放打断。
+ * ⚠️ 切到 TF 会**挂载**卡并读索引，切走会**卸载** —— 见 sd_card.h 的内存账。 */
 void player_set_back(player_back_t b, bool autoplay);
 
 /* 「收藏」模式跳过前 N 首 —— 给 QQ「我喜欢」里的**置顶歌**用。
@@ -74,6 +82,7 @@ void player_set_fav_skip(int n);
  * ★ 「模式」的含义**随后端而变**，而且只由后端决定项数：
  *     Navidrome: 0=最近播放  1=我的收藏  2=随机30首
  *     QQ 音乐:   0=收藏  1=每日30首  2=百万收藏  3=新歌推荐  4=刷歌  5=雷达
+ *     TF 卡:     0=全部曲目  1=随机30首
  *
  * UI 只用下面四个函数渲染二级菜单 —— **不需要知道有几项、叫什么**，
  * 以后服务端加模式（改 qqmusic 的 k_modes 表）UI 一行都不用动。 */
@@ -83,6 +92,23 @@ void        player_set_mode(int i, bool autoplay);
 int         player_mode(void);             /* 当前模式下标 */
 
 /* 每个后端各自记住自己上次的模式：切到 QQ 再切回来，Navidrome 还是原来那个模式。 */
+
+/* ---------------- TF 卡离线曲库的维护操作 ----------------
+ *
+ * 三个都是**非阻塞**（塞进 player 命令队列），进度靠下面的查询接口轮询 ——
+ * 扫描一张满卡要好几秒，UI 任务不能等。 */
+
+/* 重新扫描 TF 卡：重建索引（曲库名/艺术家来自文件名，不解析标签）。
+ * 要求卡已挂载 —— 会先确保挂载。扫完 musiclib_scan_result() 给结果码。 */
+void player_tf_scan(void);
+bool player_tf_scan_busy(void);
+/* 扫描进度：已遍历的文件数 / 已入库的曲目数 */
+void player_tf_scan_progress(int *scanned, int *found);
+esp_err_t player_tf_scan_err(void);
+/* 曲库现有几首（未挂卡/没索引时为 0） */
+int  player_tf_count(void);
+bool player_tf_present(void);      /* 卡插着没 */
+bool player_tf_mounted(void);
 
 esp_err_t player_init(void);
 

@@ -851,6 +851,7 @@ ae_source_t *ae_source_memory_new(const uint8_t *data, size_t len)
     s->open = mem_open;
     s->read = mem_read;
     s->close = mem_close;
+    s->free = ae_source_memory_free;      /* 让 player 能用统一的 ae_source_free() */
     return s;
 }
 
@@ -858,6 +859,18 @@ void ae_source_memory_free(ae_source_t *s)
 {
     if (!s) return;
     if (s->ctx) heap_caps_free(s->ctx);
+    heap_caps_free(s);
+}
+
+/* 通用释放：转调源自己的 free。player 换歌时用它释放"上一首" —— 源类型
+ * 是运行时才知道的（在线 HTTP / 离线本地文件），所以不能让调用方自己挑函数。 */
+void ae_source_free(ae_source_t *s)
+{
+    if (!s) return;
+    if (s->free) { s->free(s); return; }
+    /* 兜底：理论上到不了（每个源都设了 free），但真到了也别漏内存 */
+    if (s->ctx) heap_caps_free(s->ctx);
+    if (s->uri) heap_caps_free((void *)s->uri);
     heap_caps_free(s);
 }
 

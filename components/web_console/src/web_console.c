@@ -508,6 +508,11 @@ static esp_err_t h_cover(httpd_req_t *req)
     uint8_t *jpg = NULL;
     size_t len = 0;
     esp_err_t err;
+    if (back == SUB_BACK_TF) {
+        /* TF 卡曲库不解析标签（见 musiclib.h 的取舍①），没有封面可取。
+         * 明确 404，别去碰 Navidrome —— 拿一个空 id 请求它是白等一次网络超时。 */
+        return fail(req, "404 Not Found", "离线曲目没有封面");
+    }
     if (back == SUB_BACK_QQ) {
         char url[192];
         err = qqmusic_cover_url(id, size, url, sizeof(url));
@@ -538,6 +543,15 @@ static esp_err_t h_lyrics(httpd_req_t *req)
      *   Navidrome 那边 subsonic_get_lyrics() 直接就给同一格式的 JSON。 */
     int back = 0;
     query_int(req, "back", &back);
+
+    if (back == SUB_BACK_TF) {
+        /* 同封面：离线曲目不解析标签，没有歌词。回 200 + 空 lines，
+         * 网页照常渲染"暂无歌词"（而不是弹一个取歌词失败）。 */
+        no_keepalive(req);
+        httpd_resp_set_type(req, "application/json; charset=utf-8");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        return httpd_resp_sendstr(req, "{\"synced\":false,\"total\":0,\"lines\":[]}");
+    }
 
     if (back == SUB_BACK_QQ) {
         char *json = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
@@ -753,6 +767,43 @@ static esp_err_t h_cache(httpd_req_t *req)
     cJSON_AddNumberToObject(o, "removed", n);
     cJSON_AddNumberToObject(o, "freed_kb", (double)(after - before));
     cJSON_AddNumberToObject(o, "free_kb", (double)after);
+    return send_json(req, o);
+}
+
+/* TF 卡离线曲库：状态查询 + 触发扫描。
+ *
+ * GET  /api/tf  → {present, mounted, count, scanning, scanned, found, err}
+ * POST /api/tf  → 触发一次扫描（非阻塞：塞进 player 命令队列就返回，
+ *                 前端按 scanning/scanned/found 轮询进度）
+ *
+ * 为什么要独立一个接口而不是塞进 /api/sources：扫描是"要把卡取下来重扫"的
+ * 重量级动作，而 /api/sources 是网页每秒都在拉的轻量状态，不该混在一起。 */
+static esp_err_t h_tf(httpd_req_t *req)
+{
+    if (req->method == HTTP_POST) {
+        if (!player_tf_present()) {
+            return fail(req, "409 Conflict", "没插 TF 卡");
+        }
+        if (player_tf_scan_busy()) {
+            return fail(req, "409 Conflict", "扫描已在进行中");
+        }
+        player_tf_scan();                      /* 非阻塞，直接返回 */
+        ESP_LOGW(TAG, "网页触发了 TF 卡扫描");
+        return ok_json(req);
+    }
+
+    int scanned = 0, found = 0;
+    player_tf_scan_progress(&scanned, &found);
+    esp_err_t e = player_tf_scan_err();
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "present", player_tf_present());
+    cJSON_AddBoolToObject(o, "mounted", player_tf_mounted());
+    cJSON_AddNumberToObject(o, "count", player_tf_count());
+    cJSON_AddBoolToObject(o, "scanning", player_tf_scan_busy());
+    cJSON_AddNumberToObject(o, "scanned", scanned);
+    cJSON_AddNumberToObject(o, "found", found);
+    cJSON_AddBoolToObject(o, "ok", e == ESP_OK);
+    cJSON_AddStringToObject(o, "err", e == ESP_OK ? "" : esp_err_to_name(e));
     return send_json(req, o);
 }
 
@@ -1441,6 +1492,8 @@ esp_err_t web_console_start(void)
         { .uri = "/api/log",             .method = HTTP_GET,  .handler = h_log },
         { .uri = "/api/qq",              .method = HTTP_GET,  .handler = h_qq },
         { .uri = "/api/qq",              .method = HTTP_POST, .handler = h_qq },
+        { .uri = "/api/tf",              .method = HTTP_GET,  .handler = h_tf },
+        { .uri = "/api/tf",              .method = HTTP_POST, .handler = h_tf },
         { .uri = "/api/update",          .method = HTTP_POST, .handler = h_update },
         { .uri = "/api/update",          .method = HTTP_GET,  .handler = h_update_status },
         { .uri = "/",                    .method = HTTP_GET,  .handler = h_index },

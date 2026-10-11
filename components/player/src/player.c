@@ -18,6 +18,8 @@
 #include "settings.h"
 #include "store.h"
 #include "qqmusic.h"
+#include "sd_card.h"
+#include "musiclib.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -56,7 +58,8 @@ typedef enum {
     CMD_SEEK, CMD_PLAY_ID, CMD_STAR_ID,
     CMD_RESUME, CMD_STAR_REFRESH,
     CMD_SEARCH,               /* M8：屏上搜索 */
-    CMD_SET_BACK,             /* 换「来源」= Navidrome / QQ 音乐 */
+    CMD_SET_BACK,             /* 换「来源」= Navidrome / QQ 音乐 / TF 卡 */
+    CMD_TF_SCAN,              /* 重扫 TF 卡离线曲库（建索引） */
 } cmd_kind_t;
 
 typedef struct {
@@ -79,11 +82,28 @@ static uint32_t          s_queue_gen;
 static player_src_t      s_src = PLAYER_SRC_RANDOM;
 
 /* ---- 「来源」（后端）与每个后端各自的「模式」----
- * s_src 是 Navidrome 的模式（老代码一直用它），s_qq_mode 是 QQ 的模式。
- * 两个分开存是为了"每个后端记住自己上次的模式"：切到 QQ 再切回来，
+ * s_src 是 Navidrome 的模式（老代码一直用它），s_qq_mode 是 QQ 的模式，
+ * s_tf_mode 是 TF 卡的。
+ * 三个分开存是为了"每个后端记住自己上次的模式"：切到 QQ 再切回来，
  * Navidrome 那边还是原来那个模式，而不是被重置。 */
 static player_back_t     s_back    = PLAYER_BACK_NAV;
 static int               s_qq_mode = QQ_MODE_FAV;
+static int               s_tf_mode = 0;
+
+/* TF 卡「模式」的项（只有两个 —— musiclib 能提供的就这些：
+ * 全部曲目按文件名排序，随机 30 首靠 esp_random 抽）。
+ * ⚠️ 顺序变了会让 NVS 里存的下标指到别的模式，改之前想清楚。 */
+#define PLAYER_TF_MODE_ALL     0
+#define PLAYER_TF_MODE_RANDOM  1
+#define PLAYER_TF_MODE_COUNT   2
+static const char *const k_tf_modes[PLAYER_TF_MODE_COUNT] = { "全部曲目", "随机30首" };
+
+/* TF 卡扫描状态（非阻塞扫描，UI 轮询进度）。
+ * 只由 player 任务写，UI/网页只读 —— 标 volatile 就够，不用再加锁。 */
+static volatile bool       s_tf_scan_busy;
+static volatile esp_err_t  s_tf_scan_err = ESP_OK;
+static volatile int        s_tf_scan_scanned;
+static volatile int        s_tf_scan_found;
 
 /* 「收藏」模式跳过前 N 首 —— 给 QQ「我喜欢」里的**置顶歌**用。
  * 用户的需求原话：他 QQ 音乐里置顶了 5 首，希望设备进收藏模式时**直接播第 6 首**。
@@ -185,6 +205,9 @@ static void song_to_json(cJSON *arr, const sub_song_t *s)
     if (s->suffix[0])   cJSON_AddStringToObject(o, "x", s->suffix);
     if (s->starred)     cJSON_AddBoolToObject(o, "s", true);
     if (s->back)        cJSON_AddNumberToObject(o, "k", s->back);
+    /* ★ 本地路径必须一起落盘：否则重启后离线列表变成"有歌名但放不了"。
+     *   在线歌为空，不占字节。 */
+    if (s->path[0])     cJSON_AddStringToObject(o, "p", s->path);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -198,7 +221,7 @@ static bool song_from_json(const cJSON *o, sub_song_t *s)
     #define GETSTR(k, f) do { const cJSON *_i = cJSON_GetObjectItem(o, k); \
         if (cJSON_IsString(_i)) strlcpy(s->f, _i->valuestring, sizeof(s->f)); } while (0)
     GETSTR("t", title);  GETSTR("a", artist); GETSTR("b", album);
-    GETSTR("c", cover);  GETSTR("x", suffix);
+    GETSTR("c", cover);  GETSTR("x", suffix); GETSTR("p", path);
     #undef GETSTR
 
     const cJSON *j = cJSON_GetObjectItem(o, "d");
@@ -631,11 +654,13 @@ static void queue_store(const sub_song_t *songs, int n, player_src_t src, bool c
     if (content_changed) {
         player_status_set_queue(s_index, n, player_mode_name(player_mode()), true);
         /* 「来源」和「模式」都是"设置"，要持久化 —— 不然重启后又回到默认那套。
-         * 三个键分开存：src 是 Navidrome 的模式、qmode 是 QQ 的模式、
-         * back 是当前用哪个后端（这样两边各自的模式都能记住）。 */
-        settings_set_int_lazy("src",   (int)s_src);
-        settings_set_int_lazy("qmode", s_qq_mode);
-        settings_set_int_lazy("back",  (int)s_back);
+         * 四个键分开存：src 是 Navidrome 的模式、qmode 是 QQ 的模式、
+         * tfmode 是 TF 卡的模式、back 是当前用哪个后端
+         * （这样各后端各自的模式都能记住）。 */
+        settings_set_int_lazy("src",    (int)s_src);
+        settings_set_int_lazy("qmode",  s_qq_mode);
+        settings_set_int_lazy("tfmode", s_tf_mode);
+        settings_set_int_lazy("back",   (int)s_back);
     }
 }
 
@@ -723,6 +748,53 @@ static bool load_source(player_src_t src, bool autoplay, int *first_idx)
 
     int got = 0;
     esp_err_t err;
+
+    /* ---- TF 卡离线曲库：列表来自 musiclib 的常驻索引，不走网络 ----
+     *
+     * 挂卡 / 读索引由 handle_set_back 负责（切到 TF 才挂，切走就卸，见 sd_card.h
+     * 的内存账），这里只读内存里的索引 —— 不碰文件系统，所以快。 */
+    if (s_back == PLAYER_BACK_TF) {
+        int n = musiclib_count();
+        if (n <= 0) {
+            ESP_LOGE(TAG, "TF 曲库为空（没插卡 / 没索引 / 还没扫过）—— 保留原队列");
+            return false;
+        }
+        if (s_tf_mode == PLAYER_TF_MODE_RANDOM) {
+            got = musiclib_pick_random(tmp, 30);
+        } else {
+            /* ⚠️ 队列上限是 PLAYER_QUEUE_MAX（64），所以卡上超过 64 首时
+             *    「全部曲目」只装得下前 64 首 —— 这是队列本身的容量，
+             *    不是曲库的容量（musiclib_count() 仍然是卡上的真实总数，
+             *    网页/设置页显示的是那个）。想听后面的用搜索。 */
+            int lim = (n < PLAYER_QUEUE_MAX) ? n : PLAYER_QUEUE_MAX;
+            for (int i = 0; i < lim; i++) {
+                if (!musiclib_get(i, &tmp[got])) break;   /* 单条取失败就停在已取到的 */
+                got++;
+            }
+            if (n > PLAYER_QUEUE_MAX) {
+                ESP_LOGW(TAG, "曲库 %d 首，队列上限 %d 首 —— 只装了前 %d 首（其余可用搜索找）",
+                         n, PLAYER_QUEUE_MAX, got);
+            }
+        }
+        /* ★ 逐首打后端标记：起播时要靠它决定"开文件"而不是"拼 URL" */
+        for (int i = 0; i < got; i++) {
+            tmp[i].back = SUB_BACK_TF;
+            /* TF 卡这一轮**不做收藏**：没有写回目标（不解析标签、也没服务端）。
+             * 硬把心形点亮会骗人 —— 按下去没有任何东西记下来。 */
+            tmp[i].starred = false;
+        }
+        if (got <= 0) {
+            ESP_LOGE(TAG, "TF「%s」没取到歌（曲库 %d 首）—— 保留原队列",
+                     k_tf_modes[s_tf_mode], n);
+            return false;
+        }
+        /* 不动 s_src（那是 Navidrome 的模式），和 QQ 分支同一个理由 */
+        queue_store(tmp, got, s_src, true);
+        *first_idx = 0;
+        ESP_LOGW(TAG, "来源切到「TF 卡 · %s」（%d 首）%s",
+                 k_tf_modes[s_tf_mode], got, autoplay ? "" : "（列表页浏览，不打断播放）");
+        return true;
+    }
 
     /* ---- QQ 音乐后端：6 个模式全由服务端给（收藏/每日30首/百万收藏/新歌推荐/刷歌/雷达）---- */
     if (s_back == PLAYER_BACK_QQ) {
@@ -832,7 +904,27 @@ static void start_index_from(int idx, uint32_t from_ms)
     s_cur_src = NULL;
 
     char url[768];
-    if (song.back == SUB_BACK_QQ) {
+    bool is_file = (song.back == SUB_BACK_TF);
+    if (is_file) {
+        /* ★ TF 卡：**不拼 URL，直接开文件**。url[] 这个变量这里复用成"路径"。
+         *
+         * ⚠️ 本地文件不支持拖进度条（ae_source_file 不做 seek，见它的顶部说明）——
+         *    和 QQ 同一个处理：from_ms 归零，位置基准也归零，否则进度条会显示
+         *    一个根本不对的位置。 */
+        if (from_ms > 0) {
+            ESP_LOGW(TAG, "本地文件不支持拖进度条，从 0:00 重放：「%.24s」", song.title);
+            from_ms = 0;
+        }
+        if (!song.path[0]) {
+            ESP_LOGE(TAG, "这首 TF 歌没有路径（索引坏了？）：「%.24s」", song.title);
+            restore_mute();
+            s_active = false;
+            if (old) ae_source_free(old);
+            return;
+        }
+        strlcpy(url, song.path, sizeof(url));
+        subsonic_note_direct("TF本地文件");
+    } else if (song.back == SUB_BACK_QQ) {
         /* ★ QQ 直链**每次播放之前现取** —— vkey 只有 2 小时有效期，
          *   若在装载队列时就把 URL 取好存着，会"存的时候好好的、播的时候 403"。
          *   这里正是"播之前"那一刻。直链约 250~260 字符，url[768] 装得下。
@@ -850,7 +942,7 @@ static void start_index_from(int idx, uint32_t from_ms)
             ESP_LOGE(TAG, "取 QQ 直链失败（%s）：「%.24s」", esp_err_to_name(uerr), song.title);
             restore_mute();
             s_active = false;
-            if (old) ae_source_http_free(old);
+            if (old) ae_source_free(old);
             return;
         }
         /* ⚠️ 必须标一下：屏幕/网页的"直出/转码"指示器读的是 subsonic_last_raw()，
@@ -865,12 +957,12 @@ static void start_index_from(int idx, uint32_t from_ms)
             subsonic_stream_url(&song, 0, url, sizeof(url));
         }
     }
-    ae_source_t *src = ae_source_http_new(url);
+    ae_source_t *src = is_file ? ae_source_file_new(url) : ae_source_http_new(url);
     if (src == NULL) {
-        ESP_LOGE(TAG, "创建 HTTP 源失败");
+        ESP_LOGE(TAG, "创建音频源失败（%s）", is_file ? "本地文件" : "HTTP");
         restore_mute();
         s_active = false;
-        if (old) ae_source_http_free(old);
+        if (old) ae_source_free(old);
         return;
     }
 
@@ -887,7 +979,7 @@ static void start_index_from(int idx, uint32_t from_ms)
     if (from_ms > 0) audio_engine_set_pos_base(from_ms);
     restore_mute();
 
-    if (old) ae_source_http_free(old);        /* 旧源现在才能安全释放 */
+    if (old) ae_source_free(old);             /* 旧源现在才能安全释放 */
     if (from_ms == 0) {
         recent_push(&song);                   /* seek 不算"又听了一遍新歌" */
         resume_reset(song.id);                /* 换歌了：续播位置归零，别把上一首的位置带过来 */
@@ -1001,9 +1093,10 @@ static void star_song_id(const char *id, bool on)
         strlcpy(song.album,  st.album,    sizeof(song.album));
         strlcpy(song.cover,  st.cover_id, sizeof(song.cover));
         song.duration_s = st.duration_ms / 1000;
-        /* 当前歌的后端标记：状态结构里没有 back，去队列里找同一首。
+        /* 当前歌的后端标记：去队列里找同一首。
          * 找不到就按"当前后端"算（多数情况就对：正在放的那首一般来自当前后端）。 */
-        song.back = (s_back == PLAYER_BACK_QQ) ? SUB_BACK_QQ : SUB_BACK_NAV;
+        song.back = (uint8_t)((s_back == PLAYER_BACK_QQ) ? SUB_BACK_QQ :
+                              (s_back == PLAYER_BACK_TF)  ? SUB_BACK_TF  : SUB_BACK_NAV);
         xSemaphoreTake(s_lock, portMAX_DELAY);
         for (int i = 0; i < s_count; i++) {
             if (!strcmp(s_queue[i].id, id)) { song.back = s_queue[i].back; break; }
@@ -1022,6 +1115,18 @@ static void star_song_id(const char *id, bool on)
         }
         xSemaphoreGive(s_lock);
         if (!found) ESP_LOGW(TAG, "收藏的 %s 不在队列/收藏里，只有 id（元数据等刷新时从服务器补）", id);
+    }
+
+    /* ============================================================
+     * ★ TF 卡离线曲库的歌：**不支持收藏**
+     *
+     * 没有写回目标 —— 曲库不解析 ID3/FLAC 标签（见 musiclib.h 的取舍①），
+     * 卡上也没有"收藏"这个概念。点亮心形等于骗人：按下去什么都没记下来，
+     * 下次进来又是空的。所以这里明确拒绝、并把原因写进日志/提示。
+     * ============================================================ */
+    if (song.back == SUB_BACK_TF) {
+        ESP_LOGW(TAG, "TF 卡上的歌不支持收藏（离线曲库没有写回目标）：「%.32s」", song.title);
+        return;
     }
 
     /* ============================================================
@@ -1111,6 +1216,13 @@ static bool load_source_chain(player_src_t src, int *first)
                  qq_mode_name((qq_mode_t)src));
         return false;
     }
+    /* TF 卡同理：用户点的是「全部曲目」，曲库空就是空 —— 悄悄换成「随机30首」
+     * 结果一样是空，只会多一轮日志、让人以为切成功了。 */
+    if (s_back == PLAYER_BACK_TF) {
+        ESP_LOGW(TAG, "TF 模式「%s」取不到歌（曲库为空，刻意不自动退回别的模式）",
+                 k_tf_modes[(s_tf_mode >= 0 && s_tf_mode < PLAYER_TF_MODE_COUNT) ? s_tf_mode : 0]);
+        return false;
+    }
     if (src == PLAYER_SRC_RANDOM) return false;
     ESP_LOGW(TAG, "来源「%s」取不到歌，退回随机 30 首", player_src_name(src));
     return load_source(PLAYER_SRC_RANDOM, false, first);
@@ -1118,12 +1230,16 @@ static bool load_source_chain(player_src_t src, int *first)
 
 static void handle_set_source(int src, bool autoplay)
 {
-    /* 「模式」的含义**随后端而变**，所以两组下标分别校验：
+    /* 「模式」的含义**随后端而变**，所以三组下标分别校验：
      *   QQ 音乐   : 0..5  (收藏/每日30首/百万收藏/新歌推荐/刷歌/雷达)
+     *   TF 卡     : 0..1  (全部曲目/随机30首)
      *   Navidrome : 0..2  (最近播放/我的收藏/随机30首) */
     if (s_back == PLAYER_BACK_QQ) {
         if (src < 0 || src >= QQ_MODE_COUNT) return;
         s_qq_mode = src;
+    } else if (s_back == PLAYER_BACK_TF) {
+        if (src < 0 || src >= PLAYER_TF_MODE_COUNT) return;
+        s_tf_mode = src;
     } else {
         if (src < 0 || src >= PLAYER_SRC_COUNT) return;
         s_src = (player_src_t)src;
@@ -1150,11 +1266,57 @@ static void handle_set_back(int back, bool autoplay)
 {
     if (back < 0 || back >= PLAYER_BACK_COUNT) return;
     player_back_t old = s_back;
+
+    /* ★ 离开 TF 卡：必须先停播再卸载，理由有两条 ——
+     *   ① 正在播的本地文件持着卡上的 fd，卸了之后再读就是野指针；
+     *   ② SDSPI 的那份内部 SRAM（DMA 缓冲 + 协议状态）要还给系统，
+     *      在线播放正是靠这份余量（见 sd_card.h 的开头）。 */
+    bool leave_tf = (old == PLAYER_BACK_TF && (player_back_t)back != PLAYER_BACK_TF);
+    if (leave_tf) {
+        if (audio_engine_state() != AE_STATE_IDLE) {
+            board_es8388_mute(true);
+            audio_engine_stop();
+            vTaskDelay(pdMS_TO_TICKS(60));       /* 等 DMA 里剩的放完 */
+            restore_mute();
+        }
+        ae_source_t *old_src = s_cur_src;
+        s_cur_src = NULL;
+        if (old_src) ae_source_free(old_src);
+        sd_card_unmount();
+        /* ★ 索引也要放掉：它在 PSRAM 里（2000 首 ≈ 744KB）。留着不占内部 SRAM，
+         *   但没理由白占着 PSRAM —— 而且"卡都不挂了、索引还在"这个状态
+         *   会让 musiclib_find_by_id() 在别的来源下误判。见 handle_set_back 回来时的 load()。 */
+        musiclib_clear();
+    }
+
+    /* ★ 进 TF 卡：先挂卡、再读索引，然后才由 load_source 取列表。
+     *   挂不上就直接失败并保留原队列（不格式化、不猜）。 */
+    if ((player_back_t)back == PLAYER_BACK_TF) {
+        esp_err_t merr = sd_card_mount();
+        if (merr != ESP_OK) {
+            ESP_LOGE(TAG, "切到 TF 卡失败：%s（保持「%s」）", esp_err_to_name(merr),
+                     player_back_name(old));
+            return;
+        }
+        if (musiclib_load() != ESP_OK) {
+            /* 没索引不是错误 —— 曲库为空，等用户去设置里扫一次。
+             * 这里只提示，仍让 load_source 走到它自己的"曲库为空"分支，
+             * 于是界面上的表现和"卡是空的"完全一致，不用多一条错误路径。 */
+            ESP_LOGW(TAG, "TF 卡上没有可用索引（%s）—— 需要扫一次",
+                     esp_err_to_name(musiclib_last_err()));
+        }
+    }
+
     s_back = (player_back_t)back;
 
     int first = 0;
     if (!load_source_chain((player_src_t)player_mode(), &first)) {
         s_back = old;
+        /* 回退也要把卡的状态还原：切进 TF 失败不能把卡留在挂载态 */
+        if ((player_back_t)back == PLAYER_BACK_TF && old != PLAYER_BACK_TF) {
+            musiclib_clear();
+            sd_card_unmount();
+        }
         ESP_LOGE(TAG, "切到「%s」失败，保持「%s」（队列没动）",
                  player_back_name((player_back_t)back), player_back_name(old));
         return;
@@ -1173,6 +1335,19 @@ static void handle_set_back(int back, bool autoplay)
 static void handle_resume(void)
 {
     int first = 0;
+    /* ★ 上次来源是 TF 卡：开机时卡是卸着的（懒挂载，见 sd_card.h），
+     *   所以这里要先挂上、读索引，才能重建队列。挂不上就不是致命错误 ——
+     *   退回 Navidrome，否则用户会卡在一个永远空的来源上，还看不出为什么。 */
+    if (s_back == PLAYER_BACK_TF) {
+        if (sd_card_mount() != ESP_OK) {
+            ESP_LOGE(TAG, "开机恢复：TF 卡挂不上，退回「Navidrome」");
+            s_back = PLAYER_BACK_NAV;
+        } else if (musiclib_load() != ESP_OK) {
+            ESP_LOGW(TAG, "开机恢复：TF 卡上没有可用索引（%s），曲库为空",
+                     esp_err_to_name(musiclib_last_err()));
+        }
+    }
+
     /* 沿用上次的「来源 + 模式」—— player_mode() 会按当前后端给出正确下标 */
     if (!load_source_chain((player_src_t)player_mode(), &first)) return;
 
@@ -1223,6 +1398,12 @@ static void do_search(const char *q)
     if (s_back == PLAYER_BACK_QQ) {
         err = s_found_tmp ? qqmusic_search(q, s_found_tmp, QQ_SONGS_MAX, &got) : ESP_ERR_NO_MEM;
         for (int i = 0; i < got; i++) s_found_tmp[i].back = SUB_BACK_QQ;   /* 逐首打后端标记 */
+    } else if (s_back == PLAYER_BACK_TF) {
+        /* ★ TF 卡搜索是**纯内存**的（musiclib 的子串匹配），没有网络往返 ——
+         *   所以这一步不会像另外两个后端那样阻塞几百毫秒。 */
+        got = s_found_tmp ? musiclib_search(q, s_found_tmp, PLAYER_QUEUE_MAX) : 0;
+        err = s_found_tmp ? ESP_OK : ESP_ERR_NO_MEM;
+        for (int i = 0; i < got; i++) s_found_tmp[i].back = SUB_BACK_TF;
     } else {
         err = s_found_tmp ? subsonic_search(q, s_found_tmp, SUB_SONGS_MAX, &got) : ESP_ERR_NO_MEM;
         for (int i = 0; i < got; i++) s_found_tmp[i].back = SUB_BACK_NAV;
@@ -1247,6 +1428,70 @@ static void do_search(const char *q)
 }
 
 /* ============================================================ 命令分发 */
+
+/* 重扫 TF 卡曲库。跑在 player 任务里（会阻塞几秒，但这是用户主动触发的、
+ * 界面上有"扫描中"进度的那类操作，可以接受）。
+ *
+ * 顺序：确保挂卡 → 起扫描 → 轮询进度 → 重新读索引 → 如果当前就在 TF 来源，
+ * 顺手把队列重建一遍（不然扫完还得再切一次来源才看得见新歌）。 */
+static void handle_tf_scan(void)
+{
+    if (s_tf_scan_busy) { ESP_LOGW(TAG, "TF 扫描已在进行中"); return; }
+
+    if (!sd_card_mounted()) {
+        esp_err_t merr = sd_card_mount();
+        if (merr != ESP_OK) {
+            s_tf_scan_err = merr;
+            ESP_LOGE(TAG, "扫描 TF 卡失败：%s（没插卡？）", esp_err_to_name(merr));
+            return;
+        }
+    }
+
+    s_tf_scan_busy    = true;
+    s_tf_scan_err     = ESP_OK;
+    s_tf_scan_scanned = 0;
+    s_tf_scan_found   = 0;
+
+    esp_err_t serr = musiclib_scan_start();
+    if (serr != ESP_OK) {
+        s_tf_scan_busy = false;
+        s_tf_scan_err  = serr;
+        ESP_LOGE(TAG, "扫描起不来：%s", esp_err_to_name(serr));
+        return;
+    }
+
+    ESP_LOGW(TAG, "开始扫描 TF 卡曲库…");
+    while (musiclib_scan_busy()) {
+        s_tf_scan_scanned = musiclib_scan_scanned();
+        s_tf_scan_found   = musiclib_scan_found();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    s_tf_scan_scanned = musiclib_scan_scanned();
+    s_tf_scan_found   = musiclib_scan_found();
+    s_tf_scan_err     = musiclib_scan_result();
+    s_tf_scan_busy    = false;
+
+    if (s_tf_scan_err != ESP_OK) {
+        ESP_LOGE(TAG, "扫描失败：%s（遍历 %d 个文件，入库 %d 首）",
+                 esp_err_to_name(s_tf_scan_err), s_tf_scan_scanned, s_tf_scan_found);
+        return;
+    }
+    if (musiclib_load() != ESP_OK) {
+        ESP_LOGE(TAG, "扫描成功但索引读不回来：%s", esp_err_to_name(musiclib_last_err()));
+        return;
+    }
+    ESP_LOGW(TAG, "扫描完成：遍历 %d 个文件，曲库 %d 首",
+             s_tf_scan_scanned, musiclib_count());
+
+    /* 当前就在 TF 来源：把队列跟着更新（列表页/播放页立刻看到新曲库） */
+    if (s_back == PLAYER_BACK_TF) {
+        int first = 0;
+        if (load_source_chain((player_src_t)player_mode(), &first)) {
+            player_status_set_queue(-1, player_queue_count(),
+                                    player_mode_name(player_mode()), true);
+        }
+    }
+}
 
 static void handle_cmd(const player_cmd_t *c)
 {
@@ -1287,6 +1532,9 @@ static void handle_cmd(const player_cmd_t *c)
             break;
         case CMD_SET_BACK:
             handle_set_back(c->iarg, c->barg);
+            break;
+        case CMD_TF_SCAN:
+            handle_tf_scan();
             break;
         case CMD_RESUME:
             handle_resume();
@@ -1508,6 +1756,8 @@ esp_err_t player_init(void)
     if (bk >= 0 && bk < PLAYER_BACK_COUNT) s_back = (player_back_t)bk;
     int qm = settings_get_int("qmode", (int)QQ_MODE_FAV);
     if (qm >= 0 && qm < QQ_MODE_COUNT) s_qq_mode = qm;
+    int tm = settings_get_int("tfmode", PLAYER_TF_MODE_ALL);
+    if (tm >= 0 && tm < PLAYER_TF_MODE_COUNT) s_tf_mode = tm;
     /* 「收藏」跳过前 N 首置顶（0 = 不跳） */
     int fs = settings_get_int("favskip", 5);
     if (fs >= 0 && fs <= 50) s_fav_skip = fs;
@@ -1578,27 +1828,54 @@ const char *player_back_name(player_back_t b)
     switch (b) {
         case PLAYER_BACK_QQ:  return "QQ音乐";
         case PLAYER_BACK_NAV: return "Navidrome";
+        case PLAYER_BACK_TF:  return "TF卡";
         default:              return "";
     }
 }
 
 int player_mode(void)
 {
-    return (s_back == PLAYER_BACK_QQ) ? s_qq_mode : (int)s_src;
+    switch (s_back) {
+        case PLAYER_BACK_QQ: return s_qq_mode;
+        case PLAYER_BACK_TF: return s_tf_mode;
+        default:             return (int)s_src;
+    }
 }
 
 int player_mode_count(void)
 {
-    return (s_back == PLAYER_BACK_QQ) ? QQ_MODE_COUNT : PLAYER_SRC_COUNT;
+    switch (s_back) {
+        case PLAYER_BACK_QQ: return QQ_MODE_COUNT;
+        case PLAYER_BACK_TF: return PLAYER_TF_MODE_COUNT;
+        default:             return PLAYER_SRC_COUNT;
+    }
 }
 
 const char *player_mode_name(int i)
 {
-    if (s_back == PLAYER_BACK_QQ) {
-        return (i >= 0 && i < QQ_MODE_COUNT) ? qq_mode_name((qq_mode_t)i) : "";
+    switch (s_back) {
+        case PLAYER_BACK_QQ:
+            return (i >= 0 && i < QQ_MODE_COUNT) ? qq_mode_name((qq_mode_t)i) : "";
+        case PLAYER_BACK_TF:
+            return (i >= 0 && i < PLAYER_TF_MODE_COUNT) ? k_tf_modes[i] : "";
+        default:
+            return (i >= 0 && i < PLAYER_SRC_COUNT) ? player_src_name((player_src_t)i) : "";
     }
-    return (i >= 0 && i < PLAYER_SRC_COUNT) ? player_src_name((player_src_t)i) : "";
 }
+
+/* ---------------- TF 卡离线曲库的公开接口 ---------------- */
+
+void player_tf_scan(void)   { post(CMD_TF_SCAN, 0, false); }
+bool player_tf_scan_busy(void) { return s_tf_scan_busy; }
+void player_tf_scan_progress(int *scanned, int *found)
+{
+    if (scanned) *scanned = s_tf_scan_scanned;
+    if (found)   *found   = s_tf_scan_found;
+}
+esp_err_t player_tf_scan_err(void) { return s_tf_scan_err; }
+int  player_tf_count(void)   { return musiclib_count(); }
+bool player_tf_present(void) { return sd_card_present(); }
+bool player_tf_mounted(void) { return sd_card_mounted(); }
 
 void player_play_index(int idx) { post(CMD_PLAY_INDEX, idx, false); }
 void player_next(void)          { post(CMD_NEXT, 0, false); }
