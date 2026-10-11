@@ -285,7 +285,13 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON *q = cJSON_AddObjectToObject(o, "queue");
     cJSON_AddNumberToObject(q, "index", player_queue_index());
     cJSON_AddNumberToObject(q, "count", player_queue_count());
-    cJSON_AddStringToObject(q, "source", player_src_name(player_source()));
+    /* ⚠️ "source" 这个字段名是**老前端在用**的，现在它指的是「模式」（最近播放…/每日30首…）。
+     *    真正的「来源」（后端）在下面 back/back_name。保留旧字段名以免老前端显示空白。 */
+    cJSON_AddStringToObject(q, "source", player_mode_name(player_mode()));
+    cJSON_AddNumberToObject(q, "mode", player_mode());
+    cJSON_AddStringToObject(q, "mode_name", player_mode_name(player_mode()));
+    cJSON_AddNumberToObject(q, "back", (int)player_back());
+    cJSON_AddStringToObject(q, "back_name", player_back_name(player_back()));
     cJSON_AddNumberToObject(q, "gen", player_queue_gen());
 
     /* M6：收藏镜像的状态。前端靠 starred.gen 变化决定要不要重拉 /api/starred
@@ -413,13 +419,29 @@ static esp_err_t h_search(httpd_req_t *req)
 static esp_err_t h_sources(httpd_req_t *req)
 {
     cJSON *o = cJSON_CreateObject();
-    cJSON_AddNumberToObject(o, "current", (int)player_source());
-    cJSON_AddStringToObject(o, "current_name", player_src_name(player_source()));
-    cJSON *items = cJSON_AddArrayToObject(o, "items");
-    for (int i = 0; i < PLAYER_SRC_COUNT; i++) {
+    /* 「来源」（后端）和「模式」**分开报**，和屏幕上的菜单一一对应：
+     *   来源 = 从哪个服务来（Navidrome / QQ 音乐）
+     *   模式 = 这个服务下的哪类曲目（项数与名字**随后端变**：QQ 6 个 / Navidrome 3 个）
+     * 老前端只认 items/current/current_name（那三个现在指的是"模式"），字段名保持兼容。 */
+    cJSON_AddNumberToObject(o, "back", (int)player_back());
+    cJSON_AddStringToObject(o, "back_name", player_back_name(player_back()));
+
+    cJSON *backs = cJSON_AddArrayToObject(o, "backs");
+    for (int i = 0; i < (int)PLAYER_BACK_COUNT; i++) {
         cJSON *it = cJSON_CreateObject();
         cJSON_AddNumberToObject(it, "i", i);
-        cJSON_AddStringToObject(it, "name", player_src_name((player_src_t)i));
+        cJSON_AddStringToObject(it, "name", player_back_name((player_back_t)i));
+        cJSON_AddItemToArray(backs, it);
+    }
+
+    cJSON_AddNumberToObject(o, "current", player_mode());
+    cJSON_AddStringToObject(o, "current_name", player_mode_name(player_mode()));
+    cJSON *items = cJSON_AddArrayToObject(o, "items");
+    int n = player_mode_count();
+    for (int i = 0; i < n; i++) {
+        cJSON *it = cJSON_CreateObject();
+        cJSON_AddNumberToObject(it, "i", i);
+        cJSON_AddStringToObject(it, "name", player_mode_name(i));
         cJSON_AddItemToArray(items, it);
     }
     return send_json(req, o);
@@ -631,8 +653,26 @@ static esp_err_t h_source(httpd_req_t *req)
     int i = json_int(b, "i", -1);
     bool autoplay = json_bool(b, "autoplay", true);
     cJSON_Delete(b);
-    if (i < 0 || i >= PLAYER_SRC_COUNT) return fail(req, "400 Bad Request", "来源下标越界");
-    player_set_source((player_src_t)i, autoplay);
+    /* 「模式」的下标范围**随后端变**（QQ 6 个 / Navidrome 3 个），
+     * 所以在这里按当前后端校验；player 任务里还会再校验一次（它才是唯一改状态的地方）。 */
+    int n = player_mode_count();
+    if (i < 0 || i >= n) return fail(req, "400 Bad Request", "模式下标越界");
+    player_set_mode(i, autoplay);
+    return ok_json(req);
+}
+
+/* 换「来源」= 换后端（Navidrome / QQ 音乐）。
+ * ⚠️ 切换**不一定成功**（Navidrome 没配、QQ 服务连不上都会失败，player 会回退状态），
+ *    所以这里只回"已下发"，真正的结果要看 /api/status 里的 back/back_name。 */
+static esp_err_t h_back(httpd_req_t *req)
+{
+    cJSON *b = read_body(req);
+    if (b == NULL) return fail(req, "400 Bad Request", "请求体不是合法 JSON");
+    int i = json_int(b, "i", -1);
+    bool autoplay = json_bool(b, "autoplay", true);
+    cJSON_Delete(b);
+    if (i < 0 || i >= (int)PLAYER_BACK_COUNT) return fail(req, "400 Bad Request", "来源下标越界");
+    player_set_back((player_back_t)i, autoplay);
     return ok_json(req);
 }
 
@@ -973,6 +1013,7 @@ esp_err_t web_console_start(void)
         { .uri = "/api/mute",            .method = HTTP_POST, .handler = h_mute },
         { .uri = "/api/bright",          .method = HTTP_POST, .handler = h_bright },
         { .uri = "/api/source",          .method = HTTP_POST, .handler = h_source },
+        { .uri = "/api/back",            .method = HTTP_POST, .handler = h_back },
         /* 音质挡位：GET 读、POST 写，同一个处理器按 method 分支 */
         { .uri = "/api/quality",         .method = HTTP_GET,  .handler = h_quality },
         { .uri = "/api/quality",         .method = HTTP_POST, .handler = h_quality },
