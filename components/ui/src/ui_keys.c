@@ -199,6 +199,13 @@ static void key_short(int k)
             }
             break;
 
+        case UI_PAGE_QQLOGIN:                   /* QQ 登录页 */
+            /* K1/K2 不做事：这一页只有"看情况 / 取码"两件事，翻来翻去没有意义。
+             * K3 = 取二维码（码已显示时再按 = 换一张；正在取时会被忽略）。
+             * K4 由 k4_navigate 管（回设置页）。 */
+            if (k == 2) ui_qqlogin_activate();
+            break;
+
         case UI_PAGE_VOL:
             switch (k) {
                 case 0: ui_vol_step(+5); break;       /* K1 = 加（用户指定） */
@@ -354,6 +361,7 @@ static void enc_press_short(void)
         case UI_PAGE_SRC:        ui_srcmenu_activate();   break;  /* 「模式」 */
         case UI_PAGE_BACK:       ui_backmenu_activate();  break;  /* 「来源」 */
         case UI_PAGE_SETTINGS:   ui_setmenu_activate();   break;
+        case UI_PAGE_QQLOGIN:    ui_qqlogin_activate();   break;  /* 按 = 取二维码 */
         case UI_PAGE_VOL:        ui_vol_toggle_mute();    break;
         case UI_PAGE_SEARCH_MODE:
         case UI_PAGE_SEARCH_IN:

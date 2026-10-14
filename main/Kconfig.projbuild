@@ -100,12 +100,13 @@ menu "ESP-Music 配置"
 
         config APP_QQ_HOST
             string "契约层服务地址（含 http:// 与端口）"
-            default "http://192.168.0.108:3210"
+            default "http://192.168.0.116:3210"
             help
-                这是 F:\wsl\qqmusic 那个 Docker 服务（见那边的 README）。
-                它把 QQ 音乐包装成一套我们自己的 /v1/* 契约，设备只依赖它 ——
-                QQ 的接口怎么变、上游库怎么升级，都只改容器，不用重刷固件。
-
+                这是把 QQ 音乐包装成一套我们自己的 /v1/* 契约的服务。
+                ⚠️ 2026-10-14 改：它**已经从 PC 上的 Docker 搬到了 OpenStick 棒子上**
+                   （Qualcomm MSM8916 / Debian，systemd + venv 部署，源码在
+                     github.com/spring-soft/lychee-music-qqservice）。PC 上那个已停用，
+                   所以旧默认值 192.168.0.108 在新布局下连不上。
                 地址也可以之后在网页设置里改（存 NVS，优先于这里的默认值）。
                 ⚠️ 结尾不要带斜杠。
 

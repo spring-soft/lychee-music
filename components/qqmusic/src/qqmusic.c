@@ -19,9 +19,11 @@ static const char *TAG = "qqmusic";
 #define QQ_NVS_NS       "qqcfg"
 #define HTTP_BODY_MAX   (96 * 1024)     /* 列表 JSON 也就几十 KB，给足余量 */
 
-/* Kconfig 没定义时的兜底（值就是本机跑服务的地址） */
+/* Kconfig 没定义时的兜底（值就是跑服务的地址）。
+ * ⚠️ 2026-10-14：QQ 服务已从 PC 的 Docker 搬到 OpenStick（192.168.0.116），
+ *    这里跟着 Kconfig 一起改 —— 免得出现"Kconfig 改了、兜底还是旧的"这种鬼状态。 */
 #ifndef CONFIG_APP_QQ_HOST
-#define CONFIG_APP_QQ_HOST "http://192.168.0.108:3210"
+#define CONFIG_APP_QQ_HOST "http://192.168.0.116:3210"
 #endif
 
 static char s_host[QQ_HOST_MAX];
@@ -247,10 +249,28 @@ static esp_err_t parse_items(cJSON *root, sub_song_t *out, int max, int *got)
 esp_err_t qqmusic_health(char *msg, size_t len)
 {
     if (msg && len) msg[0] = 0;
+    qqmusic_health_t h;
+    esp_err_t err = qqmusic_health_ex(&h);
+    if (msg == NULL || len == 0) return err;
+
+    if (!h.reachable) { strlcpy(msg, h.reason, len); return err; }
+    if (!h.present)   { strlcpy(msg, "还没登录（需要扫码）", len); return ESP_ERR_INVALID_STATE; }
+    if (h.expired)    { strlcpy(msg, "凭据已过期（需要重新扫码）", len); return ESP_ERR_INVALID_STATE; }
+    if (!h.valid)     { strlcpy(msg, h.reason[0] ? h.reason : "凭据无效", len); return ESP_ERR_INVALID_STATE; }
+    snprintf(msg, len, "凭据有效%s", h.vip ? "，VIP 已识别" : "");
+    return ESP_OK;
+}
+
+esp_err_t qqmusic_health_ex(qqmusic_health_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+
     if (!qqmusic_configured()) {
-        if (msg && len) strlcpy(msg, "没配服务地址", len);
+        strlcpy(out->reason, "没配服务地址", sizeof(out->reason));
         return ESP_ERR_INVALID_STATE;
     }
+
     char url[256];
     snprintf(url, sizeof(url), "%s/v1/health", s_host);
 
@@ -258,37 +278,146 @@ esp_err_t qqmusic_health(char *msg, size_t len)
     int status = 0;
     esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, NULL, &status, 8000);
     if (err != ESP_OK) {
-        if (msg && len) snprintf(msg, len, "连不上服务（HTTP %d）", status);
+        snprintf(out->reason, sizeof(out->reason), "连不上服务（HTTP %d）", status);
         return err;
     }
     cJSON *root = cJSON_Parse(body);
     heap_caps_free(body);
-    if (!root) {
-        if (msg && len) strlcpy(msg, "响应不是合法 JSON", len);
+    if (root == NULL) {
+        strlcpy(out->reason, "响应不是合法 JSON", sizeof(out->reason));
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    esp_err_t ret = ESP_OK;
-    const cJSON *ok = cJSON_GetObjectItem(root, "ok");
+    out->reachable = true;
+    out->ok        = cJSON_IsTrue(cJSON_GetObjectItem(root, "ok"));
     const cJSON *cred = cJSON_GetObjectItem(root, "credential");
-    bool okv = cJSON_IsTrue(ok);
-    const char *reason = NULL;
     if (cJSON_IsObject(cred)) {
+        out->present = cJSON_IsTrue(cJSON_GetObjectItem(cred, "present"));
+        out->valid   = cJSON_IsTrue(cJSON_GetObjectItem(cred, "valid"));
+        out->expired = cJSON_IsTrue(cJSON_GetObjectItem(cred, "expired"));
+        const cJSON *mid = cJSON_GetObjectItem(cred, "musicid");
+        if (cJSON_IsNumber(mid)) out->musicid = (long long)mid->valuedouble;
         const cJSON *r = cJSON_GetObjectItem(cred, "reason");
-        if (cJSON_IsString(r)) reason = r->valuestring;
+        if (cJSON_IsString(r) && r->valuestring) {
+            strlcpy(out->reason, r->valuestring, sizeof(out->reason));
+        }
     }
-    if (okv) {
-        if (msg && len) {
-            /* 把 VIP 是否可见也带出来 —— 它决定能不能拿无损 */
-            const cJSON *vip = cJSON_GetObjectItem(root, "vip");
-            snprintf(msg, len, "凭据有效%s", cJSON_IsObject(vip) ? "，VIP 已识别" : "");
+    out->vip = cJSON_IsObject(cJSON_GetObjectItem(root, "vip"));
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/* ============================================================ 登录（扫码） */
+
+static int b64_val(int c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+/* 解 base64（容忍换行/空格，遇 '=' 结束）。缓冲不够返回 false。 */
+static bool b64_decode(const char *in, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    size_t o = 0;
+    int    acc = 0, nbits = 0;
+    for (const char *p = in; *p; p++) {
+        if (*p == '=') break;
+        if (*p == '\n' || *p == '\r' || *p == ' ') continue;
+        int v = b64_val((unsigned char)*p);
+        if (v < 0) return false;
+        acc = (acc << 6) | v;
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            if (o >= out_cap) return false;
+            out[o++] = (uint8_t)((acc >> nbits) & 0xFF);
+        }
+    }
+    *out_len = o;
+    return true;
+}
+
+esp_err_t qqmusic_login_qr_png(uint8_t **png, size_t *len)
+{
+    if (png == NULL || len == NULL) return ESP_ERR_INVALID_ARG;
+    *png = NULL;
+    *len = 0;
+    if (!qqmusic_configured()) return ESP_ERR_INVALID_STATE;
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/v1/login/qr", s_host);
+
+    char *body = NULL;
+    int status = 0;
+    /* 服务端要等上游 CreateQRCode 建码、再拉起 MQTT 监听，给足时间 */
+    esp_err_t err = http_req(HTTP_METHOD_POST, url, &body, NULL, &status, 20000);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "取二维码失败（HTTP %d）", status);
+        return err;
+    }
+    cJSON *root = cJSON_Parse(body);
+    heap_caps_free(body);
+    if (root == NULL) return ESP_ERR_INVALID_RESPONSE;
+
+    err = ESP_ERR_INVALID_RESPONSE;
+    const cJSON *b64 = cJSON_GetObjectItem(root, "image_base64");
+    if (cJSON_IsString(b64) && b64->valuestring) {
+        size_t in_len = strlen(b64->valuestring);
+        size_t cap = in_len / 4 * 3 + 4;
+        uint8_t *buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+        if (buf == NULL) buf = heap_caps_malloc(cap, MALLOC_CAP_8BIT);
+        if (buf == NULL) {
+            err = ESP_ERR_NO_MEM;
+        } else {
+            size_t n = 0;
+            if (b64_decode(b64->valuestring, buf, cap, &n) && n > 0) {
+                *png = buf;
+                *len = n;
+                err  = ESP_OK;
+                const cJSON *mime = cJSON_GetObjectItem(root, "mimetype");
+                ESP_LOGI(TAG, "二维码 PNG %u 字节（base64 %u，mime=%s）",
+                         (unsigned)n, (unsigned)in_len,
+                         cJSON_IsString(mime) ? mime->valuestring : "?");
+            } else {
+                heap_caps_free(buf);
+            }
         }
     } else {
-        ret = ESP_ERR_INVALID_STATE;
-        if (msg && len) snprintf(msg, len, "%s", reason ? reason : "服务报不 ok（多半是凭据过期）");
+        const cJSON *d = cJSON_GetObjectItem(root, "detail");
+        ESP_LOGW(TAG, "服务端没给 image_base64: %s",
+                 cJSON_IsString(d) ? d->valuestring : "(无 detail)");
     }
     cJSON_Delete(root);
-    return ret;
+    return err;
+}
+
+esp_err_t qqmusic_login_status(char *event, size_t event_len,
+                               bool *saved, char *errbuf, size_t err_len)
+{
+    if (event && event_len) event[0] = 0;
+    if (saved) *saved = false;
+    if (errbuf && err_len) errbuf[0] = 0;
+    if (!qqmusic_configured()) return ESP_ERR_INVALID_STATE;
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/v1/login/status", s_host);
+
+    char *body = NULL;
+    esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, NULL, NULL, 6000);
+    if (err != ESP_OK) return err;
+    cJSON *root = cJSON_Parse(body);
+    heap_caps_free(body);
+    if (root == NULL) return ESP_ERR_INVALID_RESPONSE;
+
+    if (event && event_len) copy_str(event, event_len, root, "event");
+    if (saved) *saved = cJSON_IsTrue(cJSON_GetObjectItem(root, "saved"));
+    if (errbuf && err_len) copy_str(errbuf, err_len, root, "error");
+    cJSON_Delete(root);
+    return (event && event[0]) ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
 esp_err_t qqmusic_list(qq_mode_t mode, sub_song_t *out, int max, int *got)

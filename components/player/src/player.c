@@ -31,7 +31,23 @@
 
 static const char *TAG = "player";
 
-#define PLAYER_TASK_STACK 6144
+/* ⚠️ 2026-10-14 真机实测（自制 PCB V2，首次刷写该板）：
+ *    6144 不够 —— **起播那一刻栈溢出**，触发 vApplicationStackOverflowHook
+ *    打印 "A stack overflow in task player has been detected." 后无限重启。
+ *    两次都是刚打开 HTTP 音频流（8.7MB / 45MB 的 FLAC）就崩。
+ *
+ *    最费栈的是 start_index_from()：它栈上放着 sub_song_t(660B) + char url[768B]，
+ *    再叠加 subsonic_stream_url_at/stream_url_ex、audio_engine_play、
+ *    player_status_set_song 的帧，以及 ESP_LOG 的 vsnprintf（几十~几百字节）。
+ *    单看每一处都不大，**累加起来就贴着 6144 的天花板**，没有余量。
+ *    （大板线同样是 6144 却能跑 —— 因为 v2-pcb 这版 player.c 多了 384 行
+ *      TF/QQ 合并代码，调用链变深了。）
+ *
+ *    调到 10240，同时在 player_task 里加了**周期性的栈水位日志**，
+ *    长期盯着真实余量 —— 不想靠"调大蒙过去"（水位日志能证明调得对不对）。
+ *    如果以后又逼近，优先把 start_index_from 里的 url[768] 改成堆分配，
+ *    而不是继续无脑加栈。 */
+#define PLAYER_TASK_STACK 10240
 #define PLAYER_TASK_PRIO  5
 #define PLAYER_TASK_CORE  0
 
@@ -1652,7 +1668,9 @@ static void handle_cmd(const player_cmd_t *c)
 
 static void player_task(void *arg)
 {
-    ESP_LOGI(TAG, "player 任务启动（core %d, prio %d）", PLAYER_TASK_CORE, PLAYER_TASK_PRIO);
+    ESP_LOGI(TAG, "player 任务启动（core %d, prio %d, 栈 %d B）",
+             PLAYER_TASK_CORE, PLAYER_TASK_PRIO, PLAYER_TASK_STACK);
+    uint32_t stack_tick = 0;
     for (;;) {
         player_cmd_t c;
         if (xQueueReceive(s_q, &c, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -1666,6 +1684,19 @@ static void player_task(void *arg)
         starred_save_tick();                /* M6：收藏镜像落盘 */
         pend_retry_tick();                  /* M6：离线攒下的收藏操作，每分钟补发一次 */
         resume_tick();                      /* M6：每 20 秒记一次续播位置 */
+
+        /* ★ 每 5 秒报一次栈水位（25 × 200ms）。
+         * 为什么必须有这个：2026-10-14 在 PCB V2 上起播就栈溢出、无限重启
+         * （见 PLAYER_TASK_STACK 上面的说明）。把栈调大之后，必须能**看见**
+         * 真实余量 —— 否则下次还是"崩了才知道不够"，而代价是变砖式的重启循环。
+         * uxTaskGetStackHighWaterMark 返回的是**历史最低剩余**，单位是字，不是字节。 */
+        if (++stack_tick >= 25) {
+            stack_tick = 0;
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGI(TAG, "栈水位: 历史最低剩余 %u B / 共 %d B",
+                     (unsigned)(hwm * sizeof(StackType_t)), PLAYER_TASK_STACK);
+        }
+
         if (!s_active) continue;
 
         /* 无命令时：看引擎状态决定要不要自动接下一首 */

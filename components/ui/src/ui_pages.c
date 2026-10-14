@@ -26,6 +26,8 @@
 #include "store.h"        /* 清空缓存：store_evict / store_free_kb */
 #include "settings.h"
 #include "hid_remote.h"
+#include "qqlogin.h"      /* 设置 → QQ 登录：登录情况 + 扫码（点阵是模块级的，本页自己放大画）*/
+#include "qqmusic.h"      /* qqmusic_host()：登录页要显示服务地址 */
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -277,6 +279,7 @@ ui_page_t ui_page_parent(ui_page_t p)
         case UI_PAGE_SRC:         return UI_PAGE_MENU;
         case UI_PAGE_BACK:        return UI_PAGE_MENU;   /* 来源二级菜单的上一级也是主菜单 */
         case UI_PAGE_SETTINGS:    return UI_PAGE_MENU;   /* 设置页的上一级 = 菜单 */
+        case UI_PAGE_QQLOGIN:     return UI_PAGE_SETTINGS;  /* QQ 登录的上一级 = 设置 */
         case UI_PAGE_SEARCH_MODE: return UI_PAGE_MENU;
         case UI_PAGE_SEARCH_IN:   return UI_PAGE_SEARCH_MODE;   /* 用户要的：回输入页要先过方式选择 */
         case UI_PAGE_SEARCH_RES:  return UI_PAGE_SEARCH_IN;     /* 用户要的：方便改词重搜 */
@@ -457,8 +460,14 @@ void ui_backmenu_activate(void)
  * 重连为什么要二次确认：重连会把当前连接掐掉、正在放的歌会中断。原来它直接摆在
  * 主菜单里按一下就执行，往上翻菜单很容易误触。现在第一次按 K3 只是把这一行变成
  * "重连 WiFi？再按K3确认"，再按一次才真的动网络，K4 随时退出。
+ *
+ * 2026-10-14 新增第 4 项「QQ 登录」：用户要求"在设置里能看到当前 QQ 契约层服务的
+ * 登录情况，按 K3 扫码登录，确认后回到显示登录情况"。这一行的**后缀就是登录结论**
+ * （有效 / 已过期 / 未登录…），按 K3 进 UI_PAGE_QQLOGIN 看详情并扫码。
+ * 为什么这一项不做二次确认：扫码只是"看"和"换一张码"，没有任何破坏性，
+ * 多一步确认只会让人以为按错了。
  */
-#define SET_N  3
+#define SET_N  4
 
 static lv_obj_t *s_scr_set, *s_set_hl, *s_set_lbl[SET_N];
 static int       s_set_sel;
@@ -467,6 +476,9 @@ static bool      s_set_confirm;      /* true = 正停在某一项的确认态 */
 /* 扫描 TF 卡的进度显示：只在"上一次 tick 还在扫"时才算进度，
  * 并负责在扫完的那一次弹结果（不这样的话 toast 会在扫描期间被反复覆盖）。 */
 static bool      s_tf_was_busy;
+/* 「QQ 登录」那一行的状态后缀。后台任务查到结果要几秒，所以靠 set_tick 定期取；
+ * 只在文字真的变了才重绘（否则每 250ms 平白重画一行）。 */
+static char      s_set_qq[16];
 
 static void set_render(void)
 {
@@ -494,6 +506,11 @@ static void set_render(void)
                  (s_set_confirm && s_set_sel == 2) ? "？再按K3确认" : "");
     }
     ui_set_text(s_set_lbl[2], buf);
+
+    /* QQ 登录：后缀 = 登录结论（后台查到什么就显示什么，见 set_qq_short） */
+    if (s_set_qq[0]) snprintf(buf, sizeof(buf), "QQ 登录  %s", s_set_qq);
+    else             snprintf(buf, sizeof(buf), "QQ 登录");
+    ui_set_text(s_set_lbl[3], buf);
 
     int y = MENU_Y0 + s_set_sel * MENU_ROW_H;
     if (s_set_r_sel < 0 || lv_obj_get_y(s_set_hl) != y) {
@@ -539,7 +556,14 @@ void ui_setmenu_move(int delta)
 void ui_setmenu_activate(void)
 {
     /* 两段式：第一次按 K3 只是"进入确认态"，再按一次才真的执行。
-     * 这两项都有副作用（断网 / 删文件），不该一按就中。 */
+     * 这两项都有副作用（断网 / 删文件），不该一按就中。
+     * ⚠️ 第 4 项「QQ 登录」**不进确认态** —— 它只是打开一页，没有副作用，
+     *    多一步确认只会让人以为按错了。 */
+    if (s_set_sel == 3) {
+        ui_qqlogin_open();
+        return;
+    }
+
     if (!s_set_confirm) {
         s_set_confirm = true;
         ui_toast(s_set_sel == 0 ? "再按 K3 确认重连" :
@@ -583,8 +607,25 @@ void ui_setmenu_activate(void)
     ui_page_show(UI_PAGE_MENU);     /* 执行完退出 */
 }
 
+/* 「QQ 登录」那一行的短后缀。把 qqlogin 给的长结论压成两三个字 ——
+ * 12px 字体下一行只放得下 11 个字符，"QQ 登录  " 已经占 7 个。 */
+static const char *qq_short(const char *state)
+{
+    if (strcmp(state, "凭据有效") == 0) return "有效";
+    if (strcmp(state, "凭据已过期") == 0) return "已过期";
+    if (strcmp(state, "未登录") == 0) return "未登录";
+    if (strcmp(state, "凭据无效") == 0) return "无效";
+    if (strcmp(state, "连不上服务") == 0) return "连不上";
+    if (strcmp(state, "没配服务地址") == 0) return "没配置";
+    if (strcmp(state, "等待扫码") == 0) return "等扫码";
+    if (strcmp(state, "正在获取二维码…") == 0) return "取码中";
+    if (strcmp(state, "已扫码，请在手机上确认") == 0) return "待确认";
+    return "";
+}
+
 /* 设置页的周期刷新（ui_pages_tick 调）。
- * 存在的唯一理由：扫描 TF 卡是异步的，界面要显示进度、并在扫完时弹结果。 */
+ * 存在的唯一理由：扫描 TF 卡是异步的，界面要显示进度、并在扫完时弹结果。
+ * 2026-10-14 起多了一件事：定期把「QQ 登录」那一行的登录结论对一眼。 */
 static void set_tick(void)
 {
     bool busy = player_tf_scan_busy();
@@ -593,25 +634,233 @@ static void set_tick(void)
         set_render();               /* 把 "扫描中 n/m" 刷出来 */
         return;
     }
-    if (!s_tf_was_busy) return;     /* 平时什么都没发生，不白刷 */
-
-    /* 刚刚扫完（busy 从 true 变 false）—— 报告结果 */
-    s_tf_was_busy = false;
-    int sc = 0, fd = 0;
-    player_tf_scan_progress(&sc, &fd);
-    esp_err_t e = player_tf_scan_err();
-    char t[48];
-    if (e != ESP_OK) {
-        snprintf(t, sizeof(t), "扫描失败：%s", esp_err_to_name(e));
-    } else {
-        snprintf(t, sizeof(t), "曲库 %d 首（遍历 %d 个文件）", fd, sc);
+    if (s_tf_was_busy) {
+        /* 刚刚扫完（busy 从 true 变 false）—— 报告结果 */
+        s_tf_was_busy = false;
+        int sc = 0, fd = 0;
+        player_tf_scan_progress(&sc, &fd);
+        esp_err_t e = player_tf_scan_err();
+        char t[48];
+        if (e != ESP_OK) {
+            snprintf(t, sizeof(t), "扫描失败：%s", esp_err_to_name(e));
+        } else {
+            snprintf(t, sizeof(t), "曲库 %d 首（遍历 %d 个文件）", fd, sc);
+        }
+        ui_toast(t);
+        set_render();
+        return;
     }
-    ui_toast(t);
-    set_render();
+
+    /* 平时：对一眼 QQ 登录结论。只在文字变了才重绘 ——
+     * 否则每 250ms 就把这一行重画一次，白白占屏幕带宽。 */
+    qqlogin_view_t v;
+    qqlogin_view(&v);
+    const char *s = qq_short(v.state);
+    if (strcmp(s, s_set_qq) != 0) {
+        strlcpy(s_set_qq, s, sizeof(s_set_qq));
+        set_render();
+    }
 }
 
 
-/* 系统信息整页 —— 一行 toast 放不下这么多事实（IP + 内存 + 欠载 + …），
+/* ============================================================ QQ 登录页
+ *
+ * 用户要求（2026-10-14）：设置二级菜单里能看到 QQ 契约层服务的**登录情况**，
+ * 按 K3 取二维码扫码登录，确认登录后**回到显示登录情况**。
+ *
+ * 两个视图（同一张屏，靠显隐切换，运行时不建/删控件）：
+ *   ① 登录情况：六行文字（状态 / 账号 / 服务地址 / 说明 / 键位）
+ *   ② 二维码  ：一整张点阵 + 下面一行状态
+ *
+ * ★ 二维码为什么要"自己放大画"，而不是把 PNG 交给 LVGL 显示：
+ *   服务端那张图是 150×150、29 个模块、**四周一点静区都没有**，而屏幕只有
+ *   160×128。缩放显示（150/29 不是整数）会把模块边界糊掉，手机直接扫不动；
+ *   留白不够同样扫不动（实测：原图直接喂 OpenCV 是解不出来的，放大 + 补静区才行）。
+ *   所以走 qrpng 解出**模块点阵**，这里按**整数倍**重画，白底自己铺 —— 白底就是静区。
+ *
+ * ★ 性能：整屏重绘一次 40KB，绝不能每 250ms 重画一遍二维码。
+ *   所以**只有 phase 真的变了才重画**（见 qq_render），静态那一帧不产生任何重绘。
+ */
+#define QQ_ROWS       6
+#define QQ_ROW_H      15
+#define QQ_Y0         20
+
+/* 二维码视图：标题藏起来，整块让给码。上面 112px 放码，下面一行状态。 */
+#define QQ_QR_AREA_H  112
+#define QQ_QR_MAXSIDE 112
+#define QQ_STAT_Y     114
+
+static lv_obj_t *s_scr_qq;
+static lv_obj_t *s_qq_title;
+static lv_obj_t *s_qq_lbl[QQ_ROWS];
+static lv_obj_t *s_qq_stat;        /* 二维码视图下面那行状态 */
+static lv_obj_t *s_qq_img;         /* 二维码（RGB565，自己画的） */
+
+static uint8_t       *s_qq_buf;    /* 画布缓冲（PSRAM） */
+static lv_image_dsc_t s_qq_dsc;
+static qqlogin_view_t s_qq_v;      /* UI 自己的快照 */
+static qqlogin_phase_t s_qq_painted = (qqlogin_phase_t)-1;  /* 上一次画的是哪个 phase */
+static bool           s_qq_qr_view;                          /* 当前屏上是不是二维码视图 */
+
+/* 服务地址去掉 http:// 前缀 —— 12px 字体下 19 个字符正好放得下，多 7 个就溢出 */
+static const char *qq_host_short(void)
+{
+    const char *h = qqmusic_host();
+    if (strncmp(h, "http://", 7) == 0) h += 7;
+    return h;
+}
+
+static void qq_paint_qr(const qrpng_t *qr)
+{
+    if (s_qq_buf == NULL || qr == NULL || qr->n <= 0) return;
+    int n = qr->n;
+
+    /* 整数倍放大；2 倍是底线（再小手机真扫不动），8 倍是上限（29×8 早就超屏了） */
+    int scale = QQ_QR_AREA_H / n;
+    if (scale < 2) scale = 2;
+    if (scale > 8) scale = 8;
+    while (n * scale > QQ_QR_MAXSIDE && scale > 1) scale--;
+    int side = n * scale;
+
+    uint16_t *px = (uint16_t *)s_qq_buf;
+    /* 白底：这张码自己没有静区，这层白就是静区，不能省 */
+    memset(s_qq_buf, 0xFF, (size_t)side * (size_t)side * 2);
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i < n; i++) {
+            if (!qrpng_dark(qr, i, j)) continue;
+            int x0 = i * scale, y0 = j * scale;
+            for (int dy = 0; dy < scale; dy++) {
+                uint16_t *row = px + (size_t)(y0 + dy) * (size_t)side + x0;
+                for (int dx = 0; dx < scale; dx++) row[dx] = 0x0000;
+            }
+        }
+    }
+
+    memset(&s_qq_dsc, 0, sizeof(s_qq_dsc));
+    /* ⚠️ 这里写的是**本机字节序**的 RGB565，也就是屏幕要的那个。
+     *    别用 RGB565_SWAPPED —— 那是给"解码器吐大端"的 JPEG 封面用的。 */
+    s_qq_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    s_qq_dsc.header.w  = side;
+    s_qq_dsc.header.h  = side;
+    s_qq_dsc.data_size = (uint32_t)side * side * 2;
+    s_qq_dsc.data      = s_qq_buf;
+
+    lv_image_set_src(s_qq_img, &s_qq_dsc);
+    lv_obj_set_size(s_qq_img, side, side);
+    lv_obj_set_pos(s_qq_img, (160 - side) / 2, (QQ_QR_AREA_H - side) / 2);
+    /* ⚠️ src 指针没变（还是同一个 dsc），LVGL 会当成"没动过"而不重绘 ——
+     *    所以换了码之后必须手动 invalidate，否则屏上还是上一张码。 */
+    lv_obj_invalidate(s_qq_img);
+    ESP_LOGI(TAG, "二维码已上屏：%d 模块 × %d 倍 = %dx%d @(%d,%d)",
+             n, scale, side, side, (160 - side) / 2, (QQ_QR_AREA_H - side) / 2);
+}
+
+static void qq_render(void)
+{
+    qqlogin_view(&s_qq_v);
+
+    /* "刚登录成功"只提示一次（后台会连着刷状态，不 ack 会弹个不停） */
+    if (s_qq_v.fresh_login) {
+        ui_toast("登录成功");
+        qqlogin_ack();
+    }
+
+    bool qr_mode = s_qq_v.qr_ready &&
+                   (s_qq_v.phase == QQLOGIN_QR_WAIT || s_qq_v.phase == QQLOGIN_QR_SCANNED);
+
+    /* ---- 两个视图的显隐只在真的切换时动一次 ---- */
+    if (qr_mode != s_qq_qr_view) {
+        s_qq_qr_view = qr_mode;
+        if (qr_mode) {
+            lv_obj_add_flag(s_qq_title, LV_OBJ_FLAG_HIDDEN);   /* 标题让位给二维码的静区 */
+            for (int i = 0; i < QQ_ROWS; i++) lv_obj_add_flag(s_qq_lbl[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_qq_img, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_qq_stat, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(s_qq_title, LV_OBJ_FLAG_HIDDEN);
+            for (int i = 0; i < QQ_ROWS; i++) lv_obj_remove_flag(s_qq_lbl[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_qq_img, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_qq_stat, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (qr_mode) {
+        /* ★ 只有换了一张新码（phase 从 BUSY 进到 WAIT）才重画点阵 ——
+         *   WAIT→SCANNED 是同一张码，只换下面那行字，重画纯属浪费。
+         *   （29 个模块 × 4 倍 = 116×116 ≈ 13KB 全屏重绘，250ms 一次就废了。） */
+        if (s_qq_painted != s_qq_v.phase) {
+            if (s_qq_v.phase == QQLOGIN_QR_WAIT) qq_paint_qr(&s_qq_v.qr);
+            s_qq_painted = s_qq_v.phase;
+        }
+        ui_set_text(s_qq_stat, s_qq_v.phase == QQLOGIN_QR_SCANNED
+                                   ? "已扫码，请在手机上确认"
+                                   : "用手机 QQ 音乐 App 扫码");
+        return;
+    }
+
+    s_qq_painted = s_qq_v.phase;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "状态  %s", s_qq_v.state);
+    ui_set_text(s_qq_lbl[0], buf);
+    if (s_qq_v.account[0]) snprintf(buf, sizeof(buf), "账号  %s", s_qq_v.account);
+    else                   strlcpy(buf, "账号  无", sizeof(buf));
+    ui_set_text(s_qq_lbl[1], buf);
+    ui_set_text(s_qq_lbl[2], "服务地址");
+    ui_set_text(s_qq_lbl[3], qq_host_short());
+    ui_set_text(s_qq_lbl[4], s_qq_v.reason);
+    ui_set_text(s_qq_lbl[5],
+                (s_qq_v.phase == QQLOGIN_QR_BUSY) ? "正在取二维码…" : "按K3扫码登录   K4返回");
+}
+
+static void build_qq_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    s_scr_qq = scr;
+    ui_page_register(UI_PAGE_QQLOGIN, scr);
+
+    ui_put_img(scr, ASSET_BG_INFO, 0, 0);      /* 和系统信息/蓝牙页同一套底图 */
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    s_qq_title = ui_put_label_1line(scr, "QQ 登录", 20, 2, 134, ui_font_16, 0x1C1C1E);
+
+    for (int i = 0; i < QQ_ROWS; i++) {
+        s_qq_lbl[i] = ui_put_label_1line(scr, "", 6, QQ_Y0 + i * QQ_ROW_H, 150,
+                                         ui_font_12, 0x3C3C40);
+    }
+
+    /* 二维码画布：RGB565、PSRAM。只按"最大可能边长"开一次，之后改 dsc 的 w/h。 */
+    s_qq_buf = heap_caps_malloc((size_t)QQ_QR_MAXSIDE * QQ_QR_MAXSIDE * 2,
+                                MALLOC_CAP_SPIRAM);
+    if (s_qq_buf == NULL) {
+        ESP_LOGE(TAG, "二维码画布分配失败（%u 字节）—— 扫码页会画不出码",
+                 (unsigned)(QQ_QR_MAXSIDE * QQ_QR_MAXSIDE * 2));
+    }
+    s_qq_img = lv_image_create(scr);
+    lv_obj_remove_flag(s_qq_img, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_qq_img, LV_OBJ_FLAG_HIDDEN);
+
+    s_qq_stat = ui_put_label_1line(scr, "", 0, QQ_STAT_Y, 160, ui_font_12, 0x1C1C1E);
+    lv_obj_set_style_text_align(s_qq_stat, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_qq_stat, LV_OBJ_FLAG_HIDDEN);
+
+    ESP_LOGI(TAG, "QQ 登录页已建好（画布 %u B，%s）",
+             (unsigned)(QQ_QR_MAXSIDE * QQ_QR_MAXSIDE * 2),
+             s_qq_buf ? "PSRAM 就绪" : "★分配失败★");
+}
+
+void ui_qqlogin_open(void)
+{
+    qqlogin_enter();      /* 异步查一次登录情况（结果几秒后由 tick 刷上来） */
+    qq_render();          /* 先把缓存里的结论填上，别进去空一下 */
+    ui_page_show(UI_PAGE_QQLOGIN);
+}
+
+void ui_qqlogin_activate(void)
+{
+    qqlogin_request_qr();
+    qq_render();
+}
+
+/* ============================================================ 系统信息整页 —— 一行 toast 放不下这么多事实（IP + 内存 + 欠载 + …），
  * 用户反馈"根本显示不全"。7 行 × 15px，对应 bg_info 的底图。 */
 #define INFO_ROWS  7
 #define INFO_ROW_H 15
@@ -1083,6 +1332,7 @@ void ui_pages_build(void)
     build_src_screen();              /* 「模式」二级菜单（项数随后端动态） */
     build_back_screen();             /* 「来源」二级菜单（Navidrome / QQ 音乐） */
     build_set_screen();              /* 设置二级菜单（开机续播 / 重连 WiFi）*/
+    build_qq_screen();               /* QQ 登录（设置里那一项按 K3 进）*/
     /* 音质二级菜单已按用户要求删除（固定用最高：无损优先）*/
     build_mem_screen();              /* 内存用量图表（系统信息页长按 K3 进）*/             /* 音质二级菜单（5 个挡位）*/
     ui_search_build();               /* M8：搜索方式 / 输入 / 结果 三页 */
@@ -1129,6 +1379,15 @@ void ui_pages_enter(ui_page_t p)
             s_back_r_sel = -1;
             back_render();
             break;
+        /* 进设置页顺带查一次 QQ 登录情况 —— 那一行的后缀要显示它。
+         * 只是投一条后台命令，UI 不会被网络卡住。 */
+        case UI_PAGE_SETTINGS:
+            qqlogin_enter();
+            set_render();
+            break;
+        case UI_PAGE_QQLOGIN:
+            qq_render();
+            break;
         case UI_PAGE_SEARCH_MODE:
         case UI_PAGE_SEARCH_IN:
         case UI_PAGE_SEARCH_RES:
@@ -1160,6 +1419,17 @@ void ui_bt_mode_follow(void)
 
 void ui_pages_tick(void)
 {
+    /* ★ 离开 QQ 登录页要**立刻**告诉后台停轮询 —— 否则它会白白轮询五分钟，
+     *   还会在用户已经回到别的页面时把 toast 弹出来。
+     *   放在这里（而不是某个页面自己的 K4 处理里）是因为出口有三条：
+     *   K4 短按、K4 长按回播放器、以及网页那边切页面。集中判一次最稳。 */
+    {
+        static bool s_qq_page_on;
+        bool on = (ui_page_current() == UI_PAGE_QQLOGIN);
+        if (s_qq_page_on && !on) qqlogin_leave();
+        s_qq_page_on = on;
+    }
+
     switch (ui_page_current()) {
         case UI_PAGE_LIST: list_render(false); break;
         case UI_PAGE_MENU: menu_render();      break;
@@ -1170,6 +1440,7 @@ void ui_pages_tick(void)
         case UI_PAGE_SRC:  src_render();       break;
         case UI_PAGE_BACK: back_render();      break;
         case UI_PAGE_SETTINGS: set_tick();     break;
+        case UI_PAGE_QQLOGIN:  qq_render();    break;
         case UI_PAGE_SEARCH_MODE:
         case UI_PAGE_SEARCH_IN:
         case UI_PAGE_SEARCH_RES:
