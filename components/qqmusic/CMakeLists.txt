@@ -1,5 +1,8 @@
 idf_component_register(
-    SRCS "src/qqmusic.c"
+    SRCS
+        "src/qqmusic.c"
+        "src/qqlogin.c"
+        "src/qrpng.c"
     INCLUDE_DIRS "include"
     REQUIRES
         esp_http_client

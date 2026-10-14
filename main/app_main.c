@@ -30,6 +30,7 @@
 #include "net_mgr.h"
 #include "subsonic.h"
 #include "qqmusic.h"
+#include "qqlogin.h"
 #include "app_core.h"
 #include "player.h"
 #include "settings.h"
@@ -357,6 +358,10 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "没配 QQ 音乐服务地址（菜单里切到 QQ 会取不到歌）");
     }
+    /* 扫码登录（设置 → QQ 登录）：只建锁/队列/任务，不联网、不占网络。
+     * 放在这里而不是 ui_start 里 —— 它属于"服务后端"这一块，
+     * 而且没配 Navidrome 时下面会提前 goto，那时也得能用（QQ 可以单独用）。 */
+    qqlogin_init();
 
     /* ---- M4: 起播（之后按键/网页都通过 player 命令层控制）---- */
     if (subsonic_init() != ESP_OK || !subsonic_configured()) {

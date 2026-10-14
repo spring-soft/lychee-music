@@ -31,6 +31,7 @@ typedef enum {
     UI_PAGE_SEARCH_IN,    /* M8：输入页（字母格 + 拼音候选字，两种模式共用一页）*/
     UI_PAGE_SEARCH_RES,   /* M8：搜索结果列表 */
     UI_PAGE_SETTINGS,     /* 设置二级菜单（主菜单"设置"那一项按 K3 进来的）*/
+    UI_PAGE_QQLOGIN,      /* QQ 登录（设置二级菜单里那一项按 K3 进来的）*/
     UI_PAGE_MEM,          /* 内存用量图表（系统信息页长按 K3 进来的）*/
     UI_PAGE_COUNT,
 } ui_page_t;
@@ -100,6 +101,13 @@ void ui_backmenu_activate(void);
 void ui_setmenu_open(void);
 void ui_setmenu_move(int delta);
 void ui_setmenu_activate(void);
+
+/* QQ 登录页（设置二级菜单里那一项按 K3 进来）：
+ *   进去先显示**登录情况**（凭据有效 / 已过期 / 未登录 / 连不上），
+ *   按 K3 取二维码扫码，登录成功后自动回到显示登录情况。
+ * K4 返回设置页（走 ui_page_parent 的统一规则）。 */
+void ui_qqlogin_open(void);
+void ui_qqlogin_activate(void);     /* K3：取二维码 / 换一张 */
 
 /* 清空封面缓存后调它：把内存里的"封面黑名单"一起清掉。
  * ⚠️ 不清的话那些歌不会重新去取封面 —— 等于白清。 */

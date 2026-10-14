@@ -66,6 +66,47 @@ esp_err_t   qqmusic_set_config(const char *host, bool save);
  * 表现却是"所有歌都放不了"，所以这个接口是排障第一入口。 */
 esp_err_t qqmusic_health(char *msg, size_t len);
 
+/* 结构化版的健康检查 —— 给设置里的「QQ 登录」页用（要逐项显示登录情况，
+ * 一句人话不够）。返回 ESP_OK = 服务**连上了**（不代表凭据可用，看下面的字段）。
+ *
+ * ⚠️ 三个布尔值都必须分开看，它们是**三种完全不同的故障**：
+ *    present=false → 从来没登录过（要扫码）
+ *    expired=true  → 登录过但过期了（要重扫）★ 最常见，表现却是"所有歌都放不了"
+ *    valid=false   → 凭据本身不完整/坏了
+ *   而 ok=false 只说明服务自评不 ok，此时 reason 里才是原因。
+ * 2026-10-14 实测：过期时 present/valid 仍是 true，只有 expired 会变 true，
+ * 而 ok 甚至还是 true（VIP 接口照样能用）—— 所以**不能拿 ok 当登录状态**。 */
+typedef struct {
+    bool      reachable;    /* HTTP 通了、JSON 解出来了 */
+    bool      ok;           /* 服务自评 ok */
+    bool      present;      /* 有凭据（登录过） */
+    bool      valid;        /* 凭据完好 */
+    bool      expired;      /* 已过期 */
+    bool      vip;          /* 识别到 VIP（决定能不能拿无损） */
+    long long musicid;      /* 账号；0 = 没有 */
+    char      reason[96];   /* 服务端给的原因 / 本地错误说明 */
+} qqmusic_health_t;
+
+esp_err_t qqmusic_health_ex(qqmusic_health_t *out);
+
+/* ---------------- 扫码登录（设置里的「QQ 登录」页用） ----------------
+ * HTTP 与 base64 都关在这一层里，固件上层只拿"PNG 原始字节"和"状态字符串"。
+ *
+ * ⚠️ 登录是**合约层服务端的全局状态**（同一时刻只有一张有效的码），
+ *    所以这两个接口都没有 identifier 参数 —— 传进去只会多一层对不上的风险。 */
+
+/* POST /v1/login/qr，把 image_base64 解成 PNG 原始字节。
+ * 成功时 *png 是 PSRAM/内部堆上的缓冲，调用方用 heap_caps_free() 释放。 */
+esp_err_t qqmusic_login_qr_png(uint8_t **png, size_t *len);
+
+/* GET /v1/login/status。event 取值来自上游库的 QRCodeLoginEvents：
+ *   WAITING 还没扫     SCAN 等待扫描中     CONF 已扫码、等手机上确认
+ *   DONE    登录完成（凭据已落盘）        TIMEOUT 码过期
+ *   REFUSE  手机上拒绝                    ERROR 服务端监听出错（err 里有原因）
+ *   STALE 给的是旧码（本固件不会出现） */
+esp_err_t qqmusic_login_status(char *event, size_t event_len,
+                               bool *saved, char *err, size_t err_len);
+
 /* 按模式取列表（GET /v1/list?mode=...） */
 esp_err_t qqmusic_list(qq_mode_t mode, sub_song_t *out, int max, int *got);
 
