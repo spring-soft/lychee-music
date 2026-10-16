@@ -31,6 +31,13 @@ static char s_pass[64];
 static int  s_max_kbps;
 static char s_transcode[8];              /* "auto" / "mp3" / "aac" / "raw" */
 
+/* ★ 只给 ping（网页"测试连接"）打开的分步面包屑。
+ *   背景：点"测试连接"会把板子搞重启一次，而这块板子**没插串口**，
+ *   崩溃现场只能靠 RTC 黑匣子（GET /api/crash）里最后几行日志。
+ *   所以只在 ping 这条路上把 http 客户端的每一步都记下来 —— 平时不记，
+ *   否则元数据请求一秒好几条，2KB 的 RTC 缓冲立刻被刷没。 */
+static bool s_probe;
+
 static bool nvs_get_str_or(const char *key, char *dst, size_t len, const char *fallback)
 {
     nvs_handle_t h;
@@ -190,6 +197,8 @@ static esp_err_t http_get_body_ex(const char *url, char **body_out, size_t *len_
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
     if (!cli) return ESP_FAIL;
+    if (s_probe) ESP_LOGW(TAG, "[ping] 1/5 客户端已建（buffer %d，url %u 字节）",
+                          cfg.buffer_size, (unsigned)strlen(url));
 
     esp_err_t err = esp_http_client_open(cli, 0);
     if (err != ESP_OK) {
@@ -197,9 +206,12 @@ static esp_err_t http_get_body_ex(const char *url, char **body_out, size_t *len_
         esp_http_client_cleanup(cli);
         return err;
     }
+    if (s_probe) ESP_LOGW(TAG, "[ping] 2/5 TCP 已连上");
     int content_len = esp_http_client_fetch_headers(cli);
     int status = esp_http_client_get_status_code(cli);
     if (status_out) *status_out = status;
+    if (s_probe) ESP_LOGW(TAG, "[ping] 3/5 头部已收：status=%d content_len=%d",
+                          status, content_len);
 
     /* 有 Content-Length 且明显超限时，连读都不读 —— 省掉一次几万字节的下载 */
     if (max_bytes > 0 && content_len > 0 && (size_t)content_len > max_bytes) {
@@ -221,6 +233,7 @@ static esp_err_t http_get_body_ex(const char *url, char **body_out, size_t *len_
         return ESP_ERR_NO_MEM;
     }
     size_t used = 0;
+    if (s_probe) ESP_LOGW(TAG, "[ping] 4/5 开始读响应体（容量 %u）", (unsigned)cap);
     while (true) {
         if (used + 1 >= cap) {                     /* 满了就翻倍，直到上限 */
             if (cap >= HTTP_BODY_MAX) {
@@ -251,6 +264,7 @@ static esp_err_t http_get_body_ex(const char *url, char **body_out, size_t *len_
     body[used] = 0;
     esp_http_client_close(cli);
     esp_http_client_cleanup(cli);
+    if (s_probe) ESP_LOGW(TAG, "[ping] 5/5 读完 %u 字节", (unsigned)used);
 
     ESP_LOGI(TAG, "HTTP %d，响应体 %u 字节（Content-Length=%d，前 4 字节 %02X %02X %02X %02X）",
              status, (unsigned)used, content_len,
@@ -299,9 +313,21 @@ static esp_err_t ping_ex(const char *host, const char *user, const char *pass,
     snprintf(url, sizeof(url), "%s/rest/ping.view?f=json", host);
     append_auth_ex(url, sizeof(url), user, pass);
 
+    /* ⚠️ 地址里没写 http:// 的话，esp_http_client 会按它自己的规则去猜 ——
+     *   猜错就得到一条诡异的错误，所以这里先把这个事实记下来（现场证据）。
+     *   ⚠️ 这里**只报地址**：账号/密码的"填没填"由调用方（web_console）去记 ——
+     *      到了这一层，空账号已经被回退成"已存的那个"了，在这里说"本次填了"是假话。
+     *      账号本身当然也不记，这段日志会上网页。 */
+    ESP_LOGW(TAG, "[ping] 0/5 目标 %s（%s）",
+             host,
+             (strncasecmp(host, "http://", 7) == 0 || strncasecmp(host, "https://", 8) == 0)
+                 ? "带 http://" : "!! 没写 http://");
+
     char *body = NULL;
     /* ping 全程用短超时：地址填错时快速失败（也少阻塞 httpd） */
+    s_probe = true;
     esp_err_t err = http_get_body_ex(url, &body, NULL, NULL, 0, HTTP_TIMEOUT_PING_MS);
+    s_probe = false;
     if (err != ESP_OK) return err;
 
     cJSON *root = cJSON_Parse(body);
