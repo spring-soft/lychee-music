@@ -2780,16 +2780,18 @@ else init();
     '<div style="font-weight:600;margin-bottom:8px">有线联动（无网配网）</div>' +
     '<div style="font-size:12px;color:#6E6E73;margin-bottom:10px">' +
       '板子插在服务器上时，可以用这条线让服务器也连上同一个 WiFi。</div>' +
-    '<input id="lk-ssid" placeholder="WiFi 名称" autocapitalize="off" autocorrect="off" spellcheck="false" ' +
+    '<input id="lk-ssid" placeholder="WiFi 名称（可点下面「扫描附近」选）" autocapitalize="off" autocorrect="off" spellcheck="false" ' +
       'style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:6px;border:1px solid #DDD;border-radius:8px">' +
     '<input id="lk-pass" placeholder="WiFi 密码" type="password" ' +
       'style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:8px;border:1px solid #DDD;border-radius:8px">' +
-    '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">' +
+      '<button id="lk-scan" style="padding:8px 12px;border-radius:8px;background:#F1EFEB;color:#333;font-weight:600">扫描附近 WiFi</button>' +
       '<button id="lk-wifi" style="padding:8px 12px;border-radius:8px;background:#1A73E8;color:#fff;font-weight:600">给服务器配网</button>' +
-      '<button id="lk-hot" style="padding:8px 12px;border-radius:8px;background:#E8F0FE;color:#1A73E8;font-weight:600">让服务器开热点</button>' +
+      '<button id="lk-4g" style="padding:8px 12px;border-radius:8px;background:#E8F0FE;color:#1A73E8;font-weight:600">使用 4G 网</button>' +
       '<button id="lk-stat" style="padding:8px 12px;border-radius:8px;background:#F1EFEB;color:#333">查链路</button>' +
       '<button id="lk-adopt" style="padding:8px 12px;border-radius:8px;background:#E8F0FE;color:#1A73E8;font-weight:600">校准服务器地址</button>' +
     '</div>' +
+    '<div id="lk-list" style="max-height:190px;overflow:auto;font-size:13px"></div>' +
     '<div id="lk-msg" style="font-size:12px;color:#6E6E73;margin-top:8px;min-height:16px"></div>';
   function put(t){ var e = document.getElementById('lk-msg'); if (e) e.textContent = t || ''; }
   document.body.appendChild(box);
@@ -2819,18 +2821,60 @@ else init();
             function(e){ put('发指令失败：' + e.message); });
   };
 
-  document.getElementById('lk-hot').onclick = function(){
-    put('已请求服务器开热点…');
-    api2('/api/link/cmd?c=' + encodeURIComponent('HOTSPOT'))
-      .then(function(){ setTimeout(showLink, 1500); },
-            function(e){ put('发指令失败：' + e.message); });
-  };
+  document.getElementById('lk-hot') && (document.getElementById('lk-hot').onclick = null);
 
   document.getElementById('lk-adopt').onclick = function(){
     if (!lastIp) { put('还没有服务器 IP：先点「给服务器配网」或「查链路」'); return; }
     api2('/api/link/adopt?ip=' + encodeURIComponent(lastIp)).then(function(d){
       put('已校准：QQ API ' + d.qq + ' ，音乐流 ' + d.nav);
     }).catch(function(e){ put('校准失败：' + e.message); });
+  };
+
+  /* 扫描附近 WiFi：复用 ESP 自己的扫描接口（/api/wifi/scan 启动 + 轮询结果），
+   * 点一条就填进 SSID 框，用户只需要再输密码 —— 不用手打 SSID。 */
+  function renderList(items){
+    var el = document.getElementById('lk-list'), seen = {}, arr = [];
+    (items || []).slice().sort(function(a, b){ return (b.rssi || -999) - (a.rssi || -999); })
+      .forEach(function(it){ var k = it.ssid || ''; if (!k || seen[k]) return; seen[k] = 1; arr.push(it); });
+    arr = arr.slice(0, 30);
+    if (!arr.length){ el.innerHTML = '<div style="color:#999;padding:6px">没有扫描到网络</div>'; return; }
+    el.innerHTML = arr.map(function(it, i){
+      var lock = (it.auth && it.auth !== ' OPEN' && it.auth !== 'OPEN' && it.auth !== '开放') ? ' 🔒' : '';
+      return '<div data-i="' + i + '" style="padding:8px 6px;border-bottom:1px solid #F0EEE9;' +
+             'display:flex;justify-content:space-between"><span>' + (it.ssid || '') + '</span>' +
+             '<span style="color:#999">' + (it.rssi || 0) + ' dBm' + lock + '</span></div>';
+    }).join('');
+    el.onclick = function(ev){
+      var row = ev.target.closest ? ev.target.closest('[data-i]') : null;
+      if (!row) return;
+      var it = arr[Number(row.getAttribute('data-i'))];
+      if (!it) return;
+      document.getElementById('lk-ssid').value = it.ssid || '';
+      put('已选择「' + (it.ssid || '') + '」，输入密码后点「给服务器配网」');
+    };
+  }
+  document.getElementById('lk-scan').onclick = function(){
+    var el = document.getElementById('lk-list');
+    el.innerHTML = '<div style="color:#999;padding:6px">正在扫描…</div>';
+    put('正在扫描附近 WiFi，约 3 秒…');
+    api2('/api/wifi/scan').then(function(){
+      var tries = 0;
+      (function poll(){
+        if (tries++ > 25){ put('扫描超时，请重试'); return; }
+        setTimeout(function(){
+          api2('/api/wifi/scan/result').then(function(d){
+            if (d && d.scanning){ poll(); return; }
+            renderList((d && d.items) || []);
+            put('选一个网络，然后输密码');
+          }, function(){ poll(); });
+        }, 1000);
+      })();
+    }, function(e){ put('扫描失败：' + e.message); });
+  };
+  document.getElementById('lk-4g').onclick = function(){
+    put('已请求服务器切到 4G…');
+    api2('/api/link/cmd?c=' + encodeURIComponent('4G'))
+      .then(function(){ setTimeout(showLink, 1500); }, function(e){ put('发指令失败：' + e.message); });
   };
 
   setTimeout(showLink, 1500);
