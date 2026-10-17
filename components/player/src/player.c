@@ -1453,7 +1453,16 @@ static void handle_out_switch(int want)
         }
         if (player_queue_count() > 0) {
             s_active = true;
-            start_index_from(idx, rs.valid ? rs.pos_ms : 0);
+            /* ★ 保证无损：**不从中间位置接**。
+             *   Navidrome 的续播靠 timeOffset，而它一用 timeOffset 就必然转码
+             *   （`format=raw` 不支持带偏移）—— 那一首会变成 MP3，用户明确要求避免。
+             *   QQ 那边本来就不支持拖进度（见 start_index_from 里的注释）。
+             *   所以统一：同一首、从 0:00 重放。 */
+            if (rs.valid && rs.pos_ms > 3000) {
+                ESP_LOGW(TAG, "切回本机：为保证无损，同一首从 0:00 重放（不接进度 %" PRIu32 "ms）",
+                         rs.pos_ms);
+            }
+            start_index_from(idx, 0);
         }
     }
 }
