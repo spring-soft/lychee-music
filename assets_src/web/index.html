@@ -2778,6 +2778,8 @@ else init();
     'background:#fff;font-size:14px;line-height:1.5';
   box.innerHTML =
     '<div style="font-weight:600;margin-bottom:8px">有线联动（无网配网）</div>' +
+    '<div style="height:6px;background:#EFEDE9;border-radius:3px;margin:2px 0 4px"><div id="lk-bar" style="height:100%;width:0%;background:#1A73E8;border-radius:3px;transition:width .3s"></div></div>' +
+    '<div id="lk-pct" style="font-size:11px;color:#6E6E73;text-align:right;min-height:13px"></div>' +
     '<div style="font-size:12px;color:#6E6E73;margin-bottom:10px">' +
       '没网时：先让 ESP 连上 WiFi，再通过这条线让服务器也连同一个网络，最后自动校准服务器地址。</div>' +
     '<input id="lk-ssid" placeholder="WiFi 名称（可点下面「扫描附近」选）" autocapitalize="off" autocorrect="off" spellcheck="false" ' +
@@ -2794,7 +2796,17 @@ else init();
     '<div id="lk-list" style="max-height:190px;overflow:auto;font-size:13px"></div>' +
     '<div id="lk-msg" style="font-size:12px;color:#6E6E73;margin-top:8px;min-height:16px"></div>';
   function put(t){ var e = document.getElementById('lk-msg'); if (e) e.textContent = t || ''; }
-  document.body.appendChild(box);
+  /* ★ 放进"设置"页里（WiFi 卡后面），不要挂 body —— 挂 body 会跑到播放页最下面 */
+  var anchor = document.getElementById('wifi-join');
+  var wifiCard = (anchor && anchor.closest) ? anchor.closest('.card') : null;
+  if (wifiCard && wifiCard.parentNode) wifiCard.parentNode.insertBefore(box, wifiCard.nextSibling);
+  else document.body.appendChild(box);
+
+  function pbar(pct, txt){
+    var b = document.getElementById('lk-bar'), t = document.getElementById('lk-pct');
+    if (b) b.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    if (t) t.textContent = (pct > 0 ? (pct + '%') : '') + (txt ? ('  ' + txt) : '');
+  }
 
   var lastIp = '';
 
@@ -2833,8 +2845,8 @@ else init();
         if (n++ > 30){ reject(new Error('ESP 30 秒内没连上（密码错？信号弱？）')); return; }
         setTimeout(function(){
           api2('/api/wifi').then(function(w){
-            if (w && w.ip){ put('② ESP 已连上，IP=' + w.ip); resolve(w.ip); }
-            else { put('① ESP 正在连接 WiFi… ' + (n * 2) + 's'); poll(); }
+            if (w && w.ip){ pbar(40, 'ESP 已连上'); put('② ESP 已连上，IP=' + w.ip); resolve(w.ip); }
+            else { pbar(15, 'ESP 连接中'); put('① ESP 正在连接 WiFi… ' + (n * 2) + 's'); poll(); }
           }, poll);
         }, 1000);
       })();
@@ -2848,8 +2860,9 @@ else init();
         setTimeout(function(){
           api2('/api/link').then(function(d){
             var m = /ip=(\d+\.\d+\.\d+\.\d+)/.exec(d.last_reply || '');
-            if (m){ put('④ 服务器已连上，IP=' + m[1]); resolve(m[1]); return; }
+            if (m){ pbar(85, '服务器已连上'); put('④ 服务器已连上，IP=' + m[1]); resolve(m[1]); return; }
             var tail = (d.last_reply || '').slice(0, 70);
+            pbar(55, '服务器配网中 ' + (n * 2) + 's');
             put('③ 正在给服务器配网… ' + (n * 2) + 's' + (tail ? ('  回执: ' + tail) : ''));
             poll();
           }, poll);
@@ -2864,6 +2877,7 @@ else init();
     if (!ssid){ put('先点「扫描附近 WiFi」选一个网络'); return; }
     var btn = this;
     btn.disabled = true;
+    pbar(5, '开始');
     put('① 让 ESP 连上「' + ssid + '」…');
     api2post('/api/wifi', {ssid: ssid, pass: pass})
       .then(waitEspIp)
@@ -2875,10 +2889,10 @@ else init();
       .then(function(srvIp){
         put('⑤ 校准服务器地址…');
         return api2('/api/link/adopt?ip=' + encodeURIComponent(srvIp))
-          .then(function(d){ put('✅ 配网完成：ESP 已上网，服务器 ' + srvIp +
+          .then(function(d){ pbar(100, '完成'); put('✅ 配网完成：ESP 已上网，服务器 ' + srvIp +
                                  '（QQ API ' + d.qq + ' / 音乐流 ' + d.nav + '）'); });
       })
-      .catch(function(e){ put('❌ ' + e.message); })
+      .catch(function(e){ pbar(0, '失败'); put('❌ ' + e.message); })
       .then(function(){ btn.disabled = false; });
   };
 
