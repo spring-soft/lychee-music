@@ -11,6 +11,7 @@
 #include "web_console.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
@@ -1195,6 +1196,92 @@ static esp_err_t h_debug(httpd_req_t *req)
  * 副本不受影响，**任何时候**都能读，包括"重启完过了一小时才想起来看"。 */
 static esp_err_t h_crash(httpd_req_t *req);
 
+/* ============================================================ 下载（转发给服务器）
+ *
+ * 需求：**设备网页控制台也能把 QQ 的歌下载进服务器的 Navidrome 曲库**。
+ *
+ * 为什么由固件转发、而不是网页直接调服务器：
+ *   · 网页是从设备（192.168.0.105）打开的，直接跨域调 192.168.0.116:3210 会被浏览器拦；
+ *   · 服务器地址本来就配在设备里（qqmusic_host()），转发一层等于免费复用它。
+ * 这里只做"转发"，真正的下载/补封面/UTF-8 歌词/装进曲库全在服务器上做。
+ */
+static esp_err_t dl_forward(const char *path, char *out, size_t cap, size_t *len)
+{
+    char host[160];
+    strlcpy(host, qqmusic_host(), sizeof(host));
+    size_t hl = strlen(host);
+    while (hl > 0 && host[hl - 1] == '/') host[--hl] = 0;
+    char url[320];
+    snprintf(url, sizeof(url), "%s%s", host, path);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = 25000,        /* 服务器要现取直链再入队，给宽一点 */
+        .buffer_size = 512,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (cli == NULL) return ESP_FAIL;
+    esp_err_t err = esp_http_client_open(cli, 0);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "下载转发连不上: %s（%s）", url, esp_err_to_name(err));
+        esp_http_client_cleanup(cli);
+        return err;
+    }
+    (void)esp_http_client_fetch_headers(cli);
+    int status = esp_http_client_get_status_code(cli);
+    size_t used = 0;
+    while (used + 1 < cap) {
+        int n = esp_http_client_read(cli, out + used, cap - 1 - used);
+        if (n <= 0) break;
+        used += n;
+    }
+    out[used] = 0;
+    esp_http_client_close(cli);
+    esp_http_client_cleanup(cli);
+    if (len) *len = used;
+    if (status != 200) {
+        ESP_LOGW(TAG, "下载转发失败: %s → HTTP %d", url, status);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* GET /api/dl?id=<QQ 歌曲 mid>：让服务器把这首下载进 Navidrome 曲库 */
+static esp_err_t h_dl(httpd_req_t *req)
+{
+    char q[64] = {0};
+    if (!query_str(req, "id", q, sizeof(q)) || q[0] == 0) {
+        return fail(req, "400 Bad Request", "缺少 id（QQ 歌曲 mid）");
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/v1/download/add?id=%s", q);
+    /* httpd 是单任务串行处理，静态缓冲安全（也省 1.5KB 栈） */
+    static char buf[1536];
+    size_t n = 0;
+    if (dl_forward(path, buf, sizeof(buf), &n) != ESP_OK) {
+        return fail(req, "502 Bad Gateway",
+                    "下载请求发不到服务器（检查服务器/QQ 服务是否正常）");
+    }
+    no_keepalive(req);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, buf, n);
+}
+
+/* GET /api/dl/stat：服务器那边的一句话下载概况（给网页显示进度） */
+static esp_err_t h_dl_stat(httpd_req_t *req)
+{
+    static char buf[512];
+    size_t n = 0;
+    if (dl_forward("/v1/download/summary", buf, sizeof(buf), &n) != ESP_OK) {
+        return fail(req, "502 Bad Gateway", "读不到服务器的下载状态");
+    }
+    no_keepalive(req);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, buf, n);
+}
+
 /* ============================================================ 注册 */
 
 /* ============================================================ 固件升级（OTA）
@@ -1678,7 +1765,7 @@ esp_err_t web_console_start(void)
      *
      * 内存代价：每项只是一个指针（sizeof(httpd_uri_t*)），48 项 = 192 字节，可以忽略。
      * 所以这里给足余量，宁可多留也别再踩一次。 */
-    cfg.max_uri_handlers   = 48;
+    cfg.max_uri_handlers   = 56;
     cfg.recv_wait_timeout  = 5;
     cfg.send_wait_timeout  = 5;
 
@@ -1728,6 +1815,9 @@ esp_err_t web_console_start(void)
         { .uri = "/api/back",            .method = HTTP_POST, .handler = h_back },
         { .uri = "/api/out",             .method = HTTP_GET,  .handler = h_out_get },
         { .uri = "/api/out",             .method = HTTP_POST, .handler = h_out },
+        /* 下载（固件转发给服务器的下载接口，见 dl_forward 的说明） */
+        { .uri = "/api/dl",              .method = HTTP_GET,  .handler = h_dl },
+        { .uri = "/api/dl/stat",         .method = HTTP_GET,  .handler = h_dl_stat },
         /* 音质挡位：GET 读、POST 写，同一个处理器按 method 分支 */
         { .uri = "/api/quality",         .method = HTTP_GET,  .handler = h_quality },
         { .uri = "/api/quality",         .method = HTTP_POST, .handler = h_quality },

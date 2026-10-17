@@ -2508,5 +2508,208 @@ function init(){
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
 else init();
 </script>
+<script>
+/* ============================================================
+   下载：把 QQ 的歌下载进【服务器的 Navidrome 曲库】
+   ------------------------------------------------------------
+   为什么这段是"后补"的、不去改 renderList：
+     列表渲染那段又长又细，硬改容易碰坏；这里在 renderList 跑完之后往每行补一格，
+     结构上只是多一个 grid 单元，风险最小。
+   为什么走设备中转（/api/dl）而不是网页直接调服务器：
+     网页是从设备打开的，跨域调 http://192.168.0.116:3210 会被浏览器拦；
+     而服务器地址本来就配在设备里，固件转发一层最省事。
+   真正的活（取直链/下载/补封面/UTF-8 歌词/装进曲库）全在服务器上做。
+   ============================================================ */
+(function(){
+  var DL = { on: false, sel: {}, done: {} };
+
+  var css = document.createElement('style');
+  css.textContent =
+    '#list .row{grid-template-columns:1fr auto auto 26px !important}' +
+    '.rdl2{width:26px;height:26px;display:flex;align-items:center;justify-content:center;' +
+      'color:#969698;font-size:15px;border-radius:7px;cursor:pointer;flex:none}' +
+    '.rdl2:active{background:#EFEDE9}' +
+    '.rdl2.done{color:#1B7F3B;font-weight:700}' +
+    '.ck2{width:18px;height:18px;accent-color:#1A73E8;margin:0;flex:none}' +
+    '.dlbar2{position:fixed;left:10px;right:10px;bottom:12px;z-index:60;background:#1A73E8;' +
+      'color:#fff;border-radius:12px;padding:10px 14px;display:flex;align-items:center;' +
+      'justify-content:space-between;gap:10px;font-size:14px;' +
+      'box-shadow:0 4px 14px rgba(0,0,0,.25)}' +
+    '.dlbar2 button{color:#fff;font-weight:600;font-size:14px}' +
+    '.dlstat2{font-size:11px;color:#6E6E73;margin:4px 2px 0;min-height:15px}' +
+    '.dlbtn2{font-size:11px;color:#1A73E8;background:#E8F0FE;border-radius:8px;' +
+      'padding:3px 9px;font-weight:600;margin-left:6px}';
+  document.head.appendChild(css);
+
+  function jget(path){
+    return fetch(path, {cache:'no-store'}).then(function(r){
+      return r.text().then(function(t){
+        var d = null; try { d = JSON.parse(t); } catch(e){}
+        if (!r.ok) throw new Error((d && (d.error || d.detail)) || ('HTTP ' + r.status));
+        return d;
+      });
+    });
+  }
+  function stat(t){ var e = document.getElementById('dlstat2'); if(e) e.textContent = t || ''; }
+
+  /* 列表项：只有 QQ 来源（back=1）的歌才需要下 —— Navidrome 的歌本来就在曲库里 */
+  function items(){
+    try { return (typeof curL === 'function' ? (curL().items || []) : []); }
+    catch(e){ return []; }
+  }
+
+  /* 往当前列表的每一行补一格（⬇ / 勾选框 / 空） */
+  function fill(){
+    var el = document.getElementById('list');
+    if (!el) return;
+    var rows = el.querySelectorAll('.row[data-n]'), arr = items();
+    for (var i = 0; i < rows.length; i++){
+      var r = rows[i], it = arr[Number(r.getAttribute('data-n'))];
+      if (!it) continue;
+      var old = r.querySelector('.rdl2, .ck2');
+      if (old) old.parentNode.removeChild(old);
+      var cell;
+      if (DL.on){
+        cell = document.createElement('input');
+        cell.type = 'checkbox'; cell.className = 'ck2';
+        cell.setAttribute('data-id', it.id || '');
+        if (DL.sel[it.id]) cell.checked = true;
+      } else if ((it.back | 0) === 1){
+        cell = document.createElement('span');
+        cell.className = 'rdl2' + (DL.done[it.id] ? ' done' : '');
+        cell.textContent = DL.done[it.id] ? '✓' : '⬇';
+        cell.title = '下载到服务器曲库';
+        cell.setAttribute('data-id', it.id || '');
+      } else {
+        cell = document.createElement('span');
+      }
+      r.appendChild(cell);
+    }
+  }
+
+  /* 包一层 renderList：它画完我们就补按钮 */
+  var _renderList = window.renderList;
+  if (typeof _renderList === 'function'){
+    window.renderList = function(){
+      _renderList.apply(null, arguments);
+      fill();
+    };
+  }
+
+  function addOne(id){
+    if (!id) return;
+    stat('正在提交下载…');
+    jget('/api/dl?id=' + encodeURIComponent(id)).then(function(d){
+      DL.done[id] = true;
+      var j = (d && d.job) || {};
+      stat('已提交：' + (j.title || id) + (j.quality_name ? '（' + j.quality_name + '）' : ''));
+      fill();
+    }).catch(function(e){
+      stat('下载失败：' + e.message);
+    });
+  }
+
+  function barUpdate(){
+    var b = document.getElementById('dlbar2');
+    if (!b) return;
+    var n = Object.keys(DL.sel).length;
+    b.querySelector('span').textContent = '已选 ' + n + ' 首';
+    b.querySelector('button:last-child').textContent = n ? ('下载 ' + n + ' 首') : '下载';
+  }
+
+  function enterBatch(){
+    DL.on = true; DL.sel = {};
+    var hdr = document.getElementById('list-count');
+    if (hdr && hdr.parentNode){
+      var b = document.createElement('button');
+      b.className = 'dlbtn2'; b.id = 'dlbatch2'; b.textContent = '退出批量';
+      hdr.parentNode.appendChild(b);
+      b.onclick = exitBatch;
+    }
+    var bar = document.createElement('div');
+    bar.className = 'dlbar2'; bar.id = 'dlbar2';
+    bar.innerHTML = '<span>已选 0 首</span><span style="display:flex;gap:14px">' +
+                    '<button id="dlbar2-no">取消</button><button id="dlbar2-go">下载</button></span>';
+    document.body.appendChild(bar);
+    bar.querySelector('#dlbar2-no').onclick = exitBatch;
+    bar.querySelector('#dlbar2-go').onclick = function(){
+      var ids = Object.keys(DL.sel);
+      if (!ids.length) return;
+      stat('正在提交 ' + ids.length + ' 首…');
+      var i = 0;
+      (function next(){
+        if (i >= ids.length){ stat('已全部提交，服务器会一首一首下'); exitBatch(); return; }
+        jget('/api/dl?id=' + encodeURIComponent(ids[i++])).then(next, next);
+      })();
+    };
+    fill();
+    barUpdate();
+  }
+
+  function exitBatch(){
+    DL.on = false; DL.sel = {};
+    var b = document.getElementById('dlbar2'); if (b) b.parentNode.removeChild(b);
+    var g = document.getElementById('dlbatch2'); if (g) g.parentNode.removeChild(g);
+    fill();
+  }
+
+  /* 点 ⬇ 下载 / 点勾选框选择（捕获阶段，抢在页面自己的"点行播放"前面） */
+  document.addEventListener('click', function(ev){
+    var t = ev.target;
+    var dl = t.closest ? t.closest('.rdl2') : null;
+    if (dl){
+      ev.preventDefault(); ev.stopPropagation();
+      addOne(dl.getAttribute('data-id'));
+      return;
+    }
+    var ck = t.closest ? t.closest('.ck2') : null;
+    if (ck){
+      ev.stopPropagation();
+      setTimeout(function(){
+        if (ck.checked) DL.sel[ck.getAttribute('data-id')] = 1;
+        else delete DL.sel[ck.getAttribute('data-id')];
+        barUpdate();
+      }, 0);
+    }
+  }, true);
+
+  /* 列表标题旁加「批量下载」入口 + 一行下载状态 */
+  function ensureHdr(){
+    var cnt = document.getElementById('list-count');
+    if (!cnt || !cnt.parentNode) return;
+    if (!document.getElementById('dlbatch2') && !DL.on){
+      var b = document.createElement('button');
+      b.className = 'dlbtn2'; b.id = 'dlbatch2'; b.textContent = '批量下载';
+      b.onclick = function(){
+        b.parentNode.removeChild(b);
+        enterBatch();
+      };
+      cnt.parentNode.appendChild(b);
+    }
+    if (!document.getElementById('dlstat2')){
+      var s = document.createElement('div');
+      s.className = 'dlstat2'; s.id = 'dlstat2';
+      cnt.parentNode.parentNode.appendChild(s);
+    }
+  }
+
+  setInterval(function(){
+    ensureHdr();
+    if (typeof page_current === 'function' && page_current() === 'list'){
+      if (!document.getElementById('dlstat2')) ensureHdr();
+    }
+    /* 下载进度（服务器一句话概况） */
+    jget('/api/dl/stat').then(function(d){
+      if (d && d.text) stat(d.text);
+      else if (d && !d.busy && !d.done) stat('');
+    }).catch(function(){});
+  }, 3500);
+
+  /* 页面切到列表时 DOM 会重建，补一次 */
+  if (document.readyState === 'loading')
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(ensureHdr, 800); });
+  else setTimeout(ensureHdr, 800);
+})();
+</script>
 </body>
 </html>

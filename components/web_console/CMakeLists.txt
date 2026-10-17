@@ -21,6 +21,7 @@ idf_component_register(
         hid_remote
         board
         esp_http_server
+        esp_http_client
         app_update
         esp_partition
         json
