@@ -1353,6 +1353,34 @@ static esp_err_t h_link_adopt(httpd_req_t *req)
     return send_json(req, o);
 }
 
+/* GET /api/link/provision?ssid=&pass= —— 启动"一键配网"（流程跑在设备上，页面关了也继续） */
+static esp_err_t h_link_provision(httpd_req_t *req)
+{
+    char ssid[64] = {0}, pass[96] = {0};
+    if (!query_str(req, "ssid", ssid, sizeof(ssid)) || ssid[0] == 0) {
+        return fail(req, "400 Bad Request", "缺少 ssid");
+    }
+    (void)query_str(req, "pass", pass, sizeof(pass));
+    esp_err_t err = usblink_provision_start(ssid, pass);
+    if (err == ESP_ERR_INVALID_STATE) return fail(req, "409 Conflict", "已经有一个配网在跑了");
+    if (err != ESP_OK) return fail(req, "500 Internal Server Error", "启动配网任务失败");
+    return ok_json(req);
+}
+
+/* GET /api/link/provision/status —— 看配网进度（AP 断过、页面刷新过，这里都还有） */
+static esp_err_t h_link_provision_status(httpd_req_t *req)
+{
+    int pct = 0;
+    char msg[160] = {0};
+    bool running = usblink_provision_status(&pct, msg, sizeof(msg));
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "running", running);
+    cJSON_AddNumberToObject(o, "pct", pct);
+    cJSON_AddStringToObject(o, "msg", msg);
+    cJSON_AddStringToObject(o, "ip", net_mgr_ip_str());
+    return send_json(req, o);
+}
+
 /* ============================================================ 注册 */
 
 /* ============================================================ 固件升级（OTA）
@@ -1836,7 +1864,7 @@ esp_err_t web_console_start(void)
      *
      * 内存代价：每项只是一个指针（sizeof(httpd_uri_t*)），48 项 = 192 字节，可以忽略。
      * 所以这里给足余量，宁可多留也别再踩一次。 */
-    cfg.max_uri_handlers   = 60;
+    cfg.max_uri_handlers   = 64;
     cfg.recv_wait_timeout  = 5;
     cfg.send_wait_timeout  = 5;
 
@@ -1893,6 +1921,8 @@ esp_err_t web_console_start(void)
         { .uri = "/api/link",            .method = HTTP_GET,  .handler = h_link },
         { .uri = "/api/link/cmd",        .method = HTTP_GET,  .handler = h_link_cmd },
         { .uri = "/api/link/adopt",      .method = HTTP_GET,  .handler = h_link_adopt },
+        { .uri = "/api/link/provision",  .method = HTTP_GET,  .handler = h_link_provision },
+        { .uri = "/api/link/provision/status", .method = HTTP_GET, .handler = h_link_provision_status },
         /* 音质挡位：GET 读、POST 写，同一个处理器按 method 分支 */
         { .uri = "/api/quality",         .method = HTTP_GET,  .handler = h_quality },
         { .uri = "/api/quality",         .method = HTTP_POST, .handler = h_quality },

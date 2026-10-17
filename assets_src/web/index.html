@@ -2969,6 +2969,52 @@ else init();
       .then(function(){ setTimeout(showLink, 1500); }, function(e){ put('发指令失败：' + e.message); });
   };
 
+  /* ================= 一键配网（流程跑在**设备上**） =================
+   * 为什么改成这样：ESP 一连上新 WiFi，AP 会切信道、断 1~3 秒，网页 fetch 全断。
+   * 流程放在设备后台任务里跑，页面断了/刷新了都继续；页面只负责启动 + 看进度。
+   * 这里在文件末尾**重新绑定** onclick，覆盖前面那版"网页里跑流程"的实现。 */
+  function pollProvision(btn){
+    var n = 0;
+    (function poll(){
+      api2('/api/link/provision/status').then(function(d){
+        pbar(d.pct, '');
+        put(d.msg || '');
+        if (d.running){ setTimeout(poll, 1500); return; }
+        if (d.pct >= 100) put('✅ ' + (d.msg || '配网完成'));
+        else if (d.msg) put('❌ ' + d.msg);
+        if (btn) btn.disabled = false;
+      }, function(){
+        if (n++ > 40){ if (btn) btn.disabled = false; put('⚠ 与 ESP 失联太久；重连热点并刷新本页，进度会自动接上'); return; }
+        put('等待 ESP 重连（AP 切信道中）… ' + (n * 2) + 's');
+        setTimeout(poll, 2000);
+      });
+    })();
+  }
+  document.getElementById('lk-wifi').onclick = function(){
+    var ssid = document.getElementById('lk-ssid').value.trim();
+    var pass = document.getElementById('lk-pass').value;
+    if (!ssid){ put('先点「扫描附近 WiFi」选一个网络'); return; }
+    var btn = this;
+    btn.disabled = true;
+    pbar(2, '启动');
+    put('正在启动设备端配网任务…');
+    apiRetry(function(){
+      return api2('/api/link/provision?ssid=' + encodeURIComponent(ssid) + '&pass=' + encodeURIComponent(pass));
+    }, 10, 2000, '①').then(function(){
+      pollProvision(btn);
+    }).catch(function(e){ pbar(0, '启动失败'); put('❌ ' + e.message); btn.disabled = false; });
+  };
+  /* 刷新/重进页面时：设备上任务还在跑就自动接上进度 */
+  setTimeout(function(){
+    api2('/api/link/provision/status').then(function(d){
+      if (d && (d.running || (d.pct > 0 && d.pct < 100))){
+        pbar(d.pct, '');
+        put(d.msg || '配网进行中…');
+        pollProvision(document.getElementById('lk-wifi'));
+      }
+    }, function(){});
+  }, 2500);
+
   setTimeout(showLink, 1500);
 })();
 </script>

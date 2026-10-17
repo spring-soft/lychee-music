@@ -1,4 +1,4 @@
-/*
+﻿/*
  * usblink —— 板子与服务器之间的**有线串口指令通道**（走烧录口那根 USB 线）。
  *
  * ============================================================================
@@ -50,6 +50,17 @@ const char *usblink_last_cmd(void);
 
 uint32_t usblink_rx_lines(void);   /* 收到多少条来自服务器的行 */
 uint32_t usblink_tx_lines(void);   /* 发出去多少条指令 */
+
+/* ============================================================ 一键配网（流程跑在设备上）
+ *
+ * ★ 为什么不能放在网页里跑：ESP 一连上新 WiFi，**AP 会切信道、断 1~3 秒**，
+ *   网页的 fetch 立刻全断（Failed to fetch）—— 流程就死在半路了，刷新也没用。
+ *   所以流程做成**设备上的后台任务**：页面只负责"启动"和"看进度"，
+ *   AP 断了、页面刷新了都无所谓，任务照跑；刷新后一查状态就能看到进度。
+ */
+esp_err_t usblink_provision_start(const char *ssid, const char *pass);
+/* 读当前进度：返回 true = 正在跑；pct/message 是给网页显示的内容 */
+bool      usblink_provision_status(int *pct, char *message, size_t len);
 
 #ifdef __cplusplus
 }

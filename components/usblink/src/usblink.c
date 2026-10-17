@@ -1,4 +1,4 @@
-#include "usblink.h"
+﻿#include "usblink.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -9,6 +9,11 @@
 #include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "net_mgr.h"
+#include "qqmusic.h"
+#include "subsonic.h"
+#include "freertos/queue.h"
 
 static const char *TAG = "usblink";
 
@@ -142,3 +147,104 @@ const char *usblink_last_cmd(void)
 
 uint32_t usblink_rx_lines(void) { return atomic_load(&s_rx_lines); }
 uint32_t usblink_tx_lines(void) { return atomic_load(&s_tx_lines); }
+
+/* ============================================================ 一键配网状态机 */
+static struct {
+    volatile int  running;        /* 0=空闲 1=跑着 */
+    volatile int  pct;
+    char          msg[160];
+    char          ssid[33];
+    char          pass[65];
+    volatile int  step;           /* 1=连ESP 2=通知服务器 3=等服务器 4=校准 */
+} s_pv;
+
+static void pv_set(int pct, const char *fmt, ...)
+{
+    va_list ap;
+    s_pv.pct = pct;
+    va_start(ap, fmt);
+    vsnprintf(s_pv.msg, sizeof(s_pv.msg), fmt, ap);
+    va_end(ap);
+    ESP_LOGW(TAG, "[配网 %d%%] %s", pct, s_pv.msg);
+}
+
+static void provision_task(void *arg)
+{
+    s_pv.step = 1;
+    pv_set(5, "开始：让 ESP 连上「%s」", s_pv.ssid);
+    esp_err_t err = net_mgr_set_sta(s_pv.ssid, s_pv.pass[0] ? s_pv.pass : NULL);
+    if (err != ESP_OK) { pv_set(-1, "ESP 连接失败：%s", esp_err_to_name(err)); goto done; }
+
+    /* 等 ESP 拿到 IP（最多 30 秒）——这一步 AP 会瞬断，正常 */
+    bool ok = false;
+    for (int i = 0; i < 60; i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        const char *ip = net_mgr_ip_str();
+        if (ip && ip[0]) { pv_set(40, "ESP 已连上，IP=%s", ip); ok = true; break; }
+        if ((i % 4) == 0) pv_set(15, "ESP 连接中… %d 秒（AP 会瞬断，属正常）", i / 2);
+    }
+    if (!ok) { pv_set(-1, "ESP 30 秒内没连上（密码错或信号弱）"); goto done; }
+
+    /* 通过串口让服务器连同一个网络 */
+    s_pv.step = 2;
+    pv_set(55, "正在让服务器连「%s」…", s_pv.ssid);
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "WIFI %s %s", s_pv.ssid, s_pv.pass);
+    if (usblink_send(cmd) != ESP_OK) { pv_set(-1, "串口发送失败（数据线插好了吗）"); goto done; }
+
+    /* 等服务器回执里的 ip=（最多 150 秒） */
+    s_pv.step = 3;
+    char srv_ip[32] = {0};
+    for (int i = 0; i < 150; i++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        const char *r = usblink_last_reply();
+        const char *p = r ? strstr(r, "ip=") : NULL;
+        if (p) {
+            p += 3;
+            int n = 0;
+            while (p[n] && p[n] != ' ' && n < (int)sizeof(srv_ip) - 1) { srv_ip[n] = p[n]; n++; }
+            srv_ip[n] = 0;
+        }
+        if (srv_ip[0]) { pv_set(85, "服务器已连上，IP=%s", srv_ip); break; }
+        if (r && strncmp(r, "ERR", 3) == 0) { pv_set(-1, "服务器连不上：%s", r); goto done; }
+        if ((i % 5) == 0) pv_set(60 + (i / 10), "服务器配网中… %d 秒", i);
+    }
+    if (!srv_ip[0]) { pv_set(-1, "服务器 150 秒内没回 IP（看回执）"); goto done; }
+
+    /* 校准服务器地址（QQ API :3210 / 音乐流 :4533） */
+    s_pv.step = 4;
+    pv_set(95, "校准服务器地址…");
+    char qhost[96], nhost[96];
+    snprintf(qhost, sizeof(qhost), "http://%s:3210", srv_ip);
+    snprintf(nhost, sizeof(nhost), "http://%s:4533", srv_ip);
+    qqmusic_set_config(qhost, true);
+    subsonic_set_config(nhost, NULL, NULL, NULL, 0);
+    pv_set(100, "配网完成：ESP=%s 服务器=%s", net_mgr_ip_str(), srv_ip);
+
+done:
+    if (s_pv.pct < 0) s_pv.pct = 0;
+    s_pv.running = 0;
+    vTaskDelete(NULL);
+}
+
+esp_err_t usblink_provision_start(const char *ssid, const char *pass)
+{
+    if (ssid == NULL || ssid[0] == 0) return ESP_ERR_INVALID_ARG;
+    if (s_pv.running) return ESP_ERR_INVALID_STATE;
+    strlcpy(s_pv.ssid, ssid, sizeof(s_pv.ssid));
+    strlcpy(s_pv.pass, pass ? pass : "", sizeof(s_pv.pass));
+    s_pv.pct = 0;
+    s_pv.running = 1;
+    if (xTaskCreate(provision_task, "provision", 6144, NULL, 4, NULL) != pdPASS) {
+        s_pv.running = 0;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+bool usblink_provision_status(int *pct, char *message, size_t len)
+{
+    if (pct) *pct = s_pv.pct;
+    if (message) strlcpy(message, s_pv.msg, len);
+    return s_pv.running != 0;
+}
