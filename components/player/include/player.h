@@ -102,6 +102,19 @@ void player_star(bool on);            /* 收藏/取消收藏当前歌（写回 N
 void player_volume(int vol);          /* 0..100，落到 ES8388（含模拟音量混合），自动存 NVS */
 void player_set_mute(bool on);        /* 真·静音：ES8388 DAC 硬静音，不是把音量设成 0 */
 void player_set_brightness(int pct);  /* 屏幕背光 5..100（网页和屏幕都改这一个，自动存 NVS） */
+
+/* ---------------- 「播放设备」：本机 / 服务器 ----------------
+ *
+ * 0 = 本机  ：ESP 自己解码，从板载 DAC 出声（默认，一直以来的行为）
+ * 1 = 服务器：服务器（接了 USB DAC 的那台 OpenStick）自己出声，ESP 只当遥控器+显示屏
+ *
+ * ⚠️ 现在这一版只做到「记住选择 + 菜单里能选」。真正把按键/状态切到服务器，
+ *    要等远程控制接线（下一步）；在那之前选「服务器」不会改变出声设备。
+ */
+typedef enum { PLAYER_OUT_LOCAL = 0, PLAYER_OUT_SERVER = 1, PLAYER_OUT_COUNT } player_out_t;
+void          player_set_out(player_out_t o);   /* 切换播放设备（存 NVS，重启保留） */
+player_out_t  player_out(void);
+const char   *player_out_name(player_out_t o);  /* "本机" / "服务器" */
 void player_seek(uint32_t pos_ms);    /* seek：让服务端从该位置重转（约 1 秒缓冲） */
 void player_play_song_id(const char *song_id);      /* 播放队列外的歌（只知道 id，会去服务器取元数据） */
 /* 同上，但元数据已经有了 —— **前端点列表时用这个，省掉一次 getSong 网络往返** */

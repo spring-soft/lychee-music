@@ -146,6 +146,8 @@ static int               s_volume = 40;
 static volatile int      s_vol_target = 40;
 static volatile bool     s_mute_target;   /* 同上：界面读请求值，不等 I2C 写完 */
 static volatile int      s_bright_target = 100;
+/* 「播放设备」：0=本机 / 1=服务器（见 player.h 的说明）。UI 直接读它，所以 volatile */
+static volatile int      s_out = PLAYER_OUT_LOCAL;
 
 /* 临时静音解开时，要恢复成"用户是否静音"而不是无条件解开 */
 static void restore_mute(void) { board_es8388_mute(board_es8388_is_muted()); }
@@ -1500,6 +1502,9 @@ esp_err_t player_init(void)
      * 这里只把值读出来，ui_pages_apply_brightness() 负责施加） */
     s_bright_target = settings_get_int("bright", 100);
     if (s_bright_target < 5 || s_bright_target > 100) s_bright_target = 100;
+    /* 播放设备：0=本机（默认）/ 1=服务器 */
+    s_out = settings_get_int("outdev", PLAYER_OUT_LOCAL);
+    if (s_out < 0 || s_out >= PLAYER_OUT_COUNT) s_out = PLAYER_OUT_LOCAL;
 
     /* 「来源」（后端）和每个后端各自的「模式」—— 三个键都恢复 */
     int src = settings_get_int("src", (int)PLAYER_SRC_RANDOM);
@@ -1686,6 +1691,30 @@ void player_set_brightness(int pct)
     if (pct > 100) pct = 100;
     s_bright_target = pct;
     post(CMD_BRIGHT, pct, false);
+}
+
+/* ---------------- 播放设备（本机 / 服务器） ----------------
+ * ⚠️ 只做到"记住选择"这一版：按键/状态还没切到服务器（远程控制是下一步）。
+ *    先把这个选择落进 NVS，是因为菜单要显示它、而且切过去以后要能重启保留。 */
+void player_set_out(player_out_t o)
+{
+    if (o < 0 || o >= PLAYER_OUT_COUNT) return;
+    if (s_out == (int)o) return;
+    s_out = (int)o;
+    settings_set_int_lazy("outdev", s_out);
+    ESP_LOGW(TAG, "播放设备 = %s（%s）", player_out_name(o),
+             o == PLAYER_OUT_SERVER ? "远程控制还没接入，这一版仍从本机出声" : "本机解码出声");
+}
+
+player_out_t player_out(void) { return (player_out_t)s_out; }
+
+const char *player_out_name(player_out_t o)
+{
+    switch (o) {
+        case PLAYER_OUT_LOCAL:  return "本机";
+        case PLAYER_OUT_SERVER: return "服务器";
+        default:                return "?";
+    }
 }
 
 int player_queue_count(void)

@@ -238,6 +238,7 @@ const char *ui_page_name(ui_page_t p)
         case UI_PAGE_BT:          return "蓝牙控制";
         case UI_PAGE_SRC:         return "模式二级";
         case UI_PAGE_BACK:        return "来源二级";
+        case UI_PAGE_DEVICE:      return "设备二级";
         case UI_PAGE_SETTINGS:    return "设置";     /* 以前漏了这一项，日志里一直是 "?" */
         case UI_PAGE_QQLOGIN:     return "QQ登录";
         case UI_PAGE_SEARCH_MODE: return "搜索方式";

@@ -196,9 +196,10 @@ static bool      s_menu_dirty = true;
 
 static const char *menu_name(int i)
 {
-    /* 「模式」和「来源」两行的文字是动态的，文本放在这两个静态缓冲里 */
+    /* 「模式」「来源」「设备」三行的文字是动态的，文本放在这几个静态缓冲里 */
     static char s_menu_mode_lbl[48];
     static char s_menu_back_lbl[48];
+    static char s_menu_out_lbl[48];
     switch (i) {
         /* ★ 两个概念分开，就不打架了：
          *     来源 = 音乐从哪个**服务**来（Navidrome / QQ 音乐）
@@ -213,7 +214,12 @@ static const char *menu_name(int i)
                      player_back_name(player_back()));
             return s_menu_back_lbl;
         case 2: return "搜索";
-        case 3: return "屏幕亮度";
+        /* ★ 2026-10-17 用户要求：原来这行是「屏幕亮度」，改成「设备」，亮度挪进设置。
+         *   后缀直接显示当前播放设备，进二级页可以切（本机 / 服务器）。 */
+        case 3:
+            snprintf(s_menu_out_lbl, sizeof(s_menu_out_lbl), "设备: %s",
+                     player_out_name(player_out()));
+            return s_menu_out_lbl;
         /* ★ 2026-10-01：这里原来是"重连 WiFi"，用户要求换成"设置"，
          *   重连挪进设置二级菜单（并且在那边加了二次确认）。 */
         case 4: return "设置";
@@ -224,13 +230,14 @@ static const char *menu_name(int i)
 
 static void menu_render(void)
 {
-    /* 「模式」和「来源」两行都是动态的。任一变就把菜单标脏，否则要等到用户翻页才刷新
+    /* 「模式」「来源」「设备」三行都是动态的。任一变就把菜单标脏，否则要等到用户翻页才刷新
      * —— 用户会以为"换了来源但屏幕上没反应"。 */
     {
-        static char prev[128];
-        char now[128];
-        snprintf(now, sizeof(now), "%s|%s",
-                 player_back_name(player_back()), player_mode_name(player_mode()));
+        static char prev[160];
+        char now[160];
+        snprintf(now, sizeof(now), "%s|%s|%s",
+                 player_back_name(player_back()), player_mode_name(player_mode()),
+                 player_out_name(player_out()));
         if (strcmp(now, prev) != 0) {
             strlcpy(prev, now, sizeof(prev));
             s_menu_dirty = true;
@@ -280,6 +287,7 @@ ui_page_t ui_page_parent(ui_page_t p)
         case UI_PAGE_MENU:        return UI_PAGE_PLAY;
         case UI_PAGE_SRC:         return UI_PAGE_MENU;
         case UI_PAGE_BACK:        return UI_PAGE_MENU;   /* 来源二级菜单的上一级也是主菜单 */
+        case UI_PAGE_DEVICE:      return UI_PAGE_MENU;   /* 设备二级菜单：上一级 = 主菜单 */
         case UI_PAGE_SETTINGS:    return UI_PAGE_MENU;   /* 设置页的上一级 = 菜单 */
         case UI_PAGE_QQLOGIN:     return UI_PAGE_SETTINGS;  /* QQ 登录的上一级 = 设置 */
         case UI_PAGE_SEARCH_MODE: return UI_PAGE_MENU;
@@ -454,6 +462,83 @@ void ui_backmenu_activate(void)
     ui_page_show(UI_PAGE_MENU);
 }
 
+/* ============================================================ 「设备」二级菜单（切播放设备）
+ *
+ * 2026-10-17 用户要求：主菜单原来那行「屏幕亮度」改成「设备」，
+ * 按 K3 进来选"在本机放"还是"在服务器放"。亮度挪到设置二级菜单里了。
+ *
+ * 只有两项，跟「来源」二级菜单同构（都用 MENU_Y0 / MENU_ROW_H 那套坐标）。
+ * ⚠️ 这一版选「服务器」只会记住选择，还不会真的把播放切过去 ——
+ *    远程控制（按键转给服务器、状态从服务器读）是下一步。提示语里说明了。
+ */
+#define DEV_N  ((int)PLAYER_OUT_COUNT)
+
+static lv_obj_t *s_scr_dev, *s_dev_hl, *s_dev_lbl[DEV_N];
+static int       s_dev_sel;
+static int       s_dev_r_sel = -1;
+
+static void dev_render(void)
+{
+    for (int i = 0; i < DEV_N; i++) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%s%s", player_out_name((player_out_t)i),
+                 (player_out() == (player_out_t)i) ? "（当前）" : "");
+        ui_set_text(s_dev_lbl[i], buf);
+    }
+    int y = MENU_Y0 + s_dev_sel * MENU_ROW_H;
+    if (s_dev_r_sel < 0 || lv_obj_get_y(s_dev_hl) != y) {
+        ui_anim_slide_obj(s_dev_hl, y, 120);
+    }
+    s_dev_r_sel = s_dev_sel;
+}
+
+static void build_dev_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    s_scr_dev = scr;
+    ui_page_register(UI_PAGE_DEVICE, scr);
+
+    ui_put_img(scr, ASSET_BG_MENU, 0, 0);
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    ui_put_label_1line(scr, "设备", 20, 2, 134, ui_font_16, 0x1C1C1E);
+
+    s_dev_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
+    for (int i = 0; i < DEV_N; i++) {
+        s_dev_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
+                                          136, ui_font_12, 0x1C1C1E);
+    }
+    ESP_LOGI(TAG, "设备二级菜单已建好（%d 项：本机 / 服务器）", DEV_N);
+}
+
+void ui_devmenu_open(void)
+{
+    s_dev_sel = (int)player_out();
+    if (s_dev_sel < 0 || s_dev_sel >= DEV_N) s_dev_sel = 0;
+    s_dev_r_sel = -1;
+    dev_render();
+    ui_page_show(UI_PAGE_DEVICE);
+}
+
+void ui_devmenu_move(int delta)
+{
+    s_dev_sel = (s_dev_sel + delta + DEV_N) % DEV_N;
+    dev_render();
+}
+
+void ui_devmenu_activate(void)
+{
+    player_out_t o = (player_out_t)s_dev_sel;
+    player_set_out(o);
+    if (o == PLAYER_OUT_SERVER) {
+        /* 诚实提示：这一版还没把播放切过去，别让用户以为已经切了 */
+        ui_toast("已选服务器（连接线下一步）");
+    } else {
+        ui_toast("本机播放");
+    }
+    s_menu_dirty = true;              /* 主菜单那行「设备: X」要跟着变 */
+    ui_page_show(UI_PAGE_MENU);
+}
+
 /* ============================================================ 设置二级菜单
  *
  * 用户要求：主菜单原来的"重连 WiFi"换成"设置"，按 K3 进这一页。
@@ -468,8 +553,11 @@ void ui_backmenu_activate(void)
  * （有效 / 已过期 / 未登录…），按 K3 进 UI_PAGE_QQLOGIN 看详情并扫码。
  * 为什么这一项不做二次确认：扫码只是"看"和"换一张码"，没有任何破坏性，
  * 多一步确认只会让人以为按错了。
+ * 2026-10-17 新增第 4 项「屏幕亮度」：用户要求把主菜单那行亮度挪到这里，
+ * 腾出主菜单那行给「设备」。亮度页本身没变，只是入口换了 ——
+ * 打开时传 brightness=true 就走原来的虚拟按键调节。
  */
-#define SET_N  3
+#define SET_N  4
 
 static lv_obj_t *s_scr_set, *s_set_hl, *s_set_lbl[SET_N];
 static int       s_set_sel;
@@ -497,6 +585,10 @@ static void set_render(void)
     if (s_set_qq[0]) snprintf(buf, sizeof(buf), "QQ 登录  %s", s_set_qq);
     else             snprintf(buf, sizeof(buf), "QQ 登录");
     ui_set_text(s_set_lbl[2], buf);
+
+    /* 屏幕亮度：从主菜单挪进来的。没有确认态（调亮度随时可退，本来就有实时的视觉反馈）*/
+    snprintf(buf, sizeof(buf), "屏幕亮度  %d%%", player_brightness());
+    ui_set_text(s_set_lbl[3], buf);
 
     int y = MENU_Y0 + s_set_sel * MENU_ROW_H;
     if (s_set_r_sel < 0 || lv_obj_get_y(s_set_hl) != y) {
@@ -547,6 +639,12 @@ void ui_setmenu_activate(void)
      *    多一步确认只会让人以为按错了。 */
     if (s_set_sel == 2) {
         ui_qqlogin_open();
+        return;
+    }
+    /* 第 4 项「屏幕亮度」：直接打开亮度页（无副作用，不用确认）。
+     * ⚠️ 要传 brightness=true —— 那一页是"音量/亮度共用一屏"，靠这个标志切变体。 */
+    if (s_set_sel == 3) {
+        ui_vol_open(true, false);
         return;
     }
 
@@ -1081,7 +1179,7 @@ static void menu_activate(int i)
         case 0: ui_srcmenu_open(); break;      /* 模式 → 二级菜单（最近播放… / 每日30首…） */
         case 1: ui_backmenu_open(); break;     /* ★ 新增：来源 → 二级菜单（Navidrome / QQ 音乐） */
         case 2: ui_search_open(); break;       /* 搜索（播放/暂停 在播放页有 K2）*/
-        case 3: ui_vol_open(true, false); break;   /* 记住来路=菜单，K4 会回菜单 */
+        case 3: ui_devmenu_open(); break;      /* ★ 2026-10-17：设备（本机 / 服务器），原来这里是屏幕亮度 */
         case 4: ui_setmenu_open(); break;      /* 设置 → 二级菜单 */
         case 5: ui_page_show(UI_PAGE_INFO); break;
         default: break;
@@ -1294,6 +1392,7 @@ void ui_pages_build(void)
     build_bt_screen();
     build_src_screen();              /* 「模式」二级菜单（项数随后端动态） */
     build_back_screen();             /* 「来源」二级菜单（Navidrome / QQ 音乐） */
+    build_dev_screen();              /* 「设备」二级菜单（本机 / 服务器）*/
     build_set_screen();              /* 设置二级菜单（开机续播 / 重连 WiFi）*/
     build_qq_screen();               /* QQ 登录（设置里那一项按 K3 进）*/
     /* 音质二级菜单已按用户要求删除（固定用最高：无损优先）*/
@@ -1341,6 +1440,10 @@ void ui_pages_enter(ui_page_t p)
         case UI_PAGE_BACK:
             s_back_r_sel = -1;
             back_render();
+            break;
+        case UI_PAGE_DEVICE:
+            s_dev_r_sel = -1;
+            dev_render();
             break;
         /* 进设置页顺带查一次 QQ 登录情况 —— 那一行的后缀要显示它。
          * 只是投一条后台命令，UI 不会被网络卡住。 */
@@ -1402,6 +1505,7 @@ void ui_pages_tick(void)
         case UI_PAGE_BT:   bt_render();        break;
         case UI_PAGE_SRC:  src_render();       break;
         case UI_PAGE_BACK: back_render();      break;
+        case UI_PAGE_DEVICE: dev_render();     break;
         case UI_PAGE_SETTINGS: set_tick();     break;
         case UI_PAGE_QQLOGIN:  qq_render();    break;
         case UI_PAGE_SEARCH_MODE:

@@ -186,6 +186,15 @@ static void key_short(int k)
             }
             break;
 
+        case UI_PAGE_DEVICE:                    /* 「设备」二级菜单（本机 / 服务器） */
+            switch (k) {
+                case 0: ui_devmenu_move(-1); break;
+                case 1: ui_devmenu_move(+1); break;
+                case 2: ui_devmenu_activate(); break;  /* 选定并退回主菜单 */
+                default: break;              /* K4 由 k4_navigate 管 */
+            }
+            break;
+
         case UI_PAGE_SETTINGS:                  /* 设置二级菜单 */
             switch (k) {
                 case 0: ui_setmenu_move(-1); break;
