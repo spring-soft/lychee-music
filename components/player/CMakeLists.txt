@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "src/player.c"
+    SRCS "src/player.c" "src/player_remote.c"
     INCLUDE_DIRS "include"
     REQUIRES
         board
@@ -12,4 +12,6 @@ idf_component_register(
         json
         freertos
         esp_hw_support
+        esp_http_client
+        esp_timer
 )

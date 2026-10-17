@@ -270,19 +270,31 @@ static esp_err_t h_status(httpd_req_t *req)
     }
     if (audio_engine_is_paused()) state = "PAUSED";
 
+    /* ★ 设备=服务器时，本机引擎是停的（它不出声），状态全在 player_status 里
+     *   （那是从服务器镜像过来的）。所以要换数据源，否则网页会一直显示 IDLE。 */
+    bool remote = (player_out() == PLAYER_OUT_SERVER);
+    if (remote) {
+        state = st.playing ? "PLAYING" : (st.paused ? "PAUSED" : "IDLE");
+    }
+
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "state", state);
-    cJSON_AddNumberToObject(o, "pos_ms", audio_engine_position_ms());
+    cJSON_AddNumberToObject(o, "pos_ms", remote ? st.position_ms : audio_engine_position_ms());
     cJSON_AddNumberToObject(o, "dur_ms", st.duration_ms);
     /* ⚠️ 暂停时引擎状态仍是 PLAYING（暂停是独立标志），所以 playing 要额外排除暂停。
      *    否则网页会显示"播放中"却不走时间。前端自己也算了一层 && !paused 做兜底，
      *    但契约本身该是对的。 */
-    cJSON_AddBoolToObject(o, "playing", aes == AE_STATE_PLAYING && !audio_engine_is_paused());
-    cJSON_AddBoolToObject(o, "paused", audio_engine_is_paused());
+    cJSON_AddBoolToObject(o, "playing",
+                          remote ? (st.playing && !st.paused)
+                                 : (aes == AE_STATE_PLAYING && !audio_engine_is_paused()));
+    cJSON_AddBoolToObject(o, "paused", remote ? st.paused : audio_engine_is_paused());
     cJSON_AddNumberToObject(o, "vol", player_volume_get());
     cJSON_AddBoolToObject(o, "muted", player_is_muted());
     cJSON_AddNumberToObject(o, "bright", player_brightness());
     cJSON_AddNumberToObject(o, "gen", st.gen);      /* ★ 每次换歌 +1，前端靠它对账 */
+    /* ★ 播放设备：0=本机（ESP 出声）/ 1=服务器（那台接 USB DAC 的机器出声）*/
+    cJSON_AddNumberToObject(o, "out", (int)player_out());
+    cJSON_AddStringToObject(o, "out_name", player_out_name(player_out()));
 
     cJSON *song = cJSON_AddObjectToObject(o, "song");
     cJSON_AddStringToObject(song, "id", st.song_id);
@@ -792,6 +804,36 @@ static esp_err_t h_qq(httpd_req_t *req)
     return ok_json(req);
 }
 
+/* 「播放设备」：0=本机（ESP 解码出声）/ 1=服务器（那台接 USB DAC 的机器出声）
+ * 网页/手机也能切 —— 跟屏幕菜单里「设备」是同一个入口（都走 player_set_out）。 */
+static esp_err_t h_out(httpd_req_t *req)
+{
+    cJSON *b = read_body(req);
+    if (b == NULL) return fail(req, "400 Bad Request", "请求体不是合法 JSON");
+    int dev = json_int(b, "dev", -1);
+    cJSON_Delete(b);
+    if (dev < 0 || dev >= (int)PLAYER_OUT_COUNT) {
+        return fail(req, "400 Bad Request", "dev 只能是 0（本机）或 1（服务器）");
+    }
+    player_set_out((player_out_t)dev);
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddNumberToObject(o, "out", (int)player_out());
+    cJSON_AddStringToObject(o, "out_name", player_out_name(player_out()));
+    cJSON_AddNumberToObject(o, "requested", dev);
+    /* 切换在 player 任务里异步做（要停本机、让服务器接管，1~3 秒）*/
+    cJSON_AddStringToObject(o, "note", "切换异步执行，约 1~3 秒后 GET /api/out 才会变成新值");
+    return send_json(req, o);
+}
+
+static esp_err_t h_out_get(httpd_req_t *req)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "out", (int)player_out());
+    cJSON_AddStringToObject(o, "out_name", player_out_name(player_out()));
+    return send_json(req, o);
+}
+
 static esp_err_t h_back(httpd_req_t *req)
 {
     cJSON *b = read_body(req);
@@ -1129,6 +1171,10 @@ static esp_err_t h_debug(httpd_req_t *req)
 
     cJSON *bt = cJSON_AddObjectToObject(o, "hid");
     hid_fill(bt);
+
+    /* ★ 当前「播放设备」：0=本机（ESP 解码出声）/ 1=服务器（那台接 USB DAC 的机器出声）*/
+    cJSON_AddNumberToObject(o, "out", (int)player_out());
+    cJSON_AddStringToObject(o, "out_name", player_out_name(player_out()));
 
     /* ★ 崩溃取证三件套：本次开机是**为什么**开始的、开机过几次、
      *   以及 httpd 任务当前还剩多少栈（这个处理器就跑在 httpd 任务上，
@@ -1680,6 +1726,8 @@ esp_err_t web_console_start(void)
         { .uri = "/api/bright",          .method = HTTP_POST, .handler = h_bright },
         { .uri = "/api/source",          .method = HTTP_POST, .handler = h_source },
         { .uri = "/api/back",            .method = HTTP_POST, .handler = h_back },
+        { .uri = "/api/out",             .method = HTTP_GET,  .handler = h_out_get },
+        { .uri = "/api/out",             .method = HTTP_POST, .handler = h_out },
         /* 音质挡位：GET 读、POST 写，同一个处理器按 method 分支 */
         { .uri = "/api/quality",         .method = HTTP_GET,  .handler = h_quality },
         { .uri = "/api/quality",         .method = HTTP_POST, .handler = h_quality },

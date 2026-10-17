@@ -529,12 +529,8 @@ void ui_devmenu_activate(void)
 {
     player_out_t o = (player_out_t)s_dev_sel;
     player_set_out(o);
-    if (o == PLAYER_OUT_SERVER) {
-        /* 诚实提示：这一版还没把播放切过去，别让用户以为已经切了 */
-        ui_toast("已选服务器（连接线下一步）");
-    } else {
-        ui_toast("本机播放");
-    }
+    /* 切换是异步的（要停本机、再让服务器接管，约 1~3 秒），所以提示用"正在…" */
+    ui_toast(o == PLAYER_OUT_SERVER ? "正在切到服务器..." : "正在切回本机...");
     s_menu_dirty = true;              /* 主菜单那行「设备: X」要跟着变 */
     ui_page_show(UI_PAGE_MENU);
 }

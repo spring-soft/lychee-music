@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include "player.h"
+#include "player_remote.h"
 #include "app_core.h"
 #include "audio_engine.h"
 #include "board.h"
@@ -29,7 +30,14 @@
 
 static const char *TAG = "player";
 
-#define PLAYER_TASK_STACK 6144
+/* ⚠️ 2026-10-17 从 6144 提到 10240。
+ *
+ * 原因：设备=服务器时，player 任务里要**同步发 HTTP**（remote_sync 拉状态、
+ * 命令转发），esp_http_client 一次要吃掉 3~4KB 栈；而 player 任务本来就不宽裕。
+ * 实测证据：新固件开机 6.2 秒 panic（黑匣子 reset_reason=4），正好是第一次
+ * remote_sync 的时间点；v2-pcb 分支当初也因为栈不够把这里提到过 10240，同一个病。
+ * 代价：内部 SRAM 多 4KB（这块板最紧的资源），但播放本身在 PSRAM，实测仍有余量。 */
+#define PLAYER_TASK_STACK 10240
 #define PLAYER_TASK_PRIO  5
 #define PLAYER_TASK_CORE  0
 
@@ -57,6 +65,7 @@ typedef enum {
     CMD_RESUME, CMD_STAR_REFRESH,
     CMD_SEARCH,               /* M8：屏上搜索 */
     CMD_SET_BACK,             /* 换「来源」= Navidrome / QQ 音乐 */
+    CMD_OUT,                  /* 切「播放设备」= 本机 / 服务器 */
 } cmd_kind_t;
 
 typedef struct {
@@ -1248,11 +1257,222 @@ static void do_search(const char *q)
     }
 }
 
+/* ============================================================ 远程播放（设备=服务器）
+
+ * 用户在菜单里把「设备」切成"服务器"之后，歌由服务器（接了 USB DAC 的那台）
+ * 出声，ESP 只当遥控器。这里做三件事：
+ *   ① 每秒把服务器的状态/队列镜像到本地 —— 于是 UI/网页/按键全都不用改；
+ *   ② 把播放类命令转发给服务器；
+ *   ③ 切换设备时做"同一首、同一进度"的接管。
+ *
+ * ⚠️ 这里的 HTTP 都是阻塞的，所以**只在 player 任务里调**（UI 任务调会把界面卡住）。
+ */
+static uint32_t s_remote_gen = 0;
+
+static void remote_sync(void)
+{
+    /* 首轮面包屑：万一又在启动时崩，RTC 黑匣子里能看出崩在哪一步 */
+    static bool first = true, first_done = true;
+    if (first) {
+        first = false;
+        ESP_LOGW(TAG, "远程同步：首次拉状态开始");
+    }
+    if (player_remote_fetch() != ESP_OK) {
+        /* 连不上：保留上一次画面（比清成 0 好），只把错误记在日志里（限频） */
+        static int64_t last_log;
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now - last_log > 5000) {
+            last_log = now;
+            ESP_LOGW(TAG, "服务器状态拿不到：%s", player_remote_last_err());
+        }
+        return;
+    }
+    remote_status_t rs;
+    player_remote_status(&rs);
+    if (!rs.valid) return;
+    if (first_done) {
+        first_done = false;
+        ESP_LOGW(TAG, "远程同步：首轮成功 state=%s %s / %s，位置 %" PRIu32 "ms",
+                 rs.state, rs.title, rs.artist, rs.pos_ms);
+    }
+
+    /* 队列：服务器那边 gen 变了才重建本地镜像（队列明细 13KB，别每秒拉） */
+    if (rs.gen != s_remote_gen) {
+        s_remote_gen = rs.gen;
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_count = player_remote_queue_copy(s_queue, PLAYER_QUEUE_MAX);
+        s_index = rs.q_index;
+        xSemaphoreGive(s_lock);
+        player_status_set_queue(rs.q_index, rs.q_count, rs.q_mode, true);
+    } else {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_index = rs.q_index;
+        xSemaphoreGive(s_lock);
+        player_status_set_queue(rs.q_index, rs.q_count, rs.q_mode, false);
+    }
+
+    /* 当前歌：变了才动 gen（封面等异步结果靠它避免串台）*/
+    player_status_t cur;
+    player_status_get(&cur);
+    if (rs.id[0] && strcmp(cur.song_id, rs.id) != 0) {
+        player_status_set_song(rs.id, rs.title, rs.artist, rs.album, rs.cover,
+                               rs.dur_ms, false, (uint8_t)rs.back);
+    }
+    player_status_set_progress(rs.pos_ms,
+                               strcmp(rs.state, "playing") == 0,
+                               strcmp(rs.state, "paused") == 0, false);
+    player_status_set_volume(rs.volume);
+    /* 「来源」的显示跟服务器实际在放的对齐（用户可能在网页上换了来源）*/
+    s_back = (rs.back == 1) ? PLAYER_BACK_QQ : PLAYER_BACK_NAV;
+}
+
+/* 返回 true = 这条命令已经转给服务器，别再走本机逻辑 */
+static bool remote_handle_cmd(const player_cmd_t *c)
+{
+    int back = (s_back == PLAYER_BACK_QQ) ? 1 : 0;
+    switch (c->kind) {
+        case CMD_NEXT:    player_remote_next();   return true;
+        case CMD_PREV:    player_remote_prev();   return true;
+        case CMD_TOGGLE:  player_remote_toggle(); return true;
+        case CMD_RESTART: player_remote_seek(0);  return true;
+        case CMD_SEEK:    player_remote_seek((uint32_t)c->iarg); return true;
+
+        case CMD_PLAY_INDEX: {
+            /* 列表页选中的那首：用 id 让服务器放（它自己会插进队列）*/
+            sub_song_t s;
+            if (player_queue_get(c->iarg, &s)) {
+                player_remote_play_id(s.back, s.id);
+                player_status_set_queue(c->iarg, player_queue_count(), NULL, false);
+            }
+            return true;
+        }
+        case CMD_PLAY_ID: {
+            int b = c->meta.id[0] ? (int)c->meta.back : back;
+            player_remote_play_id(b, c->meta.id[0] ? c->meta.id : c->sid);
+            return true;
+        }
+        case CMD_SET_SOURCE: {
+            /* 只更新本地"当前模式"（菜单要显示），列表由服务器建 */
+            if (s_back == PLAYER_BACK_QQ) {
+                if (c->iarg < 0 || c->iarg >= QQ_MODE_COUNT) return true;
+                s_qq_mode = c->iarg;
+            } else {
+                if (c->iarg < 0 || c->iarg >= PLAYER_SRC_COUNT) return true;
+                s_src = (player_src_t)c->iarg;
+            }
+            player_remote_play_mode(back, c->iarg, 0, 0);
+            return true;
+        }
+        case CMD_SET_BACK: {
+            if (c->iarg < 0 || c->iarg >= PLAYER_BACK_COUNT) return true;
+            s_back = (player_back_t)c->iarg;
+            /* 两个后端的模式下标含义不同，切过去按"该后端记住的模式" */
+            player_remote_play_mode(c->iarg, player_mode(), 0, 0);
+            return true;
+        }
+        case CMD_VOLUME:
+            s_volume = c->iarg < 0 ? 0 : (c->iarg > 100 ? 100 : c->iarg);
+            player_remote_volume(s_mute_target ? 0 : s_volume);
+            player_status_set_volume(s_mute_target ? 0 : s_volume);
+            settings_set_int_lazy("vol", s_volume);
+            ESP_LOGI(TAG, "音量 %d%%（服务器）", s_volume);
+            return true;
+        case CMD_MUTE:
+            /* 服务器那边没有本机的 DAC 硬静音，只能靠音量 0（够用）*/
+            player_remote_volume(c->barg ? 0 : s_volume);
+            player_status_set_volume(c->barg ? 0 : s_volume);
+            return true;
+        case CMD_RESUME:
+            /* 服务器模式下开机不驱动本机播放（player_resume 那边也会直接跳过）*/
+            return true;
+        default:
+            /* 亮度/收藏/搜索等仍走本机逻辑 */
+            return false;
+    }
+}
+
+/* 切「播放设备」。这是唯一会停下来/接起来的操作，所以单独一个函数。 */
+static void handle_out_switch(int want)
+{
+    if (want < 0 || want >= PLAYER_OUT_COUNT) return;
+    if (want == s_out) return;
+
+    if (want == PLAYER_OUT_SERVER) {
+        player_status_t st;
+        player_status_get(&st);
+        int idx = (s_index >= 0) ? s_index : 0;
+        ESP_LOGW(TAG, "切到「服务器」播放：%s / %s / 第 %d 首 @%" PRIu32 " ms",
+                 player_back_name(s_back), player_mode_name(player_mode()),
+                 idx + 1, st.position_ms);
+        audio_engine_stop();                 /* 本机立刻停止出声 */
+        s_active = false;
+        s_out = PLAYER_OUT_SERVER;
+        settings_set_int_lazy("outdev", s_out);
+        player_remote_reset();
+        s_remote_gen = 0;
+        int back = (s_back == PLAYER_BACK_QQ) ? 1 : 0;
+        esp_err_t e = player_remote_play_mode(back, player_mode(), idx, 0);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "让服务器起播失败：%s", esp_err_to_name(e));
+        } else {
+            /* ⚠️ 随机的模式（刷歌/雷达/随机30首）两边各拉一次结果**必然不同**，
+             *    所以起播后对一下：不是同一首就强制让服务器放本机正在放的这首。
+             *    这样"切到服务器"听感上是接着放，而不是突然跳到别的歌。 */
+            remote_sync();
+            remote_status_t now;
+            player_remote_status(&now);
+            if (st.song_id[0] && strcmp(now.id, st.song_id) != 0) {
+                ESP_LOGW(TAG, "服务器队列跟本机不一致（随机模式）→ 强制放同一首 %s",
+                         st.song_id);
+                player_remote_play_id(back, st.song_id);
+            }
+            if (st.position_ms > 2000) player_remote_seek(st.position_ms);
+        }
+        remote_sync();
+    } else {
+        ESP_LOGW(TAG, "切回「本机」播放");
+        remote_status_t rs;
+        player_remote_status(&rs);           /* 先把服务器最后的状态记下来 */
+        player_remote_stop();                /* 服务器停止出声 */
+        player_remote_reset();
+        s_out = PLAYER_OUT_LOCAL;
+        settings_set_int_lazy("outdev", s_out);
+        s_remote_gen = 0;
+
+        /* 回到本机：把服务器正在放的那首/那个位置接着放（尽量无缝）*/
+        int back = rs.valid ? rs.back : (int)s_back;
+        s_back = (back == 1) ? PLAYER_BACK_QQ : PLAYER_BACK_NAV;
+        handle_set_back(back, false);        /* 重建本机队列（不自动播）*/
+        int idx = 0;
+        if (rs.valid && rs.id[0]) {
+            int n = player_queue_count();
+            for (int i = 0; i < n; i++) {
+                sub_song_t s;
+                if (player_queue_get(i, &s) && strcmp(s.id, rs.id) == 0) { idx = i; break; }
+            }
+        }
+        if (player_queue_count() > 0) {
+            s_active = true;
+            start_index_from(idx, rs.valid ? rs.pos_ms : 0);
+        }
+    }
+}
+
 /* ============================================================ 命令分发 */
 
 static void handle_cmd(const player_cmd_t *c)
 {
+    /* 「播放设备」的切换**两种模式下都要处理**，先单独拿出来 */
+    if (c->kind == CMD_OUT) {
+        handle_out_switch(c->iarg);
+        return;
+    }
+    /* 设备是"服务器"时：播放类命令转给服务器，亮度/收藏/搜索仍在本机做 */
+    if (s_out == PLAYER_OUT_SERVER && remote_handle_cmd(c)) return;
+
     switch (c->kind) {
+        case CMD_OUT:
+            break;                  /* 上面已处理（这里只为让编译器满意）*/
         case CMD_NEXT:
             s_active = true;
             next_or_wrap(+1);
@@ -1370,6 +1590,20 @@ static void player_task(void *arg)
         recent_save_tick();                 /* M6：最近播放落盘（变了 10 秒后写一次） */
         starred_save_tick();                /* M6：收藏镜像落盘 */
         pend_retry_tick();                  /* M6：离线攒下的收藏操作，每分钟补发一次 */
+
+        /* ★ 设备=服务器：本机不出声。每秒拉一次服务器的状态/队列镜像过来，
+         *   其余周期活儿（落盘/补发收藏）照常，然后**跳过本机引擎逻辑** ——
+         *   否则会去读一个已经停掉的 audio_engine 状态，凭空"下一首"。 */
+        if (s_out == PLAYER_OUT_SERVER) {
+            static int64_t last_sync;
+            int64_t now = esp_timer_get_time() / 1000;
+            if (now - last_sync >= 1000) {
+                last_sync = now;
+                remote_sync();
+            }
+            continue;
+        }
+
         resume_tick();                      /* M6：每 20 秒记一次续播位置 */
         if (!s_active) continue;
 
@@ -1533,6 +1767,13 @@ esp_err_t player_init(void)
     player_status_set_volume(s_volume);
     player_status_set_queue(-1, 0, player_mode_name(player_mode()), true);
 
+    /* 远程播放器（设备=服务器时用）：只建锁和 PSRAM 队列，不联网 */
+    player_remote_init();
+    if (s_out == PLAYER_OUT_SERVER) {
+        ESP_LOGW(TAG, "播放设备=服务器（NVS 恢复）：本机不出声，状态从 %s 镜像",
+                 qqmusic_host());
+    }
+
     xTaskCreatePinnedToCore(player_task, "player", PLAYER_TASK_STACK, NULL,
                             PLAYER_TASK_PRIO, NULL, PLAYER_TASK_CORE);
     ESP_LOGI(TAG, "就绪：队列 %d 首 / 最近 %d 条（都在 PSRAM），音量 %d%%，上次来源「%s · %s」",
@@ -1694,16 +1935,17 @@ void player_set_brightness(int pct)
 }
 
 /* ---------------- 播放设备（本机 / 服务器） ----------------
- * ⚠️ 只做到"记住选择"这一版：按键/状态还没切到服务器（远程控制是下一步）。
- *    先把这个选择落进 NVS，是因为菜单要显示它、而且切过去以后要能重启保留。 */
+ * 这里是"改状态 + 投命令"，真正的切换在 player 任务里做（见 handle_out_switch）：
+ * 停本机出声、让服务器接管 —— 这些会阻塞（HTTP），绝不能在调用方（UI 任务）里做。 */
 void player_set_out(player_out_t o)
 {
     if (o < 0 || o >= PLAYER_OUT_COUNT) return;
     if (s_out == (int)o) return;
-    s_out = (int)o;
-    settings_set_int_lazy("outdev", s_out);
-    ESP_LOGW(TAG, "播放设备 = %s（%s）", player_out_name(o),
-             o == PLAYER_OUT_SERVER ? "远程控制还没接入，这一版仍从本机出声" : "本机解码出声");
+    /* ⚠️ 这里**只投命令，不要先改 s_out** —— 真正的切换（停本机/让服务器接管）
+     *    在 player 任务里做（要发 HTTP，不能阻塞 UI）。以前这里先把 s_out 改了，
+     *    结果 handle_out_switch 一进去发现"已经等于目标"就直接返回，切换动作从来没执行过
+     *    （症状：s_out 变了、命令走了远程，但本机没停、服务器也没开始放）。 */
+    post(CMD_OUT, (int)o, false);
 }
 
 player_out_t player_out(void) { return (player_out_t)s_out; }
@@ -1781,7 +2023,15 @@ bool player_is_muted(void)   { return s_mute_target; }
 
 /* ============================================================ M6：续播 / 收藏镜像 */
 
-void player_resume(void) { post(CMD_RESUME, 0, false); }
+void player_resume(void)
+{
+    /* 设备=服务器时开机**不要**驱动本机播放：本机不出声，状态由 remote_sync 镜像 */
+    if (s_out == PLAYER_OUT_SERVER) {
+        ESP_LOGW(TAG, "开机续播跳过：播放设备=服务器，本机不出声");
+        return;
+    }
+    post(CMD_RESUME, 0, false);
+}
 
 void player_starred_refresh(bool force) { post(CMD_STAR_REFRESH, 0, force); }
 

@@ -563,8 +563,17 @@ static void play_refresh(void)
     ae_state_t aes = audio_engine_state();
     bool paused  = audio_engine_is_paused();
     bool playing = (aes == AE_STATE_PLAYING) && !paused;
-    /* 顺手把最新进度写回共享快照，供不依赖引擎的读者（M5 的网页）使用 */
-    player_status_set_progress(pos, playing, paused, aes == AE_STATE_FINISHED);
+    /* ★ 设备=服务器：本机引擎是停的，进度/状态在 player 任务从服务器镜像过来。
+     *   UI 这里**不能再写** player_status（否则 250ms 一次把镜像覆盖成"未播放、旧位置"，
+     *   症状就是"屏幕/网页上进度冻住、状态一直 IDLE" —— 2026-10-17 实测踩到）。 */
+    if (player_out() == PLAYER_OUT_SERVER) {
+        pos     = st.position_ms;
+        paused  = st.paused;
+        playing = st.playing && !st.paused;
+    } else {
+        /* 顺手把最新进度写回共享快照，供不依赖引擎的读者（M5 的网页）使用 */
+        player_status_set_progress(pos, playing, paused, aes == AE_STATE_FINISHED);
+    }
 
     bool force = s_play_refresh_all;
     s_play_refresh_all = false;
@@ -1261,11 +1270,15 @@ static void ui_tick_cb(lv_timer_t *t)
     if (s_page == UI_PAGE_PLAY) {
         play_refresh();
     } else {
-        /* 不在播放页时也要把进度写进快照（网页控制台要用） */
-        player_status_set_progress(audio_engine_position_ms(),
-                                   audio_engine_state() == AE_STATE_PLAYING,
-                                   audio_engine_is_paused(),
-                                   audio_engine_state() == AE_STATE_FINISHED);
+        /* 不在播放页时也要把进度写进快照（网页控制台要用）。
+         * ⚠️ 但"设备=服务器"时**不能写** —— 那时候进度是 player 任务从服务器镜像来的，
+         *    UI 拿本机（已停）引擎的值去写会把镜像覆盖掉。 */
+        if (player_out() != PLAYER_OUT_SERVER) {
+            player_status_set_progress(audio_engine_position_ms(),
+                                       audio_engine_state() == AE_STATE_PLAYING,
+                                       audio_engine_is_paused(),
+                                       audio_engine_state() == AE_STATE_FINISHED);
+        }
         ui_pages_tick();
     }
 }
