@@ -2888,121 +2888,47 @@ else init();
     });
   }
 
-  document.getElementById('lk-wifi').onclick = function(){
-    var ssid = document.getElementById('lk-ssid').value.trim();
-    var pass = document.getElementById('lk-pass').value;
-    if (!ssid){ put('先点「扫描附近 WiFi」选一个网络'); return; }
-    var btn = this;
-    btn.disabled = true;
-    pbar(5, '开始');
-    put('① 让 ESP 连上「' + ssid + '」…');
-    api2post('/api/wifi', {ssid: ssid, pass: pass})
-      .then(waitEspIp)
-      .then(function(espIp){
-        put('③ 通过数据线让服务器也连「' + ssid + '」…');
-        return apiRetry(function(){ return api2('/api/link/cmd?c=' + encodeURIComponent('WIFI ' + ssid + ' ' + pass)); }, 8, 2000, '③')
-          .then(waitServerIp);
-      })
-      .then(function(srvIp){
-        put('⑤ 校准服务器地址…');
-        return apiRetry(function(){ return api2('/api/link/adopt?ip=' + encodeURIComponent(srvIp)); }, 8, 2000, '⑤')
-          .then(function(d){ pbar(100, '完成'); put('✅ 配网完成：ESP 已上网，服务器 ' + srvIp +
-                                 '（QQ API ' + d.qq + ' / 音乐流 ' + d.nav + '）'); });
-      })
-      .catch(function(e){ pbar(0, '失败'); put('❌ ' + e.message); })
-      .then(function(){ btn.disabled = false; });
-  };
-
-  document.getElementById('lk-hot') && (document.getElementById('lk-hot').onclick = null);
-
-  document.getElementById('lk-adopt').onclick = function(){
-    if (!lastIp) { put('还没有服务器 IP：先点「给服务器配网」或「查链路」'); return; }
-    api2('/api/link/adopt?ip=' + encodeURIComponent(lastIp)).then(function(d){
-      put('已校准：QQ API ' + d.qq + ' ，音乐流 ' + d.nav);
-    }).catch(function(e){ put('校准失败：' + e.message); });
-  };
-
-  /* 扫描附近 WiFi：复用 ESP 自己的扫描接口（/api/wifi/scan 启动 + 轮询结果），
-   * 点一条就填进 SSID 框，用户只需要再输密码 —— 不用手打 SSID。 */
-  function renderList(items){
-    var el = document.getElementById('lk-list'), seen = {}, arr = [];
-    (items || []).slice().sort(function(a, b){ return (b.rssi || -999) - (a.rssi || -999); })
-      .forEach(function(it){ var k = it.ssid || ''; if (!k || seen[k]) return; seen[k] = 1; arr.push(it); });
-    arr = arr.slice(0, 30);
-    if (!arr.length){ el.innerHTML = '<div style="color:#999;padding:6px">没有扫描到网络</div>'; return; }
-    el.innerHTML = arr.map(function(it, i){
-      var lock = (it.auth && it.auth !== ' OPEN' && it.auth !== 'OPEN' && it.auth !== '开放') ? ' 🔒' : '';
-      return '<div data-i="' + i + '" style="padding:8px 6px;border-bottom:1px solid #F0EEE9;' +
-             'display:flex;justify-content:space-between"><span>' + (it.ssid || '') + '</span>' +
-             '<span style="color:#999">' + (it.rssi || 0) + ' dBm' + lock + '</span></div>';
-    }).join('');
-    el.onclick = function(ev){
-      var row = ev.target.closest ? ev.target.closest('[data-i]') : null;
-      if (!row) return;
-      var it = arr[Number(row.getAttribute('data-i'))];
-      if (!it) return;
-      document.getElementById('lk-ssid').value = it.ssid || '';
-      put('已选择「' + (it.ssid || '') + '」，输入密码后点「给服务器配网」');
-    };
-  }
-  document.getElementById('lk-scan').onclick = function(){
-    var el = document.getElementById('lk-list');
-    el.innerHTML = '<div style="color:#999;padding:6px">正在扫描…</div>';
-    put('正在扫描附近 WiFi，约 3 秒…');
-    api2('/api/wifi/scan').then(function(){
-      var tries = 0;
-      (function poll(){
-        if (tries++ > 25){ put('扫描超时，请重试'); return; }
-        setTimeout(function(){
-          api2('/api/wifi/scan/result').then(function(d){
-            if (d && d.scanning){ poll(); return; }
-            renderList((d && d.items) || []);
-            put('选一个网络，然后输密码');
-          }, function(){ poll(); });
-        }, 1000);
-      })();
-    }, function(e){ put('扫描失败：' + e.message); });
-  };
-  document.getElementById('lk-4g').onclick = function(){
-    put('已请求服务器切到 4G…');
-    api2('/api/link/cmd?c=' + encodeURIComponent('4G'))
-      .then(function(){ setTimeout(showLink, 1500); }, function(e){ put('发指令失败：' + e.message); });
-  };
-
-  /* ================= 一键配网（流程跑在**设备上**） =================
-   * 为什么改成这样：ESP 一连上新 WiFi，AP 会切信道、断 1~3 秒，网页 fetch 全断。
-   * 流程放在设备后台任务里跑，页面断了/刷新了都继续；页面只负责启动 + 看进度。
-   * 这里在文件末尾**重新绑定** onclick，覆盖前面那版"网页里跑流程"的实现。 */
-  function pollProvision(btn){
+  /* ★ 配网**只动服务器**（不再让 ESP 自己重连 WiFi）。
+   * 为什么改：ESP 一重连 WiFi 就会换 IP/掉 AP/页面断，配网流程和 ESP 自己的网络
+   * 搅在一起，越弄越乱。ESP 自己上网走设置页「WiFi 网络」；这里只把账号密码
+   * 通过串口交给服务器，并追踪服务器回执。 */
+  function waitSrvIp(btn){
     var n = 0;
     (function poll(){
-      api2('/api/link/provision/status').then(function(d){
-        pbar(d.pct, '');
-        put(d.msg || '');
-        if (d.running){ setTimeout(poll, 1500); return; }
-        if (d.pct >= 100) put('✅ ' + (d.msg || '配网完成'));
-        else if (d.msg) put('❌ ' + d.msg);
-        if (btn) btn.disabled = false;
-      }, function(){
-        if (n++ > 40){ if (btn) btn.disabled = false; put('⚠ 与 ESP 失联太久；重连热点并刷新本页，进度会自动接上'); return; }
-        put('等待 ESP 重连（AP 切信道中）… ' + (n * 2) + 's');
+      api2('/api/link').then(function(d){
+        var r = d.last_reply || '';
+        var m = /ip=(\d+\.\d+\.\d+\.\d+)/.exec(r);
+        if (m){
+          pbar(85, '服务器已连上');
+          put('④ 服务器已连上，IP=' + m[1] + '，正在校准地址…');
+          apiRetry(function(){ return api2('/api/link/adopt?ip=' + encodeURIComponent(m[1])); }, 8, 2000, '⑤')
+            .then(function(a){ pbar(100, '完成'); put('✅ 配网完成：服务器 ' + m[1] +
+              '（QQ API ' + a.qq + ' / 音乐流 ' + a.nav + '）'); if (btn) btn.disabled = false; })
+            .catch(function(e){ pbar(0, '校准失败'); put('❌ ' + e.message); if (btn) btn.disabled = false; });
+          return;
+        }
+        if (r.indexOf('ERR') === 0){ pbar(0, '失败'); put('❌ ' + r); if (btn) btn.disabled = false; return; }
+        if (n++ > 60){ pbar(0, '超时'); put('❌ 服务器 120 秒没回 IP（确认服务器开机、数据线插好）'); if (btn) btn.disabled = false; return; }
+        pbar(55, '服务器配网中 ' + (n * 2) + 's');
+        put('③ 服务器连接中… ' + (n * 2) + 's' + (r ? ('  回执: ' + r.slice(0, 60)) : ''));
         setTimeout(poll, 2000);
-      });
+      }, function(){ setTimeout(poll, 2000); });
     })();
   }
+
   document.getElementById('lk-wifi').onclick = function(){
     var ssid = document.getElementById('lk-ssid').value.trim();
     var pass = document.getElementById('lk-pass').value;
     if (!ssid){ put('先点「扫描附近 WiFi」选一个网络'); return; }
     var btn = this;
     btn.disabled = true;
-    pbar(2, '启动');
-    put('正在启动设备端配网任务…');
+    pbar(10, '发送');
+    put('正在通过数据线把「' + ssid + '」交给服务器…');
     apiRetry(function(){
-      return api2('/api/link/provision?ssid=' + encodeURIComponent(ssid) + '&pass=' + encodeURIComponent(pass));
-    }, 10, 2000, '①').then(function(){
-      pollProvision(btn);
-    }).catch(function(e){ pbar(0, '启动失败'); put('❌ ' + e.message); btn.disabled = false; });
+      return api2('/api/link/cmd?c=' + encodeURIComponent('WIFI ' + ssid + ' ' + pass));
+    }, 10, 2000, '②').then(function(){
+      waitSrvIp(btn);
+    }).catch(function(e){ pbar(0, '发送失败'); put('❌ ' + e.message); btn.disabled = false; });
   };
   /* 刷新/重进页面时：设备上任务还在跑就自动接上进度 */
   setTimeout(function(){
