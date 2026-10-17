@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -2779,14 +2779,14 @@ else init();
   box.innerHTML =
     '<div style="font-weight:600;margin-bottom:8px">有线联动（无网配网）</div>' +
     '<div style="font-size:12px;color:#6E6E73;margin-bottom:10px">' +
-      '板子插在服务器上时，可以用这条线让服务器也连上同一个 WiFi。</div>' +
+      '没网时：先让 ESP 连上 WiFi，再通过这条线让服务器也连同一个网络，最后自动校准服务器地址。</div>' +
     '<input id="lk-ssid" placeholder="WiFi 名称（可点下面「扫描附近」选）" autocapitalize="off" autocorrect="off" spellcheck="false" ' +
       'style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:6px;border:1px solid #DDD;border-radius:8px">' +
     '<input id="lk-pass" placeholder="WiFi 密码" type="password" ' +
       'style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:8px;border:1px solid #DDD;border-radius:8px">' +
     '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">' +
       '<button id="lk-scan" style="padding:8px 12px;border-radius:8px;background:#F1EFEB;color:#333;font-weight:600">扫描附近 WiFi</button>' +
-      '<button id="lk-wifi" style="padding:8px 12px;border-radius:8px;background:#1A73E8;color:#fff;font-weight:600">给服务器配网</button>' +
+      '<button id="lk-wifi" style="padding:8px 12px;border-radius:8px;background:#1A73E8;color:#fff;font-weight:600">一键配网（ESP + 服务器）</button>' +
       '<button id="lk-4g" style="padding:8px 12px;border-radius:8px;background:#E8F0FE;color:#1A73E8;font-weight:600">使用 4G 网</button>' +
       '<button id="lk-stat" style="padding:8px 12px;border-radius:8px;background:#F1EFEB;color:#333">查链路</button>' +
       '<button id="lk-adopt" style="padding:8px 12px;border-radius:8px;background:#E8F0FE;color:#1A73E8;font-weight:600">校准服务器地址</button>' +
@@ -2811,14 +2811,75 @@ else init();
 
   document.getElementById('lk-stat').onclick = showLink;
 
+  /* ---------- 一键配网：ESP 先连 → 再让服务器连同一网络 → 自动校准 ----------
+   * 为什么是这个顺序：没网的时候两个设备都是断的。必须先让板子自己上网，
+   * 确认拿到 IP（说明密码对、信号够），再把同一套账号密码通过数据线给服务器；
+   * 服务器 nmcli 连 WiFi 可能要几十秒到两分钟，所以进度要一直追、不能只查两次。 */
+  function api2post(p, body){
+    return fetch(p, {method:'POST', cache:'no-store',
+                     headers:{'Content-Type':'application/json'},
+                     body: JSON.stringify(body || {})}).then(function(r){
+      return r.text().then(function(t){
+        var d = null; try { d = JSON.parse(t); } catch(e){}
+        if (!r.ok) throw new Error((d && (d.error || d.detail)) || ('HTTP ' + r.status));
+        return d;
+      });
+    });
+  }
+  function waitEspIp(){
+    return new Promise(function(resolve, reject){
+      var n = 0;
+      (function poll(){
+        if (n++ > 30){ reject(new Error('ESP 30 秒内没连上（密码错？信号弱？）')); return; }
+        setTimeout(function(){
+          api2('/api/wifi').then(function(w){
+            if (w && w.ip){ put('② ESP 已连上，IP=' + w.ip); resolve(w.ip); }
+            else { put('① ESP 正在连接 WiFi… ' + (n * 2) + 's'); poll(); }
+          }, poll);
+        }, 1000);
+      })();
+    });
+  }
+  function waitServerIp(){
+    return new Promise(function(resolve, reject){
+      var n = 0;
+      (function poll(){
+        if (n++ > 60){ reject(new Error('120 秒没拿到服务器 IP（点「查链路」看回执）')); return; }
+        setTimeout(function(){
+          api2('/api/link').then(function(d){
+            var m = /ip=(\d+\.\d+\.\d+\.\d+)/.exec(d.last_reply || '');
+            if (m){ put('④ 服务器已连上，IP=' + m[1]); resolve(m[1]); return; }
+            var tail = (d.last_reply || '').slice(0, 70);
+            put('③ 正在给服务器配网… ' + (n * 2) + 's' + (tail ? ('  回执: ' + tail) : ''));
+            poll();
+          }, poll);
+        }, 2000);
+      })();
+    });
+  }
+
   document.getElementById('lk-wifi').onclick = function(){
     var ssid = document.getElementById('lk-ssid').value.trim();
     var pass = document.getElementById('lk-pass').value;
-    if (!ssid) { put('先填 WiFi 名称'); return; }
-    put('正在让服务器连「' + ssid + '」…');
-    api2('/api/link/cmd?c=' + encodeURIComponent('WIFI ' + ssid + ' ' + pass))
-      .then(function(){ setTimeout(showLink, 1200); setTimeout(showLink, 9000); },
-            function(e){ put('发指令失败：' + e.message); });
+    if (!ssid){ put('先点「扫描附近 WiFi」选一个网络'); return; }
+    var btn = this;
+    btn.disabled = true;
+    put('① 让 ESP 连上「' + ssid + '」…');
+    api2post('/api/wifi', {ssid: ssid, pass: pass})
+      .then(waitEspIp)
+      .then(function(espIp){
+        put('③ 通过数据线让服务器也连「' + ssid + '」…');
+        return api2('/api/link/cmd?c=' + encodeURIComponent('WIFI ' + ssid + ' ' + pass))
+          .then(waitServerIp);
+      })
+      .then(function(srvIp){
+        put('⑤ 校准服务器地址…');
+        return api2('/api/link/adopt?ip=' + encodeURIComponent(srvIp))
+          .then(function(d){ put('✅ 配网完成：ESP 已上网，服务器 ' + srvIp +
+                                 '（QQ API ' + d.qq + ' / 音乐流 ' + d.nav + '）'); });
+      })
+      .catch(function(e){ put('❌ ' + e.message); })
+      .then(function(){ btn.disabled = false; });
   };
 
   document.getElementById('lk-hot') && (document.getElementById('lk-hot').onclick = null);
