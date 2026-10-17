@@ -2838,6 +2838,23 @@ else init();
       });
     });
   }
+  /* ★ ESP 一加入新 WiFi，AP 会切到同一个信道，手机和 AP 的连接会瞬断 1~3 秒。
+   *   这时页面发的 fetch 会直接 "Failed to fetch" —— 不能当成失败，必须重试。
+   *   （实测：ESP 连上了，但下一条 /api/link/cmd 正好撞在瞬断窗口里，整条链就断了。） */
+  function apiRetry(fn, tries, gap, label){
+    tries = tries || 8; gap = gap || 2000;
+    return new Promise(function(resolve, reject){
+      var n = 0;
+      (function attempt(){
+        fn().then(resolve, function(e){
+          if (n++ >= tries){ reject(e); return; }
+          put((label || '') + ' 与 ESP 的连接断了一下（正在切 WiFi 信道），重试 ' + n + '/' + tries + '…');
+          setTimeout(attempt, gap);
+        });
+      })();
+    });
+  }
+
   function waitEspIp(){
     return new Promise(function(resolve, reject){
       var n = 0;
@@ -2846,7 +2863,7 @@ else init();
         setTimeout(function(){
           api2('/api/wifi').then(function(w){
             if (w && w.ip){ pbar(40, 'ESP 已连上'); put('② ESP 已连上，IP=' + w.ip); resolve(w.ip); }
-            else { pbar(15, 'ESP 连接中'); put('① ESP 正在连接 WiFi… ' + (n * 2) + 's'); poll(); }
+            else { pbar(15, 'ESP 连接中'); put('① ESP 正在连接 WiFi… ' + (n * 2) + 's（连接会瞬断，属正常）'); poll(); }
           }, poll);
         }, 1000);
       })();
@@ -2883,12 +2900,12 @@ else init();
       .then(waitEspIp)
       .then(function(espIp){
         put('③ 通过数据线让服务器也连「' + ssid + '」…');
-        return api2('/api/link/cmd?c=' + encodeURIComponent('WIFI ' + ssid + ' ' + pass))
+        return apiRetry(function(){ return api2('/api/link/cmd?c=' + encodeURIComponent('WIFI ' + ssid + ' ' + pass)); }, 8, 2000, '③')
           .then(waitServerIp);
       })
       .then(function(srvIp){
         put('⑤ 校准服务器地址…');
-        return api2('/api/link/adopt?ip=' + encodeURIComponent(srvIp))
+        return apiRetry(function(){ return api2('/api/link/adopt?ip=' + encodeURIComponent(srvIp)); }, 8, 2000, '⑤')
           .then(function(d){ pbar(100, '完成'); put('✅ 配网完成：ESP 已上网，服务器 ' + srvIp +
                                  '（QQ API ' + d.qq + ' / 音乐流 ' + d.nav + '）'); });
       })
