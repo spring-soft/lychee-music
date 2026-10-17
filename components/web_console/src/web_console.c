@@ -25,6 +25,7 @@
 #include "cJSON.h"
 #include "assets.h"
 #include "usblink.h"
+#include "player_remote.h"
 #include "app_core.h"
 #include "audio_engine.h"
 #include "player.h"
@@ -283,6 +284,15 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(o, "state", state);
     cJSON_AddNumberToObject(o, "pos_ms", remote ? st.position_ms : audio_engine_position_ms());
     cJSON_AddNumberToObject(o, "dur_ms", st.duration_ms);
+    /* ★ 服务器模式：把服务器那边镜像过来的错误也带上。
+     *   典型：USB DAC 被拔掉时服务器回 "USB DAC 已拔出（插上会自动继续）"，
+     *   不带上网页只能显示"暂停"，用户会以为播放器坏了。 */
+    if (remote) {
+        remote_status_t rs;
+        player_remote_status(&rs);
+        cJSON_AddBoolToObject(o, "srv_online", rs.valid);
+        cJSON_AddStringToObject(o, "srv_error", rs.err);
+    }
     /* ⚠️ 暂停时引擎状态仍是 PLAYING（暂停是独立标志），所以 playing 要额外排除暂停。
      *    否则网页会显示"播放中"却不走时间。前端自己也算了一层 && !paused 做兜底，
      *    但契约本身该是对的。 */

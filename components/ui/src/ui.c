@@ -1,4 +1,4 @@
-/*
+﻿/*
  * UI 核心：显示初始化 + 页面注册/切换 + 播放页 + 启动页 + 封面异步加载
  *
  * 三条"避免整屏重绘"的铁律（性能全靠它们）：
@@ -690,18 +690,26 @@ static void play_refresh(void)
         last_bytes = bytes;
         last_ms = now;
 
-        /* 上行：只有模式（用户要求：把速率挪到下一行，缓存那行删掉）*/
-        ui_set_text(s_lbl_mode, raw ? "直出" : "转码");
+        /* ★ 服务器模式（out=1）：本机不出声、解码在网络那头的服务器上，
+         *   根本没有"直出/转码"和"网络速率"这回事 —— 用户要求这种时候
+         *   直接显示「服务器播放」，别再显示转码/速度。
+         *   本地模式（out=0）保持原样：上行直出/转码，下行拉流速率。 */
+        bool remote = (player_out() == PLAYER_OUT_SERVER);
+        ui_set_text(s_lbl_mode, remote ? "服务器播放" : (raw ? "直出" : "转码"));
         lv_obj_set_style_text_color(s_lbl_mode,
-                                    lv_color_hex(raw ? 0x1B7F3B : 0xC77700), 0);
+                                    lv_color_hex(remote ? 0x1A73E8 : (raw ? 0x1B7F3B : 0xC77700)), 0);
 
         /* 下行：网络拉流速率。
          * ⚠️ 单位写死 "/s" —— 之前只写 "80K"，用户完全看不出这是"速度"还是"用量"，
          *    以为是缓存被用掉了 80K。速率是这一屏唯一一直在动的数，
          *    它跟着歌的码率走（1623kbps 的歌显示 206K/s，555kbps 的显示 80K/s）。*/
         char nbuf[20];
-        snprintf(nbuf, sizeof(nbuf), "%uK/s", (unsigned)kbs);
-        ui_set_text(s_lbl_net, nbuf);
+        if (remote) {
+            ui_set_text(s_lbl_net, "");      /* 服务器播放：不显示本机网络速率 */
+        } else {
+            snprintf(nbuf, sizeof(nbuf), "%uK/s", (unsigned)kbs);
+            ui_set_text(s_lbl_net, nbuf);
+        }
     }
 
     /* 收藏状态（长按 K1 之后要立刻反映） */

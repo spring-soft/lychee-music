@@ -2941,6 +2941,37 @@ else init();
     }, function(){});
   }, 2500);
 
+  /* 服务器模式下的异常提示（典型：服务器 USB DAC 未连接）。
+     页面状态通过 render* 系列函数刷新，这里包一层，拿到 status 就同步横幅。 */
+  (function(){
+    var bn = document.createElement('div');
+    bn.id = 'srvbanner';
+    bn.style.cssText = 'display:none;margin:8px 12px;padding:10px 12px;border-radius:10px;' +
+      'background:#FBE9E7;color:#B3261E;font-size:13px;font-weight:600;line-height:1.45';
+    var host = (document.getElementById('hdr-sub') || {}).parentNode || document.body;
+    host.appendChild(bn);
+    function upd(st){
+      if (!st || st.out !== 1){ bn.style.display = 'none'; return; }
+      var e = st.srv_error || '';
+      if (e){ bn.style.display = ''; bn.textContent = '服务器：' + e; }
+      else bn.style.display = 'none';
+    }
+    ['renderStatus','paintStatus','renderPlay','render'].forEach(function(n){
+      var f = window[n];
+      if (typeof f === 'function' && !f.__srvwrapped){
+        window[n] = function(){
+          var r = f.apply(null, arguments);
+          try { for (var i = 0; i < arguments.length; i++){
+            var a = arguments[i];
+            if (a && typeof a === 'object' && a.state && ('out' in a || 'srv_error' in a)){ upd(a); break; }
+          } } catch(e){}
+          return r;
+        };
+        window[n].__srvwrapped = true;
+      }
+    });
+  })();
+
   setTimeout(showLink, 1500);
 })();
 </script>
