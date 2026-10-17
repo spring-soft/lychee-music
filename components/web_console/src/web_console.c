@@ -1207,6 +1207,17 @@ static esp_err_t h_crash(httpd_req_t *req);
  */
 static esp_err_t dl_forward(const char *path, char *out, size_t cap, size_t *len)
 {
+    /* ⚠️ 这个函数是**同步阻塞**的：它在 httpd 任务里发 HTTP，等服务器回包。
+     *    设备只有一个 httpd 任务 —— 卡在这里的时候，网页所有别的请求
+     *    （状态轮询、切歌、点列表）全部排队 = "点什么都没反应"。
+     *    所以：① 超时压到 6 秒；② 失败后退避 20 秒，期间直接返回，不再去连。
+     *    （真踩过：服务器不在时每 3.5 秒一次 25 秒超时，整个控制台像死了一样。） */
+    static int64_t s_down_until = 0;
+    int64_t now = esp_timer_get_time();
+    if (s_down_until != 0 && now < s_down_until) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     char host[160];
     strlcpy(host, qqmusic_host(), sizeof(host));
     size_t hl = strlen(host);
@@ -1216,7 +1227,7 @@ static esp_err_t dl_forward(const char *path, char *out, size_t cap, size_t *len
 
     esp_http_client_config_t cfg = {
         .url = url,
-        .timeout_ms = 25000,        /* 服务器要现取直链再入队，给宽一点 */
+        .timeout_ms = 6000,         /* 服务器本机响应，6 秒足够；别拖垮 httpd */
         .buffer_size = 512,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
@@ -1224,6 +1235,7 @@ static esp_err_t dl_forward(const char *path, char *out, size_t cap, size_t *len
     esp_err_t err = esp_http_client_open(cli, 0);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "下载转发连不上: %s（%s）", url, esp_err_to_name(err));
+        s_down_until = now + 20LL * 1000 * 1000;
         esp_http_client_cleanup(cli);
         return err;
     }
@@ -1241,8 +1253,10 @@ static esp_err_t dl_forward(const char *path, char *out, size_t cap, size_t *len
     if (len) *len = used;
     if (status != 200) {
         ESP_LOGW(TAG, "下载转发失败: %s → HTTP %d", url, status);
+        s_down_until = now + 20LL * 1000 * 1000;
         return ESP_FAIL;
     }
+    s_down_until = 0;
     return ESP_OK;
 }
 

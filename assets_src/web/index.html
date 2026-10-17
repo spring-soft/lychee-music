@@ -2569,19 +2569,21 @@ else init();
       var old = r.querySelector('.rdl2, .ck2');
       if (old) old.parentNode.removeChild(old);
       var cell;
-      if (DL.on){
+      if ((it.back | 0) !== 1){
+        /* ★ 来源是 Navidrome 的歌：它本来就在曲库里，**不给任何下载控件**
+         *   （批量模式下也一样，以前这里漏了会给 Nav 的行也加勾选框）。 */
+        cell = document.createElement('span');
+      } else if (DL.on){
         cell = document.createElement('input');
         cell.type = 'checkbox'; cell.className = 'ck2';
         cell.setAttribute('data-id', it.id || '');
         if (DL.sel[it.id]) cell.checked = true;
-      } else if ((it.back | 0) === 1){
+      } else {
         cell = document.createElement('span');
         cell.className = 'rdl2' + (DL.done[it.id] ? ' done' : '');
         cell.textContent = DL.done[it.id] ? '✓' : '⬇';
         cell.title = '下载到服务器曲库';
         cell.setAttribute('data-id', it.id || '');
-      } else {
-        cell = document.createElement('span');
       }
       r.appendChild(cell);
     }
@@ -2604,6 +2606,7 @@ else init();
       var j = (d && d.job) || {};
       stat('已提交：' + (j.title || id) + (j.quality_name ? '（' + j.quality_name + '）' : ''));
       fill();
+      pollStat(true);              /* 只在这时短时查进度，别做常驻轮询 */
     }).catch(function(e){
       stat('下载失败：' + e.message);
     });
@@ -2673,11 +2676,21 @@ else init();
     }
   }, true);
 
-  /* 列表标题旁加「批量下载」入口 + 一行下载状态 */
+  /* 列表标题旁加「批量下载」入口 + 一行下载状态。
+   * ★ 当前列表里一首 QQ 歌都没有（比如来源就是 Navidrome）→ 连入口都不显示。 */
   function ensureHdr(){
     var cnt = document.getElementById('list-count');
     if (!cnt || !cnt.parentNode) return;
-    if (!document.getElementById('dlbatch2') && !DL.on){
+    var arr = items();
+    var hasQQ = false;
+    for (var i = 0; i < arr.length; i++){
+      if ((arr[i].back | 0) === 1){ hasQQ = true; break; }
+    }
+    if (!hasQQ && DL.on) exitBatch();
+    if (!hasQQ){
+      var old = document.getElementById('dlbatch2');
+      if (old && old.parentNode) old.parentNode.removeChild(old);
+    } else if (!document.getElementById('dlbatch2') && !DL.on){
       var b = document.createElement('button');
       b.className = 'dlbtn2'; b.id = 'dlbatch2'; b.textContent = '批量下载';
       b.onclick = function(){
@@ -2693,17 +2706,44 @@ else init();
     }
   }
 
-  setInterval(function(){
-    ensureHdr();
-    if (typeof page_current === 'function' && page_current() === 'list'){
-      if (!document.getElementById('dlstat2')) ensureHdr();
-    }
-    /* 下载进度（服务器一句话概况） */
-    jget('/api/dl/stat').then(function(d){
-      if (d && d.text) stat(d.text);
-      else if (d && !d.busy && !d.done) stat('');
-    }).catch(function(){});
-  }, 3500);
+  /* ⚠️ 这里**绝不**做后台定时轮询！
+   *   固件的 /api/dl/stat 是"同步转发到服务器"的实现，它会**独占设备那个唯一的 HTTP 服务**
+   *   直到服务器回包（服务器慢的时候能卡好几秒）。以前每 3.5 秒轮询一次，
+   *   结果整个控制台"点什么都没反应"（切歌、点列表全堵住）。
+   *   现在只在**点过下载之后**短时查几下进度，其余时间一个请求都不发。 */
+  var statTimer = null;
+  function pollStat(burst){
+    if (statTimer) clearInterval(statTimer);
+    if (!burst) return;
+    var n = 0;
+    statTimer = setInterval(function(){
+      if (++n > 4){ clearInterval(statTimer); statTimer = null; return; }
+      jget('/api/dl/stat').then(function(d){
+        if (d && d.text) stat(d.text);
+        if (d && !d.busy && n >= 2){ clearInterval(statTimer); statTimer = null; }
+      }).catch(function(){ clearInterval(statTimer); statTimer = null; });
+    }, 2500);
+  }
+
+  // 只在列表渲染后补一下表头按钮（纯 DOM，不发请求）
+  var _fill0 = fill;
+  fill = function(){
+    _fill0();
+    try { ensureHdr(); } catch(e){}
+  };
+
+  /* 列表滚到底 → 自动"加载更多"。
+   * 页面本来就有「加载更多」按钮（L.shown += PAGE，向设备要下一批），
+   * 这里只是把它自动化，不另造一套分页逻辑。设备队列现在能装 200 首。 */
+  (function(){
+    var el = document.getElementById('list');
+    if (!el) return;
+    el.addEventListener('scroll', function(){
+      if (el.scrollTop + el.clientHeight < el.scrollHeight - 80) return;
+      var b = el.querySelector('[data-more]');
+      if (b) b.click();
+    });
+  })();
 
   /* 页面切到列表时 DOM 会重建，补一次 */
   if (document.readyState === 'loading')

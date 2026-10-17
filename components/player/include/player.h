@@ -23,7 +23,10 @@
 extern "C" {
 #endif
 
-#define PLAYER_QUEUE_MAX   64   /* 队列最多几首（sub_song_t 约 370B → 24KB PSRAM） */
+#define PLAYER_QUEUE_MAX   200  /* 队列最多几首（sub_song_t 约 370B → 74KB PSRAM）
+                                 * 为什么从 64 提到 200：网页控制台的列表是"设备队列"，
+                                 * 64 首滚两下就到底了；QQ 收藏已经 64 首，歌单动辄几百首。
+                                 * 拉列表时会按 100 一页翻页取（服务端单页上限 100）。 */
 #define PLAYER_RECENT_MAX  50   /* 最近播放环形缓冲（M6 起落盘到 cache 分区） */
 /* 收藏的本地镜像上限。刻意跟 subsonic 的 SUB_SONGS_MAX 对齐 —— getStarred2
  * 本来就只取 64 条，本地留更多也没意义。（M6 前 /api/starred 每次现拉，

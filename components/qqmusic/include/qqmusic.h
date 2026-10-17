@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define QQ_SONGS_MAX   64           /* 单次最多取多少首（与 SUB_SONGS_MAX 对齐） */
+#define QQ_SONGS_MAX   100          /* 单次最多取多少首（服务端 /v1/list 单页上限 100） */
 #define QQ_HOST_MAX    160
 #define QQ_MODE_MAX    8
 

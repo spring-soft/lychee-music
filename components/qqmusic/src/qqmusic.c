@@ -425,24 +425,52 @@ esp_err_t qqmusic_list(qq_mode_t mode, sub_song_t *out, int max, int *got)
     *got = 0;
     if (!qqmusic_configured()) return ESP_ERR_INVALID_STATE;
     if (mode >= QQ_MODE_COUNT) return ESP_ERR_INVALID_ARG;
-    if (max > QQ_SONGS_MAX) max = QQ_SONGS_MAX;
+    if (max > QQ_SONGS_MAX * 2) max = QQ_SONGS_MAX * 2;   /* 最多翻两页（200 首） */
 
-    char url[256];
-    snprintf(url, sizeof(url), "%s/v1/list?mode=%s&limit=%d",
-             s_host, qq_mode_slug(mode), max);
+    /* ★ 服务端 /v1/list 支持 page（单页上限 100），设备队列现在能装 200 首，
+     *   所以这里**翻页取够**：一页 100，最多两页。
+     *   为什么要翻页：网页控制台的列表就是设备队列，64 首滚两下就到底了；
+     *   收藏已经 64 首，歌单动辄几百首。（页面上"滚到底自动加载更多"依赖这个。） */
+    int total = 0, page = 1;
+    const int PAGE_MAX = 100;
+    esp_err_t err = ESP_OK;
+    while (total < max && page <= 2) {
+        int want = max - total;
+        if (want > PAGE_MAX) want = PAGE_MAX;
 
-    char *body = NULL;
-    esp_err_t err = http_req(HTTP_METHOD_GET, url, &body, NULL, NULL, 20000);   /* 雷达/刷歌上游偶发慢 */
-    if (err != ESP_OK) return err;
-    cJSON *root = cJSON_Parse(body);
-    heap_caps_free(body);
-    if (!root) return ESP_ERR_INVALID_RESPONSE;
-    err = parse_items(root, out, max, got);
-    cJSON_Delete(root);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "模式「%s」拉到 %d 首", qq_mode_name(mode), *got);
+        char url[256];
+        snprintf(url, sizeof(url), "%s/v1/list?mode=%s&limit=%d&page=%d",
+                 s_host, qq_mode_slug(mode), want, page);
+
+        char *body = NULL;
+        /* 雷达/刷歌上游偶发慢，给 20 秒 */
+        esp_err_t e = http_req(HTTP_METHOD_GET, url, &body, NULL, NULL, 20000);
+        if (e != ESP_OK) {
+            if (total > 0) break;          /* 第一页拿到了就先用手上的 */
+            return e;
+        }
+        cJSON *root = cJSON_Parse(body);
+        heap_caps_free(body);
+        if (!root) {
+            if (total > 0) break;
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        int n = 0;
+        e = parse_items(root, out + total, max - total, &n);
+        cJSON_Delete(root);
+        if (e != ESP_OK) {
+            if (total > 0) break;
+            return e;
+        }
+        total += n;
+        if (n < want) break;               /* 这一页不满 = 没有更多了 */
+        page++;
     }
-    return err;
+    *got = total;
+    if (total > 0) {
+        ESP_LOGI(TAG, "模式「%s」拉到 %d 首（%d 页）", qq_mode_name(mode), total, page);
+    }
+    return total > 0 ? ESP_OK : err;
 }
 
 esp_err_t qqmusic_search(const char *query, sub_song_t *out, int max, int *got)
