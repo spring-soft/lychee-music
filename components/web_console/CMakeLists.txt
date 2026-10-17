@@ -1,4 +1,4 @@
-idf_component_register(
+﻿idf_component_register(
     SRCS
         "src/web_console.c"
         # ★ 网页（gzip）的字节数组，由 tools/gen_assets.py 生成。
@@ -27,4 +27,5 @@ idf_component_register(
         json
         esp_timer
         esp_hw_support
+        usblink
 )

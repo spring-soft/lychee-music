@@ -2751,5 +2751,90 @@ else init();
   else setTimeout(ensureHdr, 800);
 })();
 </script>
+<script>
+/* ============================================================
+   有线联动（无网配网）
+   ------------------------------------------------------------
+   场景：没有可用 WiFi 时，板子和服务器互相够不着 —— 只有那根 USB 数据线
+   （烧录口）还通着。流程：
+     1) 板子开热点（本页"热点"开关），手机连上访问本页
+     2) 在下面填 WiFi 账号密码 → 「给服务器配网」→ 板子通过串口让服务器连同一个 WiFi
+     3) 服务器回到 IP 后 → 「校准服务器地址」→ QQ API / 音乐流地址都改成这个 IP
+   后端接口：/api/link（状态）、/api/link/cmd?c=…（发指令）、/api/link/adopt?ip=…
+   ============================================================ */
+(function(){
+  function api2(p){
+    return fetch(p, {cache:'no-store'}).then(function(r){
+      return r.text().then(function(t){
+        var d = null; try { d = JSON.parse(t); } catch(e){}
+        if (!r.ok) throw new Error((d && (d.error || d.detail)) || ('HTTP ' + r.status));
+        return d;
+      });
+    });
+  }
+  var box = document.createElement('div');
+  box.id = 'linkbox';
+  box.style.cssText = 'margin:16px 12px;padding:14px;border:1px solid #E5E3DE;border-radius:12px;' +
+    'background:#fff;font-size:14px;line-height:1.5';
+  box.innerHTML =
+    '<div style="font-weight:600;margin-bottom:8px">有线联动（无网配网）</div>' +
+    '<div style="font-size:12px;color:#6E6E73;margin-bottom:10px">' +
+      '板子插在服务器上时，可以用这条线让服务器也连上同一个 WiFi。</div>' +
+    '<input id="lk-ssid" placeholder="WiFi 名称" autocapitalize="off" autocorrect="off" spellcheck="false" ' +
+      'style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:6px;border:1px solid #DDD;border-radius:8px">' +
+    '<input id="lk-pass" placeholder="WiFi 密码" type="password" ' +
+      'style="width:100%;box-sizing:border-box;padding:8px;margin-bottom:8px;border:1px solid #DDD;border-radius:8px">' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<button id="lk-wifi" style="padding:8px 12px;border-radius:8px;background:#1A73E8;color:#fff;font-weight:600">给服务器配网</button>' +
+      '<button id="lk-hot" style="padding:8px 12px;border-radius:8px;background:#E8F0FE;color:#1A73E8;font-weight:600">让服务器开热点</button>' +
+      '<button id="lk-stat" style="padding:8px 12px;border-radius:8px;background:#F1EFEB;color:#333">查链路</button>' +
+      '<button id="lk-adopt" style="padding:8px 12px;border-radius:8px;background:#E8F0FE;color:#1A73E8;font-weight:600">校准服务器地址</button>' +
+    '</div>' +
+    '<div id="lk-msg" style="font-size:12px;color:#6E6E73;margin-top:8px;min-height:16px"></div>';
+  function put(t){ var e = document.getElementById('lk-msg'); if (e) e.textContent = t || ''; }
+  document.body.appendChild(box);
+
+  var lastIp = '';
+
+  function showLink(){
+    api2('/api/link').then(function(d){
+      var s = '链路:' + (d.ready ? '就绪' : '未就绪') + '  收' + d.rx + '/发' + d.tx + ' 行';
+      if (d.last_cmd) s += '\n上次发: ' + d.last_cmd;
+      if (d.last_reply) s += '\n服务器回: ' + d.last_reply;
+      var m = /ip=(\d+\.\d+\.\d+\.\d+)/.exec(d.last_reply || '');
+      if (m) lastIp = m[1];
+      put(s);
+    }).catch(function(e){ put('读链路失败：' + e.message); });
+  }
+
+  document.getElementById('lk-stat').onclick = showLink;
+
+  document.getElementById('lk-wifi').onclick = function(){
+    var ssid = document.getElementById('lk-ssid').value.trim();
+    var pass = document.getElementById('lk-pass').value;
+    if (!ssid) { put('先填 WiFi 名称'); return; }
+    put('正在让服务器连「' + ssid + '」…');
+    api2('/api/link/cmd?c=' + encodeURIComponent('WIFI ' + ssid + ' ' + pass))
+      .then(function(){ setTimeout(showLink, 1200); setTimeout(showLink, 9000); },
+            function(e){ put('发指令失败：' + e.message); });
+  };
+
+  document.getElementById('lk-hot').onclick = function(){
+    put('已请求服务器开热点…');
+    api2('/api/link/cmd?c=' + encodeURIComponent('HOTSPOT'))
+      .then(function(){ setTimeout(showLink, 1500); },
+            function(e){ put('发指令失败：' + e.message); });
+  };
+
+  document.getElementById('lk-adopt').onclick = function(){
+    if (!lastIp) { put('还没有服务器 IP：先点「给服务器配网」或「查链路」'); return; }
+    api2('/api/link/adopt?ip=' + encodeURIComponent(lastIp)).then(function(d){
+      put('已校准：QQ API ' + d.qq + ' ，音乐流 ' + d.nav);
+    }).catch(function(e){ put('校准失败：' + e.message); });
+  };
+
+  setTimeout(showLink, 1500);
+})();
+</script>
 </body>
 </html>

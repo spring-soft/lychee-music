@@ -1,4 +1,4 @@
-/*
+﻿/*
  * 网页控制台 —— REST API 实现
  *
  * 分层约定：这里只调各模块的公开接口（player_/subsonic_/net_mgr_/settings_），
@@ -24,6 +24,7 @@
 #include "freertos/task.h"
 #include "cJSON.h"
 #include "assets.h"
+#include "usblink.h"
 #include "app_core.h"
 #include "audio_engine.h"
 #include "player.h"
@@ -1296,6 +1297,62 @@ static esp_err_t h_dl_stat(httpd_req_t *req)
     return httpd_resp_send(req, buf, n);
 }
 
+/* ============================================================ 有线联动（串口指令）
+ *
+ * 场景：**没有可用 WiFi 的时候**靠那根 USB 数据线（烧录口）救场：
+ *   板子开热点 → 手机连上访问本页 → 把 WiFi 账号密码填进来 →
+ *   通过串口让服务器也连上同一个 WiFi → 双方拿到 IP →
+ *   再把"服务器地址"（QQ API :3210 / 音乐流 :4533）校准成服务器的新 IP。
+ *
+ * 协议见 components/usblink/include/usblink.h（一行一条，ESP< / ESP> 前缀）。
+ */
+static esp_err_t h_link(httpd_req_t *req)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ready", usblink_ready());
+    cJSON_AddNumberToObject(o, "rx", usblink_rx_lines());
+    cJSON_AddNumberToObject(o, "tx", usblink_tx_lines());
+    cJSON_AddStringToObject(o, "last_cmd", usblink_last_cmd());
+    cJSON_AddStringToObject(o, "last_reply", usblink_last_reply());
+    return send_json(req, o);
+}
+
+/* GET /api/link/cmd?c=<指令>：把一条指令发给服务器（如 WIFI ssid pass / HOTSPOT / STATUS） */
+static esp_err_t h_link_cmd(httpd_req_t *req)
+{
+    char c[160] = {0};
+    if (!query_str(req, "c", c, sizeof(c)) || c[0] == 0) {
+        return fail(req, "400 Bad Request", "缺少 c（要发给服务器的指令）");
+    }
+    esp_err_t err = usblink_send(c);
+    if (err != ESP_OK) {
+        return fail(req, "503 Service Unavailable",
+                    "有线通道没就绪（板子插在服务器上了吗？）");
+    }
+    return ok_json(req);
+}
+
+/* GET /api/link/adopt?ip=x.x.x.x —— 把服务器地址校准成这个 IP。
+ * 用途：配网成功后一条请求把 QQ API 和音乐流的地址都对齐，不用用户手抄 IP。 */
+static esp_err_t h_link_adopt(httpd_req_t *req)
+{
+    char ip[64] = {0};
+    if (!query_str(req, "ip", ip, sizeof(ip)) || ip[0] == 0) {
+        return fail(req, "400 Bad Request", "缺少 ip");
+    }
+    char qhost[96], nhost[96];
+    snprintf(qhost, sizeof(qhost), "http://%s:3210", ip);
+    snprintf(nhost, sizeof(nhost), "http://%s:4533", ip);
+    esp_err_t e1 = qqmusic_set_config(qhost, true);
+    esp_err_t e2 = subsonic_set_config(nhost, NULL, NULL, NULL, 0);
+    ESP_LOGW(TAG, "有线配网：服务器地址校准为 %s（QQ）/%s（音乐流）", qhost, nhost);
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", e1 == ESP_OK && e2 == ESP_OK);
+    cJSON_AddStringToObject(o, "qq", qhost);
+    cJSON_AddStringToObject(o, "nav", nhost);
+    return send_json(req, o);
+}
+
 /* ============================================================ 注册 */
 
 /* ============================================================ 固件升级（OTA）
@@ -1779,7 +1836,7 @@ esp_err_t web_console_start(void)
      *
      * 内存代价：每项只是一个指针（sizeof(httpd_uri_t*)），48 项 = 192 字节，可以忽略。
      * 所以这里给足余量，宁可多留也别再踩一次。 */
-    cfg.max_uri_handlers   = 56;
+    cfg.max_uri_handlers   = 60;
     cfg.recv_wait_timeout  = 5;
     cfg.send_wait_timeout  = 5;
 
@@ -1832,6 +1889,10 @@ esp_err_t web_console_start(void)
         /* 下载（固件转发给服务器的下载接口，见 dl_forward 的说明） */
         { .uri = "/api/dl",              .method = HTTP_GET,  .handler = h_dl },
         { .uri = "/api/dl/stat",         .method = HTTP_GET,  .handler = h_dl_stat },
+        /* 有线联动（串口）：无网时通过数据线指挥服务器开热点/配网 */
+        { .uri = "/api/link",            .method = HTTP_GET,  .handler = h_link },
+        { .uri = "/api/link/cmd",        .method = HTTP_GET,  .handler = h_link_cmd },
+        { .uri = "/api/link/adopt",      .method = HTTP_GET,  .handler = h_link_adopt },
         /* 音质挡位：GET 读、POST 写，同一个处理器按 method 分支 */
         { .uri = "/api/quality",         .method = HTTP_GET,  .handler = h_quality },
         { .uri = "/api/quality",         .method = HTTP_POST, .handler = h_quality },

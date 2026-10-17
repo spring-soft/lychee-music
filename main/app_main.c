@@ -39,6 +39,7 @@
 #include "ui.h"
 #include "ui_internal.h"
 #include "web_console.h"
+#include "usblink.h"
 
 static const char *TAG = "esp-music";
 
@@ -223,6 +224,10 @@ static void start_console_for_config(void)
 {
     /* 热点可能在 NVS 里被用户关掉了，那这条救命路就没了 —— 临时拉起来（不写 NVS） */
     net_mgr_ap_rescue_on();
+    /* 有线指令通道：走烧录口那根 USB 线，无网时靠它指挥服务器开热点/配网 */
+    if (usblink_init() != ESP_OK) {
+        ESP_LOGW("app", "有线指令通道起不来（不影响其它功能）");
+    }
     if (web_console_start() != ESP_OK) {
         ESP_LOGE(TAG, "网页控制台没起来 —— 配网只能靠串口/重烧固件了");
         return;
@@ -387,6 +392,12 @@ void app_main(void)
     player_sync_library();
 
     splash("开始播放...", 8);
+    /* ---- 有线指令通道（USB 数据线 / 烧录口）----
+     * 无网时靠它指挥服务器开热点/配网；放这里是因为它只用 UART0，
+     * 跟网络、播放都不冲突，起失败也不该影响其它功能。 */
+    if (usblink_init() != ESP_OK) {
+        ESP_LOGW(TAG, "有线指令通道起不来（不影响其它功能）");
+    }
     /* ---- M5: 网页控制台 ---- */
     web_console_start();
     /* 沿用上次的来源，**并接着上次的位置放**（player_init 从 NVS/cache 恢复了
