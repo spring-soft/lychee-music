@@ -1095,6 +1095,95 @@ static void star_song_id(const char *id, bool on)
     }
 }
 
+/* ============================================================ 队列"加载更多"
+ *
+ * 背景（用户实测）：QQ「刷歌」上游一次只给 5 首、「雷达」10 首，收藏/歌单也有限。
+ * 队列到底之后要么回头重放、要么请服务器再取一批 —— 现在做了后者：
+ *   · 播到队列最后一首 → 先取一批（去重追加），有新的就接着放，没有才回头
+ *   · 屏幕列表按到底再按"下" → 取一批（异步，不卡界面）
+ *   · 网页列表拉到底 → 调 /api/queue/more
+ *
+ * 只在【本机播放】时有意义：服务器模式下队列是服务器那份，由服务器自己续
+ * （server 端 /v1/player/more 已经做了"播到底自动续"）。
+ */
+static volatile bool s_more_req;      /* 旧的同步标记（保留兼容，不再在 player 任务里取） */
+static SemaphoreHandle_t s_more_sem;  /* 给"加载更多"worker 任务打信号 */
+static int s_prefetch_idx = -1;       /* 提前预取去重：同一个下标只触发一次 */
+
+int player_queue_more(void)
+{
+    if (s_out == PLAYER_OUT_SERVER) return 0;
+
+    sub_song_t *tmp = heap_caps_malloc(PLAYER_QUEUE_MAX * sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
+    if (tmp == NULL) {
+        ESP_LOGE(TAG, "加载更多：临时缓冲分配失败");
+        return 0;
+    }
+    int got = 0;
+    if (s_back == PLAYER_BACK_QQ) {
+        qq_mode_t m = (qq_mode_t)player_mode();
+        if (qqmusic_list(m, tmp, PLAYER_QUEUE_MAX, &got) != ESP_OK) got = 0;
+        for (int i = 0; i < got; i++) tmp[i].back = SUB_BACK_QQ;
+        if (m == QQ_MODE_FAV) {
+            for (int i = 0; i < got; i++) tmp[i].starred = true;
+        }
+    } else if (player_mode() == PLAYER_SRC_RANDOM) {
+        /* 只有"随机30首"能再抽一批；最近播放/我的收藏没有下一页 */
+        if (subsonic_get_random(tmp, 30, &got) != ESP_OK) got = 0;
+        for (int i = 0; i < got; i++) tmp[i].back = SUB_BACK_NAV;
+    }
+
+    int added = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < got; i++) {
+        bool dup = false;
+        for (int j = 0; j < s_count; j++) {
+            if (s_queue[j].back == tmp[i].back && strcmp(s_queue[j].id, tmp[i].id) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (s_count >= PLAYER_QUEUE_MAX) break;
+        s_queue[s_count++] = tmp[i];
+        added++;
+    }
+    if (added) s_queue_gen++;
+    int n = s_count;
+    int idx = s_index;
+    xSemaphoreGive(s_lock);
+
+    if (added) player_status_set_queue(idx, n, player_mode_name(player_mode()), false);
+    heap_caps_free(tmp);
+    ESP_LOGW(TAG, "加载更多：取到 %d 首，新增 %d 首，队列共 %d 首", got, added, n);
+    return added;
+}
+
+/* ⚠️ 为什么要有独立 worker 任务（实测踩过）：
+ *   player_queue_more() 里要发 HTTP + 解析 JSON，**player 任务栈放不下**
+ *   （10KB，实测直接 panic 复位 4 次）。所以：
+ *     · 需要加载更多时只给 worker 打信号（xSemaphoreGive，立即返回）
+ *     · worker 用 8KB 栈，在 player_init 时（内部 RAM 还富余）创建
+ *     · player 任务自己**永远不碰网络** */
+static void more_worker(void *arg)
+{
+    for (;;) {
+        if (xSemaphoreTake(s_more_sem, portMAX_DELAY) == pdTRUE) {
+            player_queue_more();
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+    }
+}
+
+void player_queue_more_async(void)
+{
+    if (s_more_sem) {
+        xSemaphoreGive(s_more_sem);
+    } else {
+        s_more_req = true;              /* 极端情况兜底：worker 还没建好 */
+    }
+}
+
 static void next_or_wrap(int dir)
 {
     int count, idx;
@@ -1104,6 +1193,12 @@ static void next_or_wrap(int dir)
     xSemaphoreGive(s_lock);
     if (count <= 0) return;
     if (idx < 0) idx = dir > 0 ? -1 : 0;      /* 不在队列里：从头/尾算起 */
+    /* ★ 播到最后一首：不能再同步取（player 任务栈不够，实测 panic），
+     *   交给 worker 异步取；本次先回头循环。正常情况下"最后两首时提前预取"
+     *   已经把新歌准备好了，走到这里时 count 已经变大，不会真的回头。 */
+    if (dir > 0 && idx == count - 1) {
+        player_queue_more_async();
+    }
     int n = (idx + dir + count) % count;
     start_index(n);
 }
@@ -1614,6 +1709,17 @@ static void player_task(void *arg)
         }
 
         resume_tick();                      /* M6：每 20 秒记一次续播位置 */
+        /* ★ 快播到队列末尾（最后两首之内）就**提前**让 worker 取下一批：
+         *   这样播到最后一首时队列已经变长，next_or_wrap 不会回头重放。
+         *   ⚠️ 这里只打信号，取数在 worker 任务里做（player 任务栈不够跑 HTTP）。 */
+        if (s_active && s_count > 0 && s_index >= s_count - 2 && s_prefetch_idx != s_index) {
+            s_prefetch_idx = s_index;
+            ESP_LOGW(TAG, "快到队列末尾（%d/%d）→ 提前加载更多", s_index + 1, s_count);
+            player_queue_more_async();
+        }
+        if (s_more_req) {                 /* worker 还没建好时的兜底：清掉标记，不在这里取 */
+            s_more_req = false;
+        }
         if (!s_active) continue;
 
         /* 无命令时：看引擎状态决定要不要自动接下一首 */
@@ -1785,6 +1891,18 @@ esp_err_t player_init(void)
 
     xTaskCreatePinnedToCore(player_task, "player", PLAYER_TASK_STACK, NULL,
                             PLAYER_TASK_PRIO, NULL, PLAYER_TASK_CORE);
+
+    /* "加载更多"的 worker：单独 8KB 栈（HTTP + JSON 解析要这么多）。
+     * ⚠️ 必须在 player 任务里**永远不碰网络**：实测把 qqmusic_list 放进
+     *    player 任务会栈溢出 → panic 复位（连续 4 次）。这里用独立任务隔离。 */
+    s_more_sem = xSemaphoreCreateBinary();
+    if (s_more_sem != NULL) {
+        if (xTaskCreate(more_worker, "qmore", 8192, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "加载更多 worker 创建失败（列表到底将无法续取）");
+        } else {
+            ESP_LOGI(TAG, "加载更多 worker 已就绪（8KB 栈）");
+        }
+    }
     ESP_LOGI(TAG, "就绪：队列 %d 首 / 最近 %d 条（都在 PSRAM），音量 %d%%，上次来源「%s · %s」",
              PLAYER_QUEUE_MAX, PLAYER_RECENT_MAX, s_volume,
              player_back_name(s_back), player_mode_name(player_mode()));

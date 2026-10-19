@@ -162,6 +162,12 @@ bool         player_recent_get(int idx, sub_song_t *out);   /* [0] 是最新的 
 int          player_brightness(void);
 bool         player_queue_get(int idx, sub_song_t *out);
 uint32_t     player_queue_gen(void);           /* 内容变化计数 */
+
+/* 队列"加载更多"：QQ 刷歌/雷达一次只有几首，到底了要能再取一批（去重追加）。
+ * player_queue_more() 会发 HTTP（阻塞），**只能从 player 任务调**；
+ * 屏幕/网页用 player_queue_more_async()（只置标记，由 player 任务去取）。 */
+int          player_queue_more(void);
+void         player_queue_more_async(void);
 player_src_t player_source(void);
 int          player_volume_get(void);
 bool         player_is_muted(void);

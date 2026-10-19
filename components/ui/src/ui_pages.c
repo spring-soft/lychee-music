@@ -57,6 +57,10 @@ static int      s_list_sel;
 static int      s_list_win;                      /* 可视窗口的第一首下标 */
 static int      s_list_r_win = -1, s_list_r_sel = -1, s_list_r_play = -2;
 static uint32_t s_list_r_gen = 0xFFFFFFFF;
+/* 「加载更多」：按到底时置 pending，队列变长后自动把选中项挪到第一首新歌上。
+ * 为什么不在按键里同步取：取一次要发 HTTP（1~3 秒），会卡住 LVGL 界面。 */
+static bool     s_list_more_pending;
+static int      s_list_prev_count;
 
 static void list_window(int n, int count)
 {
@@ -73,6 +77,13 @@ static void list_render(bool force)
     int play  = player_queue_index();
     uint32_t gen = player_queue_gen();
     int n = count < LIST_ROWS ? count : LIST_ROWS;
+
+    /* 按到底触发过"加载更多"：队列变长后自动下移一格到第一首新歌上 */
+    if (s_list_more_pending && count > s_list_prev_count) {
+        s_list_sel = s_list_prev_count;
+        s_list_more_pending = false;
+    }
+    s_list_prev_count = count;
 
     /* 队列变短（换来源）时选中项可能越界 —— 不夹住的话高亮会跑到屏幕外，
      * 而且 K3 会"点了没反应" */
@@ -127,6 +138,14 @@ void ui_list_move(int delta)
 {
     int count = player_queue_count();
     if (count <= 0) return;
+    /* ★ 已经在最后一行还往下按 → 让 player 任务再取一批（QQ 刷歌一次只有 5 首、
+     *   雷达 10 首）。异步：只置标记 + 提示，取完队列变长后自动挪到新歌上。 */
+    if (delta > 0 && s_list_sel >= count - 1) {
+        s_list_more_pending = true;
+        player_queue_more_async();
+        ui_toast("正在加载更多…");
+        return;
+    }
     int sel = s_list_sel + delta;
     if (sel < 0) sel = 0;
     if (sel > count - 1) sel = count - 1;

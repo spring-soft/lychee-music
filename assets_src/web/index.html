@@ -2738,10 +2738,21 @@ else init();
   (function(){
     var el = document.getElementById('list');
     if (!el) return;
+    var busy = false;
     el.addEventListener('scroll', function(){
       if (el.scrollTop + el.clientHeight < el.scrollHeight - 80) return;
       var b = el.querySelector('[data-more]');
-      if (b) b.click();
+      if (b){ b.click(); return; }
+      /* 设备队列已经全显示完了 → 让设备再取一批（QQ 刷歌一次只有 5 首、雷达 10 首）。
+       * 取是异步的（设备里由 player 任务发 HTTP），所以等 2.6 秒再重取列表。 */
+      if (busy) return;
+      busy = true;
+      api2('/api/queue/more').then(function(){
+        setTimeout(function(){
+          try { loadQueuePage(curL(), 'refresh'); } catch(e){}
+          busy = false;
+        }, 2600);
+      }, function(){ busy = false; });
     });
   })();
 

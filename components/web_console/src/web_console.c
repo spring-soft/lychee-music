@@ -1363,6 +1363,20 @@ static esp_err_t h_link_adopt(httpd_req_t *req)
     return send_json(req, o);
 }
 
+/* GET /api/queue/more —— 让播放器再取一批歌追加到队列尾（列表拉到底时用）。
+ * 只在【本机播放】有意义；服务器模式由服务器自己续。
+ * ⚠️ 这里**不直接发 HTTP**（httpd 任务里做网络请求会把网页卡住），只置标记，
+ *   由 player 任务去取；页面等 2~3 秒重新拉队列即可。 */
+static esp_err_t h_queue_more(httpd_req_t *req)
+{
+    player_queue_more_async();
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddStringToObject(o, "note", "已请求加载更多，约 1~3 秒后重新拉队列");
+    cJSON_AddNumberToObject(o, "count", player_queue_count());
+    return send_json(req, o);
+}
+
 /* GET /api/link/provision?ssid=&pass= —— 启动"一键配网"（流程跑在设备上，页面关了也继续） */
 static esp_err_t h_link_provision(httpd_req_t *req)
 {
@@ -1897,6 +1911,7 @@ esp_err_t web_console_start(void)
         { .uri = "/api/status",          .method = HTTP_GET,  .handler = h_status },
         { .uri = "/api/lyrics",          .method = HTTP_GET,  .handler = h_lyrics },
         { .uri = "/api/queue",           .method = HTTP_GET,  .handler = h_queue },
+        { .uri = "/api/queue/more",      .method = HTTP_GET,  .handler = h_queue_more },
         { .uri = "/api/recent",          .method = HTTP_GET,  .handler = h_recent },
         { .uri = "/api/starred",         .method = HTTP_GET,  .handler = h_starred },
         { .uri = "/api/search",          .method = HTTP_GET,  .handler = h_search },
