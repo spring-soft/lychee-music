@@ -307,6 +307,7 @@ ui_page_t ui_page_parent(ui_page_t p)
         case UI_PAGE_SRC:         return UI_PAGE_MENU;
         case UI_PAGE_BACK:        return UI_PAGE_MENU;   /* 来源二级菜单的上一级也是主菜单 */
         case UI_PAGE_DEVICE:      return UI_PAGE_MENU;   /* 设备二级菜单：上一级 = 主菜单 */
+        case UI_PAGE_BTPAIR:      return UI_PAGE_DEVICE; /* 蓝牙配对页：上一级 = 设备菜单 */
         case UI_PAGE_SETTINGS:    return UI_PAGE_MENU;   /* 设置页的上一级 = 菜单 */
         case UI_PAGE_QQLOGIN:     return UI_PAGE_SETTINGS;  /* QQ 登录的上一级 = 设置 */
         case UI_PAGE_SEARCH_MODE: return UI_PAGE_MENU;
@@ -484,11 +485,13 @@ void ui_backmenu_activate(void)
 /* ============================================================ 「设备」二级菜单（切播放设备）
  *
  * 2026-10-17 用户要求：主菜单原来那行「屏幕亮度」改成「设备」，
- * 按 K3 进来选"在本机放"还是"在服务器放"。亮度挪到设置二级菜单里了。
+ * 按 K3 进来选"在哪出声"。亮度挪到设置二级菜单里了。
  *
- * 只有两项，跟「来源」二级菜单同构（都用 MENU_Y0 / MENU_ROW_H 那套坐标）。
- * ⚠️ 这一版选「服务器」只会记住选择，还不会真的把播放切过去 ——
- *    远程控制（按键转给服务器、状态从服务器读）是下一步。提示语里说明了。
+ * 2026-11-15 加第 3 项「蓝牙音箱」：**还是服务器出声**，只是服务器把音频
+ * 输出切到它连的蓝牙音箱。所以在这一页选蓝牙 = "服务器接管 + 服务器音频目标切 bt"。
+ * 项数直接用 PLAYER_OUT_COUNT，以后再加设备这里不用改。
+ *
+ * 跟「来源」二级菜单同构（都用 MENU_Y0 / MENU_ROW_H 那套坐标）。
  */
 #define DEV_N  ((int)PLAYER_OUT_COUNT)
 
@@ -526,7 +529,7 @@ static void build_dev_screen(void)
         s_dev_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
                                           136, ui_font_12, 0x1C1C1E);
     }
-    ESP_LOGI(TAG, "设备二级菜单已建好（%d 项：本机 / 服务器）", DEV_N);
+    ESP_LOGI(TAG, "设备二级菜单已建好（%d 项：本机 / 服务器 / 蓝牙音箱）", DEV_N);
 }
 
 void ui_devmenu_open(void)
@@ -548,10 +551,152 @@ void ui_devmenu_activate(void)
 {
     player_out_t o = (player_out_t)s_dev_sel;
     player_set_out(o);
-    /* 切换是异步的（要停本机、再让服务器接管，约 1~3 秒），所以提示用"正在…" */
-    ui_toast(o == PLAYER_OUT_SERVER ? "正在切到服务器..." : "正在切回本机...");
+    /* 切换是异步的（要停本机、再让服务器接管/连蓝牙，约 1~3 秒），所以提示用"正在…" */
+    switch (o) {
+        case PLAYER_OUT_BT:     ui_toast("正在切到蓝牙音箱..."); break;
+        case PLAYER_OUT_SERVER: ui_toast("正在切到服务器...");   break;
+        default:                ui_toast("正在切回本机...");     break;
+    }
     s_menu_dirty = true;              /* 主菜单那行「设备: X」要跟着变 */
     ui_page_show(UI_PAGE_MENU);
+}
+
+/* ============================================================ 蓝牙音箱配对页
+ *
+ * 设备二级菜单里**长按 K3** 进来（短按 K3 是选/切换设备，两者不冲突）。
+ *
+ * 行为：
+ *   打开      → 让服务器开始扫描（POST /v1/bt/scan?seconds=8）
+ *   每 ~2 秒  → 拉一次 /v1/bt/devices（只在 player 任务里发 HTTP，UI 不发网络）
+ *   K1/K2     → 移动高亮
+ *   K3        → 连接选中音箱（POST /v1/bt/connect?addr=...）
+ *   连接成功  → toast「已连接 X」并回设备菜单
+ *   K4        → 返回（走 ui_keys.c 的统一出口，上一级 = 设备菜单）
+ *
+ * 为什么连接结果要靠轮询：连接是 player 任务里阻塞做的，UI 不能等它；
+ * player 组件把结果留在 player_bt_connect_take()，这里每 tick 取一次。
+ */
+#define BTPAIR_ROWS 5
+
+static lv_obj_t *s_scr_btpair, *s_btpair_hl, *s_btpair_lbl[BTPAIR_ROWS];
+static int       s_btpair_sel;
+static int       s_btpair_r_sel = -1;
+static int64_t   s_btpair_refresh_ms;   /* 上次拉列表的时间（节流到 2 秒）*/
+
+static void btpair_render(void)
+{
+    int n = player_bt_count();
+    if (n <= 0) {
+        /* 列表空：服务器可能还在扫，也可能音箱没进配对模式 —— 两种都说清楚。
+         * 省略号故意用 ASCII 的 "..."：字库里的 "…" 是空字形（项目里踩过，见 ui.c），
+         * 用它会画出一段空白。 */
+        ui_set_text(s_btpair_lbl[0], "扫描中...（先把音箱切到配对模式）");
+        for (int i = 1; i < BTPAIR_ROWS; i++) ui_set_text(s_btpair_lbl[i], "");
+        s_btpair_sel = 0;
+    } else {
+        if (s_btpair_sel < 0) s_btpair_sel = 0;
+        if (s_btpair_sel >= n) s_btpair_sel = n - 1;
+        for (int i = 0; i < BTPAIR_ROWS; i++) {
+            char buf[80];
+            if (i < n) {
+                char name[48];
+                bool conn = false;
+                if (player_bt_get(i, NULL, 0, name, sizeof(name), &conn)) {
+                    /* 已连接的那台加后缀，用户一眼能看出哪台正在用 */
+                    snprintf(buf, sizeof(buf), "%s%s", name, conn ? "（已连接）" : "");
+                } else {
+                    buf[0] = 0;
+                }
+            } else {
+                buf[0] = 0;
+            }
+            ui_set_text(s_btpair_lbl[i], buf);
+        }
+    }
+
+    int y = MENU_Y0 + s_btpair_sel * MENU_ROW_H;
+    if (s_btpair_r_sel < 0 || lv_obj_get_y(s_btpair_hl) != y) {
+        ui_anim_slide_obj(s_btpair_hl, y, 120);
+    }
+    s_btpair_r_sel = s_btpair_sel;
+}
+
+static void build_btpair_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    if (scr == NULL) {
+        /* 内部 SRAM 不够时 LVGL 分配会失败。宁可这一页打不开，也不能空指针崩掉 */
+        ESP_LOGE(TAG, "蓝牙配对页建不出来（内部 SRAM 不足）");
+        s_scr_btpair = NULL;
+        return;
+    }
+    s_scr_btpair = scr;
+    ui_page_register(UI_PAGE_BTPAIR, scr);
+
+    ui_put_img(scr, ASSET_BG_MENU, 0, 0);
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    ui_put_label_1line(scr, "选择蓝牙音箱", 20, 2, 134, ui_font_16, 0x1C1C1E);
+
+    s_btpair_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
+    for (int i = 0; i < BTPAIR_ROWS; i++) {
+        s_btpair_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
+                                             136, ui_font_12, 0x1C1C1E);
+    }
+    ESP_LOGI(TAG, "蓝牙音箱配对页已建好（最多 %d 行，按需创建）", BTPAIR_ROWS);
+}
+
+void ui_btpair_open(void)
+{
+    /* ★ 这一页**第一次用到才建**（2026-11-15 实测踩到的坑）：
+     *   内部 SRAM 开机时只剩 ~20KB，网页控制台的 httpd 任务要 8KB 栈。
+     *   如果把这一页的 6~7 个 LVGL 控件也在 ui_pages_build() 里建好，
+     *   开机内存会再少几 KB，导致 `httpd 启动失败: ESP_ERR_HTTPD_TASK` ——
+     *   设备能放歌、能 ping，但整个网页/OTA 全没了（当时只能拆机接串口救）。
+     *   所以改成按需创建：不用蓝牙音箱的人一分钱内存都不用付。 */
+    if (s_scr_btpair == NULL) {
+        build_btpair_screen();
+        if (s_scr_btpair == NULL) {
+            ui_toast("内存不足，打不开配对页");
+            return;
+        }
+    }
+    s_btpair_sel = 0;
+    s_btpair_r_sel = -1;
+    ui_page_show(UI_PAGE_BTPAIR);   /* 进入时的扫描/刷新在 ui_pages_enter 里做 */
+}
+
+void ui_btpair_move(int delta)
+{
+    int n = player_bt_count();
+    if (n <= 0) return;
+    s_btpair_sel = (s_btpair_sel + delta + n) % n;
+    btpair_render();
+}
+
+void ui_btpair_activate(void)
+{
+    int n = player_bt_count();
+    if (n <= 0) {
+        ui_toast("还没扫描到音箱");
+        return;
+    }
+    if (s_btpair_sel >= n) s_btpair_sel = n - 1;
+    char addr[24], name[48];
+    bool conn = false;
+    if (!player_bt_get(s_btpair_sel, addr, sizeof(addr), name, sizeof(name), &conn)) {
+        ui_toast("列表还没刷新");
+        return;
+    }
+    if (conn) {
+        /* 已经连着就不用再连一次（重连会把正在听的歌掐断）*/
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.20s 已连接", name);
+        ui_toast(buf);
+        ui_page_show(UI_PAGE_DEVICE);
+        return;
+    }
+    player_bt_connect(addr);
+    ui_toast("正在连接...");
 }
 
 /* ============================================================ 设置二级菜单
@@ -1407,7 +1552,9 @@ void ui_pages_build(void)
     build_bt_screen();
     build_src_screen();              /* 「模式」二级菜单（项数随后端动态） */
     build_back_screen();             /* 「来源」二级菜单（Navidrome / QQ 音乐） */
-    build_dev_screen();              /* 「设备」二级菜单（本机 / 服务器）*/
+    build_dev_screen();              /* 「设备」二级菜单（本机 / 服务器 / 蓝牙音箱）*/
+    /* ⚠️ 蓝牙配对页不在这里建：内部 SRAM 太紧，开机建它会挤掉网页控制台的
+     *    httpd 任务（实测）。改成 ui_btpair_open() 第一次打开时按需创建。 */
     build_set_screen();              /* 设置二级菜单（开机续播 / 重连 WiFi）*/
     build_qq_screen();               /* QQ 登录（设置里那一项按 K3 进）*/
     /* 音质二级菜单已按用户要求删除（固定用最高：无损优先）*/
@@ -1460,6 +1607,18 @@ void ui_pages_enter(ui_page_t p)
             s_dev_r_sel = -1;
             dev_render();
             break;
+        case UI_PAGE_BTPAIR: {
+            /* 丢掉上一次离开这一页时留下的旧连接结果，免得一进来就弹"已连接" */
+            bool ok;
+            char nm[48];
+            while (player_bt_connect_take(&ok, nm, sizeof(nm))) { }
+            s_btpair_sel = 0;
+            s_btpair_r_sel = -1;
+            s_btpair_refresh_ms = esp_timer_get_time() / 1000;
+            player_bt_scan();          /* 打开就扫（投命令，HTTP 在 player 任务）*/
+            btpair_render();
+            break;
+        }
         /* 进设置页顺带查一次 QQ 登录情况 —— 那一行的后缀要显示它。
          * 只是投一条后台命令，UI 不会被网络卡住。 */
         case UI_PAGE_SETTINGS:
@@ -1521,6 +1680,27 @@ void ui_pages_tick(void)
         case UI_PAGE_SRC:  src_render();       break;
         case UI_PAGE_BACK: back_render();      break;
         case UI_PAGE_DEVICE: dev_render();     break;
+        case UI_PAGE_BTPAIR: {                 /* 配对页：定期刷新 + 收连接结果 */
+            int64_t now = esp_timer_get_time() / 1000;
+            if (now - s_btpair_refresh_ms >= 2000) {
+                s_btpair_refresh_ms = now;
+                player_bt_refresh();           /* 只投命令；HTTP 不在这里 */
+            }
+            bool ok;
+            char nm[48];
+            if (player_bt_connect_take(&ok, nm, sizeof(nm))) {
+                if (ok) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "已连接 %.20s", nm);
+                    ui_toast(buf);
+                    ui_page_show(UI_PAGE_DEVICE);   /* 连上了回设备菜单，用户接着选设备 */
+                } else {
+                    ui_toast("连接失败");
+                }
+            }
+            btpair_render();
+            break;
+        }
         case UI_PAGE_SETTINGS: set_tick();     break;
         case UI_PAGE_QQLOGIN:  qq_render();    break;
         case UI_PAGE_SEARCH_MODE:

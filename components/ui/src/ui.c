@@ -1,4 +1,4 @@
-﻿/*
+/*
  * UI 核心：显示初始化 + 页面注册/切换 + 播放页 + 启动页 + 封面异步加载
  *
  * 三条"避免整屏重绘"的铁律（性能全靠它们）：
@@ -239,6 +239,7 @@ const char *ui_page_name(ui_page_t p)
         case UI_PAGE_SRC:         return "模式二级";
         case UI_PAGE_BACK:        return "来源二级";
         case UI_PAGE_DEVICE:      return "设备二级";
+        case UI_PAGE_BTPAIR:      return "蓝牙音箱";
         case UI_PAGE_SETTINGS:    return "设置";     /* 以前漏了这一项，日志里一直是 "?" */
         case UI_PAGE_QQLOGIN:     return "QQ登录";
         case UI_PAGE_SEARCH_MODE: return "搜索方式";
@@ -563,10 +564,10 @@ static void play_refresh(void)
     ae_state_t aes = audio_engine_state();
     bool paused  = audio_engine_is_paused();
     bool playing = (aes == AE_STATE_PLAYING) && !paused;
-    /* ★ 设备=服务器：本机引擎是停的，进度/状态在 player 任务从服务器镜像过来。
+    /* ★ 设备=服务器/蓝牙音箱：本机引擎是停的，进度/状态在 player 任务从服务器镜像过来。
      *   UI 这里**不能再写** player_status（否则 250ms 一次把镜像覆盖成"未播放、旧位置"，
      *   症状就是"屏幕/网页上进度冻住、状态一直 IDLE" —— 2026-10-17 实测踩到）。 */
-    if (player_out() == PLAYER_OUT_SERVER) {
+    if (player_out() != PLAYER_OUT_LOCAL) {
         pos     = st.position_ms;
         paused  = st.paused;
         playing = st.playing && !st.paused;
@@ -690,11 +691,11 @@ static void play_refresh(void)
         last_bytes = bytes;
         last_ms = now;
 
-        /* ★ 服务器模式（out=1）：本机不出声、解码在网络那头的服务器上，
+        /* ★ 服务器/蓝牙音箱模式（out=1/2）：本机不出声、解码在网络那头的服务器上，
          *   根本没有"直出/转码"和"网络速率"这回事 —— 用户要求这种时候
          *   直接显示「服务器播放」，别再显示转码/速度。
          *   本地模式（out=0）保持原样：上行直出/转码，下行拉流速率。 */
-        bool remote = (player_out() == PLAYER_OUT_SERVER);
+        bool remote = (player_out() != PLAYER_OUT_LOCAL);
         ui_set_text(s_lbl_mode, remote ? "服务器播放" : (raw ? "直出" : "转码"));
         lv_obj_set_style_text_color(s_lbl_mode,
                                     lv_color_hex(remote ? 0x1A73E8 : (raw ? 0x1B7F3B : 0xC77700)), 0);
@@ -1275,13 +1276,21 @@ static void ui_tick_cb(lv_timer_t *t)
 
     ui_bt_mode_follow();              /* 蓝牙控制模式切了就把页面跟过去（无条件！） */
 
+    /* 播放设备切换失败（目前只有蓝牙音箱连不上）→ 在这里 toast。
+     * 为什么不在 ui_devmenu_activate 里判：切换是 player 任务异步做的，
+     * 结果要几秒后才有；player 组件按分层不依赖 UI，只留一个错误码。
+     * 失败时 s_out 没变，等于已经自动留在上一个设备。 */
+    int out_err = player_out_take_error();
+    if (out_err == PLAYER_OUT_BT) ui_toast("蓝牙音箱连不上");
+    else if (out_err != 0)         ui_toast("播放设备切换失败");
+
     if (s_page == UI_PAGE_PLAY) {
         play_refresh();
     } else {
         /* 不在播放页时也要把进度写进快照（网页控制台要用）。
-         * ⚠️ 但"设备=服务器"时**不能写** —— 那时候进度是 player 任务从服务器镜像来的，
+         * ⚠️ 但"设备=服务器/蓝牙音箱"时**不能写** —— 那时候进度是 player 任务从服务器镜像来的，
          *    UI 拿本机（已停）引擎的值去写会把镜像覆盖掉。 */
-        if (player_out() != PLAYER_OUT_SERVER) {
+        if (player_out() == PLAYER_OUT_LOCAL) {
             player_status_set_progress(audio_engine_position_ms(),
                                        audio_engine_state() == AE_STATE_PLAYING,
                                        audio_engine_is_paused(),

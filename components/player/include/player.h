@@ -106,18 +106,48 @@ void player_volume(int vol);          /* 0..100，落到 ES8388（含模拟音�
 void player_set_mute(bool on);        /* 真·静音：ES8388 DAC 硬静音，不是把音量设成 0 */
 void player_set_brightness(int pct);  /* 屏幕背光 5..100（网页和屏幕都改这一个，自动存 NVS） */
 
-/* ---------------- 「播放设备」：本机 / 服务器 ----------------
+/* ---------------- 「播放设备」：本机 / 服务器 / 蓝牙音箱 ----------------
  *
- * 0 = 本机  ：ESP 自己解码，从板载 DAC 出声（默认，一直以来的行为）
- * 1 = 服务器：服务器（接了 USB DAC 的那台 OpenStick）自己出声，ESP 只当遥控器+显示屏
+ * 0 = 本机    ：ESP 自己解码，从板载 DAC 出声（默认，一直以来的行为）
+ * 1 = 服务器  ：服务器（接了 USB DAC 的那台 OpenStick）自己出声，ESP 只当遥控器+显示屏
+ * 2 = 蓝牙音箱：**也是服务器出声**，只是服务器把音频输出切到它连的蓝牙音箱
+ *              （服务器会自动连上次那台）。控制语义和「服务器」完全一样。
  *
- * ⚠️ 现在这一版只做到「记住选择 + 菜单里能选」。真正把按键/状态切到服务器，
- *    要等远程控制接线（下一步）；在那之前选「服务器」不会改变出声设备。
+ * ★ 为什么蓝牙要单独一个值而不是复用「服务器」：菜单要能分辨用户选的是哪个，
+ *   而且重启后要记住。输出设备只有本机/远程两套逻辑，所以内部判断用
+ *   "是不是远程（服务器或蓝牙）"，见 player.c 的 out_remote()。
  */
-typedef enum { PLAYER_OUT_LOCAL = 0, PLAYER_OUT_SERVER = 1, PLAYER_OUT_COUNT } player_out_t;
+typedef enum {
+    PLAYER_OUT_LOCAL  = 0,
+    PLAYER_OUT_SERVER = 1,
+    PLAYER_OUT_BT     = 2,
+    PLAYER_OUT_COUNT,
+} player_out_t;
 void          player_set_out(player_out_t o);   /* 切换播放设备（存 NVS，重启保留） */
 player_out_t  player_out(void);
-const char   *player_out_name(player_out_t o);  /* "本机" / "服务器" */
+const char   *player_out_name(player_out_t o);  /* "本机" / "服务器" / "蓝牙音箱" */
+
+/* 切播放设备失败时（目前只有"蓝牙音箱连不上"）留给 UI 的错误码。
+ * 为什么不在 player 里直接 toast：player 组件不依赖 UI（分层），而且切换在
+ * player 任务里异步做。UI 每 250ms 取一次，非 0 就提示，取完即清。
+ * 返回 PLAYER_OUT_xxx 目标；0 = 没有错误。 */
+int           player_out_take_error(void);
+
+/* ---------------- 蓝牙音箱配对列表（服务器侧所有 /v1/bt/ 接口）
+ *
+ * 和远程播放同一个道理：HTTP 是阻塞的（扫描/连接可能几秒），**只能在 player
+ * 任务里发**。UI 只调下面三个非阻塞入口（内部投命令），然后读快照。
+ * 列表本身存在 player 组件的 PSRAM 里（像 remote 队列那样），UI 不加锁直接拷。
+ */
+void player_bt_scan(void);       /* 让服务器开始扫描（后台，最多 15 秒）*/
+void player_bt_refresh(void);    /* 拉一次 /v1/bt/devices 刷新列表 */
+int  player_bt_count(void);      /* 列表里有名字的音箱数 */
+/* 取第 i 项（addr/name 可为 NULL）。connected = 服务器当前是否连着它。 */
+bool player_bt_get(int i, char *addr, size_t alen, char *name, size_t nlen, bool *connected);
+void player_bt_connect(const char *addr);   /* 连指定音箱（失败由 take 报给 UI）*/
+/* 取连接结果（非阻塞）：有结果返回 true，ok=成功，name=音箱名。
+ * 取完即清 —— UI 只提示一次。 */
+bool player_bt_connect_take(bool *ok, char *name, size_t nlen);
 void player_seek(uint32_t pos_ms);    /* seek：让服务端从该位置重转（约 1 秒缓冲） */
 void player_play_song_id(const char *song_id);      /* 播放队列外的歌（只知道 id，会去服务器取元数据） */
 /* 同上，但元数据已经有了 —— **前端点列表时用这个，省掉一次 getSong 网络往返** */

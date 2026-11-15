@@ -13,6 +13,7 @@
 #include <inttypes.h>
 #include "player.h"
 #include "player_remote.h"
+#include "player_bt.h"
 #include "app_core.h"
 #include "audio_engine.h"
 #include "board.h"
@@ -26,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 
 static const char *TAG = "player";
@@ -65,7 +67,10 @@ typedef enum {
     CMD_RESUME, CMD_STAR_REFRESH,
     CMD_SEARCH,               /* M8：屏上搜索 */
     CMD_SET_BACK,             /* 换「来源」= Navidrome / QQ 音乐 */
-    CMD_OUT,                  /* 切「播放设备」= 本机 / 服务器 */
+    CMD_OUT,                  /* 切「播放设备」= 本机 / 服务器 / 蓝牙音箱 */
+    CMD_BT_SCAN,              /* 蓝牙配对页：让服务器开始扫描 */
+    CMD_BT_REFRESH,           /* 蓝牙配对页：刷新设备列表 */
+    CMD_BT_CONNECT,           /* 蓝牙配对页：连接选中音箱 */
 } cmd_kind_t;
 
 typedef struct {
@@ -75,6 +80,7 @@ typedef struct {
     int        iarg2;     /* SET_SOURCE: dir */
     char       sid[48];   /* PLAY_ID / STAR_ID: 歌曲 id */
     char       query[64]; /* SEARCH: 搜索词（拼音模式下来的是汉字，UTF-8 最多 ~20 字） */
+    char       bt_addr[24];/* BT_CONNECT: 目标音箱 MAC */
     sub_song_t meta;      /* PLAY_ID: 前端带来的元数据（id 非空就用它，免一次网络往返） */
 } player_cmd_t;
 
@@ -155,8 +161,20 @@ static int               s_volume = 40;
 static volatile int      s_vol_target = 40;
 static volatile bool     s_mute_target;   /* 同上：界面读请求值，不等 I2C 写完 */
 static volatile int      s_bright_target = 100;
-/* 「播放设备」：0=本机 / 1=服务器（见 player.h 的说明）。UI 直接读它，所以 volatile */
+/* 「播放设备」：0=本机 / 1=服务器 / 2=蓝牙音箱（见 player.h 的说明）。
+ * UI 直接读它，所以 volatile */
 static volatile int      s_out = PLAYER_OUT_LOCAL;
+/* 切换失败的目标（0 = 没有）。UI 每 250ms 取一次做 toast —— player 组件不依赖 UI，
+ * 而且切换在 player 任务里异步做，没法直接调 ui_toast()。 */
+static volatile int      s_out_err;
+
+/* ★ 蓝牙音箱在控制语义上就是"服务器出声"：ESP 照样只当遥控器，
+ *   状态/队列/按键全部走 player_remote。所以凡是要判"远程"的地方都用它，
+ *   千万别再写 s_out == PLAYER_OUT_SERVER —— 蓝牙会整个漏掉。 */
+static bool out_remote(void)
+{
+    return s_out == PLAYER_OUT_SERVER || s_out == PLAYER_OUT_BT;
+}
 
 /* 临时静音解开时，要恢复成"用户是否静音"而不是无条件解开 */
 static void restore_mute(void) { board_es8388_mute(board_es8388_is_muted()); }
@@ -1112,7 +1130,7 @@ static int s_prefetch_idx = -1;       /* 提前预取去重：同一个下标只
 
 int player_queue_more(void)
 {
-    if (s_out == PLAYER_OUT_SERVER) return 0;
+    if (out_remote()) return 0;
 
     sub_song_t *tmp = heap_caps_malloc(PLAYER_QUEUE_MAX * sizeof(sub_song_t), MALLOC_CAP_SPIRAM);
     if (tmp == NULL) {
@@ -1486,45 +1504,34 @@ static bool remote_handle_cmd(const player_cmd_t *c)
     }
 }
 
-/* 切「播放设备」。这是唯一会停下来/接起来的操作，所以单独一个函数。 */
+/* 切「播放设备」。这是唯一会停下来/接起来的操作，所以单独一个函数。
+ *
+ * 三条路径：
+ *   切回本机          → 停服务器、本机从 0:00 接着放（见下面"保证无损"的说明）
+ *   切到服务器        → 本机停、服务器接管（和以前一样）
+ *   切到蓝牙音箱      → 先让服务器把音频输出切到蓝牙，再走服务器接管
+ *   从蓝牙切到别处    → 先让服务器把音频输出切回 USB DAC（它会主动断开蓝牙）
+ *
+ * ★ 失败处理：蓝牙那一步失败时**不改 s_out**，相当于自动"留在上一个设备"，
+ *   再记一个错误码让 UI toast。绝不能先把 s_out 改了再失败，否则界面显示蓝牙、
+ *   实际还在本机出声，用户会以为设备坏了。
+ */
 static void handle_out_switch(int want)
 {
     if (want < 0 || want >= PLAYER_OUT_COUNT) return;
     if (want == s_out) return;
+    s_out_err = 0;                       /* 新的一次切换，清掉上次的失败提示 */
 
-    if (want == PLAYER_OUT_SERVER) {
-        player_status_t st;
-        player_status_get(&st);
-        int idx = (s_index >= 0) ? s_index : 0;
-        ESP_LOGW(TAG, "切到「服务器」播放：%s / %s / 第 %d 首 @%" PRIu32 " ms",
-                 player_back_name(s_back), player_mode_name(player_mode()),
-                 idx + 1, st.position_ms);
-        audio_engine_stop();                 /* 本机立刻停止出声 */
-        s_active = false;
-        s_out = PLAYER_OUT_SERVER;
-        settings_set_int_lazy("outdev", s_out);
-        player_remote_reset();
-        s_remote_gen = 0;
-        int back = (s_back == PLAYER_BACK_QQ) ? 1 : 0;
-        esp_err_t e = player_remote_play_mode(back, player_mode(), idx, 0);
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "让服务器起播失败：%s", esp_err_to_name(e));
-        } else {
-            /* ⚠️ 随机的模式（刷歌/雷达/随机30首）两边各拉一次结果**必然不同**，
-             *    所以起播后对一下：不是同一首就强制让服务器放本机正在放的这首。
-             *    这样"切到服务器"听感上是接着放，而不是突然跳到别的歌。 */
-            remote_sync();
-            remote_status_t now;
-            player_remote_status(&now);
-            if (st.song_id[0] && strcmp(now.id, st.song_id) != 0) {
-                ESP_LOGW(TAG, "服务器队列跟本机不一致（随机模式）→ 强制放同一首 %s",
-                         st.song_id);
-                player_remote_play_id(back, st.song_id);
-            }
-            if (st.position_ms > 2000) player_remote_seek(st.position_ms);
+    /* ① 离开蓝牙：先让服务器切回 USB DAC。
+     *   失败也继续 —— 否则服务器一旦连不上，用户就永远切不回本机了。 */
+    if (s_out == PLAYER_OUT_BT) {
+        if (player_bt_audio_target(false) != ESP_OK) {
+            ESP_LOGE(TAG, "让服务器切回 USB DAC 失败（仍继续切换，本机/服务器各自会再兜底）");
         }
-        remote_sync();
-    } else {
+    }
+
+    /* ② 切回本机 */
+    if (want == PLAYER_OUT_LOCAL) {
         ESP_LOGW(TAG, "切回「本机」播放");
         remote_status_t rs;
         player_remote_status(&rs);           /* 先把服务器最后的状态记下来 */
@@ -1559,6 +1566,54 @@ static void handle_out_switch(int want)
             }
             start_index_from(idx, 0);
         }
+        return;
+    }
+
+    /* ③ 切到蓝牙音箱：先把服务器音频目标切过去（服务器会自动连上次那台）。
+     *   必须在动本机之前做 —— 失败就原样返回，用户还在原来的设备上。 */
+    if (want == PLAYER_OUT_BT) {
+        if (player_bt_audio_target(true) != ESP_OK) {
+            ESP_LOGE(TAG, "切到蓝牙音箱失败：服务器拒绝/连不上 → 留在「%s」",
+                     player_out_name((player_out_t)s_out));
+            s_out_err = PLAYER_OUT_BT;   /* UI 取走后 toast「蓝牙音箱连不上」*/
+            return;
+        }
+    }
+
+    /* ④ 服务器接管（服务器和蓝牙音箱共用这一套）*/
+    {
+        player_status_t st;
+        player_status_get(&st);
+        int idx = (s_index >= 0) ? s_index : 0;
+        ESP_LOGW(TAG, "切到「%s」播放：%s / %s / 第 %d 首 @%" PRIu32 " ms",
+                 player_out_name((player_out_t)want),
+                 player_back_name(s_back), player_mode_name(player_mode()),
+                 idx + 1, st.position_ms);
+        audio_engine_stop();                 /* 本机立刻停止出声 */
+        s_active = false;
+        s_out = want;
+        settings_set_int_lazy("outdev", s_out);
+        player_remote_reset();
+        s_remote_gen = 0;
+        int back = (s_back == PLAYER_BACK_QQ) ? 1 : 0;
+        esp_err_t e = player_remote_play_mode(back, player_mode(), idx, 0);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "让服务器起播失败：%s", esp_err_to_name(e));
+        } else {
+            /* ⚠️ 随机的模式（刷歌/雷达/随机30首）两边各拉一次结果**必然不同**，
+             *    所以起播后对一下：不是同一首就强制让服务器放本机正在放的这首。
+             *    这样"切到服务器"听感上是接着放，而不是突然跳到别的歌。 */
+            remote_sync();
+            remote_status_t now;
+            player_remote_status(&now);
+            if (st.song_id[0] && strcmp(now.id, st.song_id) != 0) {
+                ESP_LOGW(TAG, "服务器队列跟本机不一致（随机模式）→ 强制放同一首 %s",
+                         st.song_id);
+                player_remote_play_id(back, st.song_id);
+            }
+            if (st.position_ms > 2000) player_remote_seek(st.position_ms);
+        }
+        remote_sync();
     }
 }
 
@@ -1571,8 +1626,8 @@ static void handle_cmd(const player_cmd_t *c)
         handle_out_switch(c->iarg);
         return;
     }
-    /* 设备是"服务器"时：播放类命令转给服务器，亮度/收藏/搜索仍在本机做 */
-    if (s_out == PLAYER_OUT_SERVER && remote_handle_cmd(c)) return;
+    /* 设备是"服务器/蓝牙音箱"时：播放类命令转给服务器，亮度/收藏/搜索仍在本机做 */
+    if (out_remote() && remote_handle_cmd(c)) return;
 
     switch (c->kind) {
         case CMD_OUT:
@@ -1622,6 +1677,16 @@ static void handle_cmd(const player_cmd_t *c)
             break;
         case CMD_SEARCH:
             do_search(c->query);
+            break;
+        /* 蓝牙配对页的三条命令：HTTP 都在 player 任务里发（UI 只投命令）*/
+        case CMD_BT_SCAN:
+            player_bt_task_scan();
+            break;
+        case CMD_BT_REFRESH:
+            player_bt_task_refresh();
+            break;
+        case CMD_BT_CONNECT:
+            player_bt_task_connect(c->bt_addr);
             break;
         case CMD_STAR: {
             player_status_t st;
@@ -1695,10 +1760,10 @@ static void player_task(void *arg)
         starred_save_tick();                /* M6：收藏镜像落盘 */
         pend_retry_tick();                  /* M6：离线攒下的收藏操作，每分钟补发一次 */
 
-        /* ★ 设备=服务器：本机不出声。每秒拉一次服务器的状态/队列镜像过来，
+        /* ★ 设备=服务器/蓝牙音箱：本机不出声。每秒拉一次服务器的状态/队列镜像过来，
          *   其余周期活儿（落盘/补发收藏）照常，然后**跳过本机引擎逻辑** ——
          *   否则会去读一个已经停掉的 audio_engine 状态，凭空"下一首"。 */
-        if (s_out == PLAYER_OUT_SERVER) {
+        if (out_remote()) {
             static int64_t last_sync;
             int64_t now = esp_timer_get_time() / 1000;
             if (now - last_sync >= 1000) {
@@ -1807,7 +1872,14 @@ esp_err_t player_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
     if (s_lock == NULL) return ESP_FAIL;
-    s_q = xQueueCreate(8, sizeof(player_cmd_t));
+    /* ★ 命令队列放 PSRAM（2026-11-15 实测踩到的坑）：
+     *   8 条 × player_cmd_t（含 sub_song_t 元数据）约 3KB 内部 SRAM。
+     *   给 player_cmd_t 加蓝牙连接命令后，开机内部 SRAM 掉到 19KB，
+     *   网页控制台的 httpd 任务（8KB 栈）直接 ESP_ERR_HTTPD_TASK 起不来 ——
+     *   设备能放歌能 ping，但网页/OTA 全没了。
+     *   队列只在任务之间收发、从不在中断里用，放 PSRAM 安全；
+     *   而且 flash 写（OTA）期间别的任务本来就被停住，不会在 cache 关掉时碰它。 */
+    s_q = xQueueCreateWithCaps(8, sizeof(player_cmd_t), MALLOC_CAP_SPIRAM);
     if (s_q == NULL) return ESP_FAIL;
 
     /* 大队列全进 PSRAM（内部 SRAM 只留给协议栈/任务栈/DMA） */
@@ -1882,11 +1954,12 @@ esp_err_t player_init(void)
     player_status_set_volume(s_volume);
     player_status_set_queue(-1, 0, player_mode_name(player_mode()), true);
 
-    /* 远程播放器（设备=服务器时用）：只建锁和 PSRAM 队列，不联网 */
+    /* 远程播放器（设备=服务器/蓝牙音箱时用）：只建锁和 PSRAM 队列，不联网 */
     player_remote_init();
-    if (s_out == PLAYER_OUT_SERVER) {
-        ESP_LOGW(TAG, "播放设备=服务器（NVS 恢复）：本机不出声，状态从 %s 镜像",
-                 qqmusic_host());
+    player_bt_init();          /* 蓝牙列表：PSRAM 快照，同样不联网 */
+    if (out_remote()) {
+        ESP_LOGW(TAG, "播放设备=%s（NVS 恢复）：本机不出声，状态从 %s 镜像",
+                 player_out_name((player_out_t)s_out), qqmusic_host());
     }
 
     xTaskCreatePinnedToCore(player_task, "player", PLAYER_TASK_STACK, NULL,
@@ -2061,7 +2134,7 @@ void player_set_brightness(int pct)
     post(CMD_BRIGHT, pct, false);
 }
 
-/* ---------------- 播放设备（本机 / 服务器） ----------------
+/* ---------------- 播放设备（本机 / 服务器 / 蓝牙音箱） ----------------
  * 这里是"改状态 + 投命令"，真正的切换在 player 任务里做（见 handle_out_switch）：
  * 停本机出声、让服务器接管 —— 这些会阻塞（HTTP），绝不能在调用方（UI 任务）里做。 */
 void player_set_out(player_out_t o)
@@ -2077,13 +2150,35 @@ void player_set_out(player_out_t o)
 
 player_out_t player_out(void) { return (player_out_t)s_out; }
 
+int player_out_take_error(void)
+{
+    int v = s_out_err;
+    s_out_err = 0;
+    return v;
+}
+
 const char *player_out_name(player_out_t o)
 {
     switch (o) {
         case PLAYER_OUT_LOCAL:  return "本机";
         case PLAYER_OUT_SERVER: return "服务器";
+        case PLAYER_OUT_BT:     return "蓝牙音箱";
         default:                return "?";
     }
+}
+
+/* ---------------- 蓝牙音箱配对（对外只投命令，HTTP 在 player 任务里） ----------------
+ * 接口与 remote 队列同一套思路：UI 任务栈小，直接发 HTTP 会崩，所以这里只 post。 */
+void player_bt_scan(void)    { post(CMD_BT_SCAN, 0, false); }
+void player_bt_refresh(void) { post(CMD_BT_REFRESH, 0, false); }
+
+void player_bt_connect(const char *addr)
+{
+    if (addr == NULL || addr[0] == 0) return;
+    if (s_q == NULL) return;
+    player_cmd_t c = { .kind = CMD_BT_CONNECT };
+    strlcpy(c.bt_addr, addr, sizeof(c.bt_addr));
+    if (xQueueSend(s_q, &c, 0) != pdTRUE) ESP_LOGW(TAG, "命令队列满，丢弃蓝牙连接");
 }
 
 int player_queue_count(void)
@@ -2152,9 +2247,10 @@ bool player_is_muted(void)   { return s_mute_target; }
 
 void player_resume(void)
 {
-    /* 设备=服务器时开机**不要**驱动本机播放：本机不出声，状态由 remote_sync 镜像 */
-    if (s_out == PLAYER_OUT_SERVER) {
-        ESP_LOGW(TAG, "开机续播跳过：播放设备=服务器，本机不出声");
+    /* 设备=服务器/蓝牙音箱时开机**不要**驱动本机播放：本机不出声，状态由 remote_sync 镜像 */
+    if (out_remote()) {
+        ESP_LOGW(TAG, "开机续播跳过：播放设备=%s，本机不出声",
+                 player_out_name((player_out_t)s_out));
         return;
     }
     post(CMD_RESUME, 0, false);

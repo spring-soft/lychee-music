@@ -1,4 +1,4 @@
-﻿/*
+/*
  * 网页控制台 —— REST API 实现
  *
  * 分层约定：这里只调各模块的公开接口（player_/subsonic_/net_mgr_/settings_），
@@ -273,9 +273,10 @@ static esp_err_t h_status(httpd_req_t *req)
     }
     if (audio_engine_is_paused()) state = "PAUSED";
 
-    /* ★ 设备=服务器时，本机引擎是停的（它不出声），状态全在 player_status 里
-     *   （那是从服务器镜像过来的）。所以要换数据源，否则网页会一直显示 IDLE。 */
-    bool remote = (player_out() == PLAYER_OUT_SERVER);
+    /* ★ 设备=服务器/蓝牙音箱时，本机引擎是停的（它不出声），状态全在 player_status 里
+     *   （那是从服务器镜像过来的）。所以要换数据源，否则网页会一直显示 IDLE。
+     *   蓝牙音箱也是服务器出声，判断条件就是"不是本机"。 */
+    bool remote = (player_out() != PLAYER_OUT_LOCAL);
     if (remote) {
         state = st.playing ? "PLAYING" : (st.paused ? "PAUSED" : "IDLE");
     }
@@ -817,6 +818,7 @@ static esp_err_t h_qq(httpd_req_t *req)
 }
 
 /* 「播放设备」：0=本机（ESP 解码出声）/ 1=服务器（那台接 USB DAC 的机器出声）
+ * 2=蓝牙音箱（还是服务器出声，只是服务器把音频输出切到蓝牙）
  * 网页/手机也能切 —— 跟屏幕菜单里「设备」是同一个入口（都走 player_set_out）。 */
 static esp_err_t h_out(httpd_req_t *req)
 {
@@ -825,7 +827,7 @@ static esp_err_t h_out(httpd_req_t *req)
     int dev = json_int(b, "dev", -1);
     cJSON_Delete(b);
     if (dev < 0 || dev >= (int)PLAYER_OUT_COUNT) {
-        return fail(req, "400 Bad Request", "dev 只能是 0（本机）或 1（服务器）");
+        return fail(req, "400 Bad Request", "dev 只能是 0（本机）/ 1（服务器）/ 2（蓝牙音箱）");
     }
     player_set_out((player_out_t)dev);
     cJSON *o = cJSON_CreateObject();

@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "src/player.c" "src/player_remote.c"
+    SRCS "src/player.c" "src/player_remote.c" "src/player_bt.c"
     INCLUDE_DIRS "include"
     REQUIRES
         board

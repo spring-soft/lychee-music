@@ -27,7 +27,8 @@ typedef enum {
     UI_PAGE_BT,        /* M7 蓝牙控制模式（独立模式：进去以后按键只管对方，不显示本机歌名） */
     UI_PAGE_SRC,       /* 「模式」二级菜单（主菜单"模式"那一项按 K3 进来的） */
     UI_PAGE_BACK,      /* 「来源」二级菜单：Navidrome / QQ 音乐 */
-    UI_PAGE_DEVICE,    /* 「设备」二级菜单：本机 / 服务器（2026-10-17 新增）*/
+    UI_PAGE_DEVICE,    /* 「设备」二级菜单：本机 / 服务器 / 蓝牙音箱（2026-10-17 新增）*/
+    UI_PAGE_BTPAIR,    /* 蓝牙音箱配对页（设备二级菜单长按 K3 进来，选音箱并连接）*/
     UI_PAGE_SEARCH_MODE,  /* M8：搜索方式选择（字母直搜 / 拼音输入）*/
     UI_PAGE_SEARCH_IN,    /* M8：输入页（字母格 + 拼音候选字，两种模式共用一页）*/
     UI_PAGE_SEARCH_RES,   /* M8：搜索结果列表 */
@@ -98,12 +99,19 @@ void ui_backmenu_open(void);
 void ui_backmenu_move(int delta);
 void ui_backmenu_activate(void);
 
-/* 「设备」二级菜单：切播放设备（本机 / 服务器）。
+/* 「设备」二级菜单：切播放设备（本机 / 服务器 / 蓝牙音箱）。
  * 2026-10-17 用户要求：主菜单原来那行「屏幕亮度」改成「设备」，
  * 亮度移到设置二级菜单里。 */
 void ui_devmenu_open(void);
 void ui_devmenu_move(int delta);
 void ui_devmenu_activate(void);
+
+/* 「蓝牙音箱」配对页：设备二级菜单里**长按 K3** 进来。
+ * 打开时让服务器扫描，之后每 2 秒刷新一次列表；K3 连接选中，成功回设备菜单。
+ * ⚠️ 页面里只调 player_bt_*（投命令）—— HTTP 由 player 任务做，UI 任务不发网络。 */
+void ui_btpair_open(void);
+void ui_btpair_move(int delta);
+void ui_btpair_activate(void);
 
 /* 设置二级菜单：开机续播（开/关）+ 重连 WiFi（需二次确认）*/
 void ui_setmenu_open(void);

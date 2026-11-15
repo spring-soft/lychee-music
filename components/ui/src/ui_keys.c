@@ -186,11 +186,20 @@ static void key_short(int k)
             }
             break;
 
-        case UI_PAGE_DEVICE:                    /* 「设备」二级菜单（本机 / 服务器） */
+        case UI_PAGE_DEVICE:                    /* 「设备」二级菜单（本机 / 服务器 / 蓝牙音箱） */
             switch (k) {
                 case 0: ui_devmenu_move(-1); break;
                 case 1: ui_devmenu_move(+1); break;
                 case 2: ui_devmenu_activate(); break;  /* 选定并退回主菜单 */
+                default: break;              /* K4 由 k4_navigate 管 */
+            }
+            break;
+
+        case UI_PAGE_BTPAIR:                    /* 蓝牙音箱配对页 */
+            switch (k) {
+                case 0: ui_btpair_move(-1); break;
+                case 1: ui_btpair_move(+1); break;
+                case 2: ui_btpair_activate(); break;   /* 连接选中（成功自动回设备菜单）*/
                 default: break;              /* K4 由 k4_navigate 管 */
             }
             break;
@@ -240,6 +249,10 @@ static void key_long(int k)
     /* ★ 用户要求：系统信息页【长按 K3】进"内存用量图表"。
      *   必须放在下面那条"非播放页直接 return"之前，否则永远轮不到。 */
     if (ui_page_current() == UI_PAGE_INFO && k == 2) { ui_mem_open(); return; }
+    /* ★ 用户要求：**设备菜单页**长按 K3 进蓝牙音箱配对页。
+     *   同样必须在"非播放页 return"之前 —— 短按 K3 是"选设备"，长按才是"配对"，
+     *   两者不冲突（iot_button 会先判长按，不会同时触发短按）。 */
+    if (ui_page_current() == UI_PAGE_DEVICE && k == 2) { ui_btpair_open(); return; }
     if (ui_page_current() != UI_PAGE_PLAY) return;   /* 播放页以外的长按没有其它语义 */
     switch (k) {
         case 0: {                                  /* 收藏 / 取消收藏 */
