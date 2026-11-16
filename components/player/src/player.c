@@ -154,6 +154,15 @@ static ae_source_t      *s_cur_src;       /* 当前 HTTP 源（换歌时释放�
 static bool              s_active;        /* 用户意图 = 想让它播 */
 static int               s_err_streak;
 static int               s_volume = 40;
+/* 三种输出各自记音量（用户要求 2026-11-16）：
+ *   s_vol_local  —— 本机(ES8388) 自己的音量
+ *   s_vol_remote —— 服务器/蓝牙最近一次的音量（真正的 DAC/蓝牙音量存在服务器上，
+ *                   服务器按音频目标分别记：volumes.dac / volumes.bt）
+ * 切换设备时恢复各自的音量，互不覆盖。 */
+static int               s_vol_local = 40;   /* 本机 ES8388 */
+static int               s_vol_dac = 30;     /* 服务器 USB DAC */
+static int               s_vol_bt = 20;      /* 蓝牙音箱 */
+static int               s_vol_remote = 40;  /* 远程模式当前值 */
 
 /* 音量有两份：s_volume 是 player 任务真正写进 ES8388 的值，s_vol_target 是"请求值"。
  * 界面必须看请求值 —— 按键 → 队列 → player 任务 → I2C 是异步的，界面如果读 s_volume，
@@ -1487,8 +1496,15 @@ static bool remote_handle_cmd(const player_cmd_t *c)
             s_volume = c->iarg < 0 ? 0 : (c->iarg > 100 ? 100 : c->iarg);
             player_remote_volume(s_mute_target ? 0 : s_volume);
             player_status_set_volume(s_mute_target ? 0 : s_volume);
-            settings_set_int_lazy("vol", s_volume);
-            ESP_LOGI(TAG, "音量 %d%%（服务器）", s_volume);
+            s_vol_remote = s_volume;
+            if (s_out == PLAYER_OUT_BT) {
+                s_vol_bt = s_volume;
+                settings_set_int_lazy("vol_bt", s_vol_bt);
+            } else {
+                s_vol_dac = s_volume;
+                settings_set_int_lazy("vol_dac", s_vol_dac);
+            }
+            ESP_LOGI(TAG, "音量 %d%%（服务器/蓝牙）", s_volume);
             return true;
         case CMD_MUTE:
             /* 服务器那边没有本机的 DAC 硬静音，只能靠音量 0（够用）*/
@@ -1540,6 +1556,11 @@ static void handle_out_switch(int want)
         s_out = PLAYER_OUT_LOCAL;
         settings_set_int_lazy("outdev", s_out);
         s_remote_gen = 0;
+        /* 恢复"本机"这一路自己的音量（三种输出各自记音量）*/
+        s_volume = s_vol_target = s_vol_local;
+        board_vol_set(s_volume);
+        player_status_set_volume(s_mute_target ? 0 : s_volume);
+        ESP_LOGW(TAG, "本机音量恢复到 %d%%", s_volume);
 
         /* 回到本机：把服务器正在放的那首/那个位置接着放（尽量无缝）*/
         int back = rs.valid ? rs.back : (int)s_back;
@@ -1593,6 +1614,14 @@ static void handle_out_switch(int want)
         s_active = false;
         s_out = want;
         settings_set_int_lazy("outdev", s_out);
+        /* 恢复这个输出自己的音量：本机/DAC/蓝牙各一份（ESP 自己记，不依赖回读）。
+         * ★ 不做"切换后回读服务器音量"——切换期间服务器还没切完，回读会取到
+         *   上一个设备的音量，实测导致音量在服务器/蓝牙之间串台。 */
+        s_volume = s_vol_target = (want == PLAYER_OUT_BT) ? s_vol_bt : s_vol_dac;
+        s_vol_remote = s_volume;
+        player_remote_volume(s_mute_target ? 0 : s_volume);   /* 推给服务器 */
+        player_status_set_volume(s_mute_target ? 0 : s_volume);
+        ESP_LOGW(TAG, "「%s」音量恢复到 %d%%", player_out_name((player_out_t)want), s_volume);
         player_remote_reset();
         s_remote_gen = 0;
         int back = (s_back == PLAYER_BACK_QQ) ? 1 : 0;
@@ -1720,7 +1749,8 @@ static void handle_cmd(const player_cmd_t *c)
             s_volume = c->iarg < 0 ? 0 : (c->iarg > 100 ? 100 : c->iarg);
             board_vol_set(s_volume);
             player_status_set_volume(s_mute_target ? 0 : s_volume);
-            settings_set_int_lazy("vol", s_volume);   /* 去抖落盘：长按连调不会写爆 NVS */
+            s_vol_local = s_volume;
+            settings_set_int_lazy("vol_local", s_vol_local); /* 去抖落盘：长按连调不会写爆 NVS */
             ESP_LOGI(TAG, "音量 %d%%", s_volume);
             break;
 
@@ -1915,8 +1945,14 @@ esp_err_t player_init(void)
     }
 
     /* 音量与来源：NVS 里存的上次设置优先，没有才用默认值 */
-    s_volume = s_vol_target = settings_get_int("vol", board_vol_get());
-    if (s_volume < 0 || s_volume > 100) s_volume = s_vol_target = 40;
+    s_vol_local = settings_get_int("vol_local", 40);
+    s_vol_dac   = settings_get_int("vol_dac", 30);
+    s_vol_bt    = settings_get_int("vol_bt", 20);
+    if (s_vol_local < 0 || s_vol_local > 100) s_vol_local = 40;
+    if (s_vol_dac   < 0 || s_vol_dac   > 100) s_vol_dac   = 30;
+    if (s_vol_bt    < 0 || s_vol_bt    > 100) s_vol_bt    = 20;
+    s_vol_remote = s_vol_dac;
+    s_volume = s_vol_target = s_vol_local;
     board_vol_set(s_volume);
 
     /* 亮度也恢复（背光要等 ui_start 里 board_backlight_init 之后才能真正设，
