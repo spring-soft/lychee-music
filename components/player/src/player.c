@@ -1625,7 +1625,17 @@ static void handle_out_switch(int want)
         player_remote_reset();
         s_remote_gen = 0;
         int back = (s_back == PLAYER_BACK_QQ) ? 1 : 0;
-        esp_err_t e = player_remote_play_mode(back, player_mode(), idx, 0);
+        /* ★ 2026-11-16 用户反馈："播放中切换播放设备，连歌曲都换了"。
+         *   根因：这里用 idx（本机队列下标）让服务器起播，但服务器那边队列的
+         *   内容/顺序可能不一样 → 同一个下标指向另一首。
+         *   改成优先按**当前这首的 id** 起播；拿不到 id 才退回按 index。 */
+        esp_err_t e;
+        if (st.song_id[0]) {
+            ESP_LOGW(TAG, "切设备：沿用当前这首（id=%s），不按队列下标", st.song_id);
+            e = player_remote_play_id(back, st.song_id);
+        } else {
+            e = player_remote_play_mode(back, player_mode(), idx, 0);
+        }
         if (e != ESP_OK) {
             ESP_LOGE(TAG, "让服务器起播失败：%s", esp_err_to_name(e));
         } else {
