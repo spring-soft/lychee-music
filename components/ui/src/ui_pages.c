@@ -300,6 +300,160 @@ static ui_page_t s_vol_back = UI_PAGE_PLAY;
  * ⚠️ 播放页故意不在这张表里：它是最外层，没有上一级，
  *    短按仍然是"换下一个来源"、长按进菜单（用户确认保持现状）。
  */
+
+/* ============================================================ 定时关闭（睡眠定时）
+ *
+ * 用户需求（2026-11-16）：
+ *   · 设置二级菜单里加「定时关闭」，进去能选 5 / 10 / 20 / 30 分钟，还有"自定义"
+ *   · 自定义页用 K1 / K2 每次 -5 / +5 分钟，K3 确定
+ *   · 定着的时候，播放页原来显示「服务器播放 / 直出 / 转码」的那行改成"剩余 mm:ss"
+ *   · 到点自动暂停播放（由 player 任务里的定时检查完成，见 player.c）
+ *
+ * 为什么只存"到点时间戳"而不在这里倒数：切歌/切设备/暂停都不该重置定时，
+ * 时间戳最省事也最不容易错；剩余时间每次渲染时现算。
+ */
+#define SLEEP_PRESET_N  4
+static const int kSleepPreset[SLEEP_PRESET_N] = {5, 10, 20, 30};
+#define SLEEP_ROWS      (SLEEP_PRESET_N + 2)      /* + 自定义 + 关闭定时 */
+
+static lv_obj_t *s_scr_sleep, *s_sleep_hl, *s_sleep_lbl[SLEEP_ROWS];
+static int       s_sleep_sel, s_sleep_r_sel = -1;
+static int       s_sleep_custom = 15;             /* 自定义默认 15 分钟 */
+static lv_obj_t *s_scr_sleepc, *s_sleepc_val, *s_sleepc_hl;
+static int       s_sleepc_r_sel = -1;
+
+static void sleep_render(void)
+{
+    char buf[32];
+    for (int i = 0; i < SLEEP_PRESET_N; i++) {
+        snprintf(buf, sizeof(buf), "%d 分钟", kSleepPreset[i]);
+        ui_set_text(s_sleep_lbl[i], buf);
+    }
+    snprintf(buf, sizeof(buf), "自定义…");
+    ui_set_text(s_sleep_lbl[SLEEP_PRESET_N], buf);
+    snprintf(buf, sizeof(buf), "关闭定时");
+    ui_set_text(s_sleep_lbl[SLEEP_PRESET_N + 1], buf);
+
+    int y = MENU_Y0 + s_sleep_sel * MENU_ROW_H;
+    if (s_sleep_r_sel < 0 || lv_obj_get_y(s_sleep_hl) != y) {
+        ui_anim_slide_obj(s_sleep_hl, y, 120);
+    }
+    s_sleep_r_sel = s_sleep_sel;
+}
+
+static void build_sleep_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    s_scr_sleep = scr;
+    ui_page_register(UI_PAGE_SLEEP, scr);
+
+    ui_put_img(scr, ASSET_BG_MENU, 0, 0);
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    ui_put_label_1line(scr, "定时关闭", 20, 2, 134, ui_font_16, 0x1C1C1E);
+
+    s_sleep_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0);
+    for (int i = 0; i < SLEEP_ROWS; i++) {
+        s_sleep_lbl[i] = ui_put_label_1line(scr, "", 12, MENU_Y0 + i * MENU_ROW_H + 1,
+                                           136, ui_font_12, 0x1C1C1E);
+    }
+    ESP_LOGI(TAG, "定时关闭页已建好（%d 行：预设 %d + 自定义 + 关闭）",
+             SLEEP_ROWS, SLEEP_PRESET_N);
+}
+
+void ui_sleep_open(void)
+{
+    if (s_scr_sleep == NULL) build_sleep_screen();     /* 按需创建，省内部 SRAM */
+    s_sleep_sel = 0;
+    s_sleep_r_sel = -1;
+    sleep_render();
+    ui_page_show(UI_PAGE_SLEEP);
+}
+
+void ui_sleep_move(int delta)
+{
+    s_sleep_sel = (s_sleep_sel + delta + SLEEP_ROWS) % SLEEP_ROWS;
+    sleep_render();
+}
+
+/* 自定义页：显示分钟数，K1 -5 / K2 +5 / K3 确定 */
+static void sleepc_render(void)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "自定义 %d 分钟", s_sleep_custom);
+    ui_set_text(s_sleepc_val, buf);
+    int y = MENU_Y0 + 1 * MENU_ROW_H;
+    if (s_sleepc_r_sel < 0 || lv_obj_get_y(s_sleepc_hl) != y) {
+        ui_anim_slide_obj(s_sleepc_hl, y, 120);
+    }
+    s_sleepc_r_sel = 0;
+}
+
+static void build_sleepc_screen(void)
+{
+    lv_obj_t *scr = ui_new_screen();
+    s_scr_sleepc = scr;
+    ui_page_register(UI_PAGE_SLEEP_CUSTOM, scr);
+
+    ui_put_img(scr, ASSET_BG_MENU, 0, 0);
+    ui_put_img(scr, ASSET_IC_NOTE, 4, 5);
+    ui_put_label_1line(scr, "定时关闭", 20, 2, 134, ui_font_16, 0x1C1C1E);
+    ui_put_label_1line(scr, "K1 -5分   K2 +5分   K3 确定", 6, 22, 148, ui_font_12, 0x6E6E73);
+
+    s_sleepc_hl = ui_put_img(scr, ASSET_HL_MENU, 0, MENU_Y0 + 1 * MENU_ROW_H);
+    s_sleepc_val = ui_put_label_1line(scr, "", 12, MENU_Y0 + 1 * MENU_ROW_H + 1,
+                                     136, ui_font_12, 0x1C1C1E);
+    ESP_LOGI(TAG, "定时关闭自定义页已建好");
+}
+
+void ui_sleep_custom_open(void)
+{
+    if (s_sleepc_val == NULL) build_sleepc_screen();
+    sleepc_render();
+    ui_page_show(UI_PAGE_SLEEP_CUSTOM);
+}
+
+int ui_sleep_custom_minutes(void) { return s_sleep_custom; }
+
+void ui_sleep_custom_move(int delta)
+{
+    s_sleep_custom += delta * 5;
+    if (s_sleep_custom < 5)  s_sleep_custom = 5;
+    if (s_sleep_custom > 180) s_sleep_custom = 180;
+    sleepc_render();
+}
+
+void ui_sleep_custom_activate(void)
+{
+    player_sleep_set(s_sleep_custom);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "已设定 %d 分钟后暂停", s_sleep_custom);
+    ui_toast(buf);
+    ui_page_show(UI_PAGE_SETTINGS);
+    s_menu_dirty = true;   /* 主菜单/设置页那行要刷新 */
+}
+
+void ui_sleep_activate(void)
+{
+    char buf[40];
+    if (s_sleep_sel < SLEEP_PRESET_N) {
+        int m = kSleepPreset[s_sleep_sel];
+        player_sleep_set(m);
+        snprintf(buf, sizeof(buf), "已设定 %d 分钟后暂停", m);
+        ui_toast(buf);
+        ui_page_show(UI_PAGE_SETTINGS);
+        s_menu_dirty = true;   /* 主菜单/设置页那行要刷新 */
+        return;
+    }
+    if (s_sleep_sel == SLEEP_PRESET_N) {          /* 自定义 */
+        ui_sleep_custom_open();
+        return;
+    }
+    player_sleep_cancel();                        /* 关闭定时 */
+    ui_toast("定时关闭已取消");
+    ui_page_show(UI_PAGE_SETTINGS);
+    s_menu_dirty = true;   /* 主菜单/设置页那行要刷新 */
+}
+
 ui_page_t ui_page_parent(ui_page_t p)
 {
     switch (p) {
@@ -316,6 +470,8 @@ ui_page_t ui_page_parent(ui_page_t p)
         case UI_PAGE_LIST:        return UI_PAGE_PLAY;
         case UI_PAGE_INFO:        return UI_PAGE_MENU;
         case UI_PAGE_MEM:         return UI_PAGE_INFO;   /* 内存图表页的上一级 = 系统信息 */
+        case UI_PAGE_SLEEP:       return UI_PAGE_SETTINGS;       /* 定时关闭：上一级 = 设置 */
+        case UI_PAGE_SLEEP_CUSTOM:return UI_PAGE_SLEEP;          /* 自定义页：上一级 = 时长页 */
         case UI_PAGE_VOL:         return s_vol_back;
         case UI_PAGE_BT:          return UI_PAGE_PLAY;          /* 遥控页的"上一级"= 退出模式 */
         default:                  return UI_PAGE_PLAY;
@@ -717,7 +873,8 @@ void ui_btpair_activate(void)
  * 腾出主菜单那行给「设备」。亮度页本身没变，只是入口换了 ——
  * 打开时传 brightness=true 就走原来的虚拟按键调节。
  */
-#define SET_N  4
+/* 2026-11-16 新增第 5 项「定时关闭」：进预设时长页（5/10/20/30 分钟 + 自定义）*/
+#define SET_N  5
 
 static lv_obj_t *s_scr_set, *s_set_hl, *s_set_lbl[SET_N];
 static int       s_set_sel;
@@ -749,6 +906,12 @@ static void set_render(void)
     /* 屏幕亮度：从主菜单挪进来的。没有确认态（调亮度随时可退，本来就有实时的视觉反馈）*/
     snprintf(buf, sizeof(buf), "屏幕亮度  %d%%", player_brightness());
     ui_set_text(s_set_lbl[3], buf);
+
+    /* 定时关闭：后缀显示还剩多久（未开启就不带后缀）*/
+    int rem = player_sleep_remaining_s();
+    if (rem > 0) snprintf(buf, sizeof(buf), "定时关闭  剩%d分", (rem + 59) / 60);
+    else         snprintf(buf, sizeof(buf), "定时关闭  未开启");
+    ui_set_text(s_set_lbl[4], buf);
 
     int y = MENU_Y0 + s_set_sel * MENU_ROW_H;
     if (s_set_r_sel < 0 || lv_obj_get_y(s_set_hl) != y) {
@@ -805,6 +968,11 @@ void ui_setmenu_activate(void)
      * ⚠️ 要传 brightness=true —— 那一页是"音量/亮度共用一屏"，靠这个标志切变体。 */
     if (s_set_sel == 3) {
         ui_vol_open(true, false);
+        return;
+    }
+    /* 第 5 项「定时关闭」：进时长选择页（只是打开一页，没有副作用）*/
+    if (s_set_sel == 4) {
+        ui_sleep_open();
         return;
     }
 

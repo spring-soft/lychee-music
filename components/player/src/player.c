@@ -1211,6 +1211,33 @@ void player_queue_more_async(void)
     }
 }
 
+/* ---------------- 定时关闭（睡眠定时） ----------------
+ * 只存一个"到点时间戳"，player 任务里定期比对 —— 这样切歌、切设备、
+ * 暂停/继续都不会把定时弄丢（用户要的是"到点暂停"，不是"从开始计时 10 分钟音乐"）。
+ * 用 esp_timer 的毫秒，不受系统时间/NTP 影响。 */
+static volatile int64_t s_sleep_end_ms;
+
+void player_sleep_set(int minutes)
+{
+    if (minutes <= 0) {
+        s_sleep_end_ms = 0;
+        ESP_LOGW(TAG, "定时关闭：已取消");
+        return;
+    }
+    s_sleep_end_ms = (int64_t)(esp_timer_get_time() / 1000) + (int64_t)minutes * 60000;
+    ESP_LOGW(TAG, "定时关闭：%d 分钟后暂停播放", minutes);
+}
+
+void player_sleep_cancel(void) { s_sleep_end_ms = 0; }
+
+int player_sleep_remaining_s(void)
+{
+    if (s_sleep_end_ms <= 0) return 0;
+    int64_t rem = s_sleep_end_ms - (int64_t)(esp_timer_get_time() / 1000);
+    if (rem <= 0) return 0;
+    return (int)((rem + 999) / 1000);
+}
+
 static void next_or_wrap(int dir)
 {
     int count, idx;
@@ -1799,6 +1826,19 @@ static void player_task(void *arg)
         recent_save_tick();                 /* M6：最近播放落盘（变了 10 秒后写一次） */
         starred_save_tick();                /* M6：收藏镜像落盘 */
         pend_retry_tick();                  /* M6：离线攒下的收藏操作，每分钟补发一次 */
+
+        /* ★ 定时关闭：到点就暂停。
+         *   ⚠️ 必须放在下面 `if (out_remote()) … continue;` **之前** ——
+         *   远程模式（服务器/蓝牙音箱）会 continue 跳过后面的周期活儿，
+         *   放后面就永远不执行（实测就是这么"到点不暂停"的）。 */
+        if (s_sleep_end_ms > 0 &&
+            (int64_t)(esp_timer_get_time() / 1000) >= s_sleep_end_ms) {
+            s_sleep_end_ms = 0;
+            player_status_t sst;
+            player_status_get(&sst);
+            if (sst.playing && !sst.paused) player_toggle();
+            ESP_LOGW(TAG, "定时关闭：时间到 → 已暂停播放");
+        }
 
         /* ★ 设备=服务器/蓝牙音箱：本机不出声。每秒拉一次服务器的状态/队列镜像过来，
          *   其余周期活儿（落盘/补发收藏）照常，然后**跳过本机引擎逻辑** ——

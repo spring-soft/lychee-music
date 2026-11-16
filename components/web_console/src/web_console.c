@@ -697,6 +697,31 @@ static esp_err_t h_seek(httpd_req_t *req)
     return ok_json(req);
 }
 
+/* /api/sleep —— 定时关闭的查询/设置（网页控制台和调试都用它）
+ *   GET             → {"on":bool,"remain_s":N}
+ *   POST {"min":N}  → 设定 N 分钟后暂停；N<=0 表示取消
+ * 屏幕上的入口在「设置 → 定时关闭」，这里是给网页/自测用的等价入口。 */
+static esp_err_t h_sleep(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        cJSON *o = cJSON_CreateObject();
+        int rem = player_sleep_remaining_s();
+        cJSON_AddBoolToObject(o, "ok", true);
+        cJSON_AddBoolToObject(o, "on", rem > 0);
+        cJSON_AddNumberToObject(o, "remain_s", rem);
+        return send_json(req, o);
+    }
+    cJSON *b = read_body(req);
+    if (b == NULL) return fail(req, "400 Bad Request", "请求体不是合法 JSON");
+    int m = json_int(b, "min", 0);
+    cJSON_Delete(b);
+    player_sleep_set(m);
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddNumberToObject(o, "remain_s", player_sleep_remaining_s());
+    return send_json(req, o);
+}
+
 static esp_err_t h_volume(httpd_req_t *req)
 {
     cJSON *b = read_body(req);
@@ -1935,6 +1960,8 @@ esp_err_t web_console_start(void)
         { .uri = "/api/prev",            .method = HTTP_POST, .handler = h_prev },
         { .uri = "/api/seek",            .method = HTTP_POST, .handler = h_seek },
         { .uri = "/api/volume",          .method = HTTP_POST, .handler = h_volume },
+        { .uri = "/api/sleep",           .method = HTTP_GET,  .handler = h_sleep },
+        { .uri = "/api/sleep",           .method = HTTP_POST, .handler = h_sleep },
         { .uri = "/api/mute",            .method = HTTP_POST, .handler = h_mute },
         { .uri = "/api/bright",          .method = HTTP_POST, .handler = h_bright },
         { .uri = "/api/source",          .method = HTTP_POST, .handler = h_source },

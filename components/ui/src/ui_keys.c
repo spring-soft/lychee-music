@@ -168,6 +168,24 @@ static void key_short(int k)
             }
             break;
 
+        case UI_PAGE_SLEEP:                     /* 定时关闭：选时长 */
+            switch (k) {
+                case 0: ui_sleep_move(-1); break;
+                case 1: ui_sleep_move(+1); break;
+                case 2: ui_sleep_activate(); break;
+                default: break;                  /* K4 由 k4_navigate 管 */
+            }
+            break;
+
+        case UI_PAGE_SLEEP_CUSTOM:              /* 定时关闭：自定义（K1 -5 / K2 +5 / K3 确定）*/
+            switch (k) {
+                case 0: ui_sleep_custom_move(-1); break;
+                case 1: ui_sleep_custom_move(+1); break;
+                case 2: ui_sleep_custom_activate(); break;
+                default: break;
+            }
+            break;
+
         case UI_PAGE_SRC:                       /* 「模式」二级菜单（项数随后端动态） */
             switch (k) {
                 case 0: ui_srcmenu_move(-1); break;

@@ -696,9 +696,19 @@ static void play_refresh(void)
          *   直接显示「服务器播放」，别再显示转码/速度。
          *   本地模式（out=0）保持原样：上行直出/转码，下行拉流速率。 */
         bool remote = (player_out() != PLAYER_OUT_LOCAL);
-        ui_set_text(s_lbl_mode, remote ? "服务器播放" : (raw ? "直出" : "转码"));
-        lv_obj_set_style_text_color(s_lbl_mode,
-                                    lv_color_hex(remote ? 0x1A73E8 : (raw ? 0x1B7F3B : 0xC77700)), 0);
+        /* ★ 定时关闭进行中：这一行改成显示"剩余 mm:ss"（用户要求：把
+         *   「服务器播放」那几个字替换成剩余时间），颜色用橙色提醒还在倒数。 */
+        int slp = player_sleep_remaining_s();
+        if (slp > 0) {
+            char sbuf[24];
+            snprintf(sbuf, sizeof(sbuf), "剩余 %d:%02d", slp / 60, slp % 60);
+            ui_set_text(s_lbl_mode, sbuf);
+            lv_obj_set_style_text_color(s_lbl_mode, lv_color_hex(0xC77700), 0);
+        } else {
+            ui_set_text(s_lbl_mode, remote ? "服务器播放" : (raw ? "直出" : "转码"));
+            lv_obj_set_style_text_color(s_lbl_mode,
+                                        lv_color_hex(remote ? 0x1A73E8 : (raw ? 0x1B7F3B : 0xC77700)), 0);
+        }
 
         /* 下行：网络拉流速率。
          * ⚠️ 单位写死 "/s" —— 之前只写 "80K"，用户完全看不出这是"速度"还是"用量"，

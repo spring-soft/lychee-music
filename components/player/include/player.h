@@ -190,6 +190,13 @@ int          player_queue_index(void);         /* -1 = 当前歌不在队列里 
 int          player_recent_count(void);        /* 最近播放里已有几条（0 = 还没播过歌） */
 bool         player_recent_get(int idx, sub_song_t *out);   /* [0] 是最新的 */
 int          player_brightness(void);
+
+/* ---------------- 定时关闭（睡眠定时） ----------------
+ * 用户要求（2026-11-16）：设置里能选 5/10/20/30 分钟或自定义（每次 ±5 分钟），
+ * 到时间自动暂停播放；定着的时候播放页把「服务器播放/直出」那行换成剩余时间。 */
+void         player_sleep_set(int minutes);   /* minutes<=0 = 取消 */
+void         player_sleep_cancel(void);
+int          player_sleep_remaining_s(void);  /* 0 = 未开启 */
 bool         player_queue_get(int idx, sub_song_t *out);
 uint32_t     player_queue_gen(void);           /* 内容变化计数 */
 
