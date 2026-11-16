@@ -33,6 +33,7 @@
 #include "qqlogin.h"
 #include "app_core.h"
 #include "player.h"
+#include "player_remote.h"
 #include "settings.h"
 #include "store.h"
 #include "hid_remote.h"
@@ -247,12 +248,44 @@ static void m2_local_http_test(void)
     ae_source_http_free(s);
 }
 
-/* 出声就收起启动页 —— 这就是"启动完成"那一刻 */
+/* 后台补曲库元数据（开机时不再阻塞启动页）*/
+static void sync_lib_task(void *arg)
+{
+    player_sync_library();
+    ESP_LOGI(TAG, "后台曲库同步完成（启动页早已收起）");
+    vTaskDelete(NULL);
+}
+
+/* 系统就绪就收起启动页 —— 这就是"启动完成"那一刻。
+ *
+ * ★ 2026-11-16 用户反馈"最后一步停很久，其实系统早就起来了"。
+ *   原因是这里只等"本机音频引擎出声"，而用【服务器】或【蓝牙音箱】模式时
+ *   本机引擎根本不会出声（声音在服务器侧），于是必然卡满 20 秒才收。
+ *
+ * 现在的判据（谁先满足就用谁）：
+ *   1) 本机模式：本机音频引擎真的在放（最硬的判据，还能顺带代表播放链路 OK）
+ *   2) 服务器/蓝牙模式：服务器那边已经在放（远程状态 playing/paused 都算）
+ *   3) 兜底：最多等 8 秒 —— 哪怕没歌可放/音箱没开，系统这时也早就可用了，
+ *      不能再把启动页挂着让用户以为死机
+ */
+#define SPLASH_MAX_MS_LOCAL  8000   /* 本机模式：等真的出声（最硬的"能播"判据）*/
+#define SPLASH_MAX_MS_REMOTE 2500   /* 服务器/蓝牙：本机不会出声，别等 */
 static void splash_watch_task(void *arg)
 {
     uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
-    while ((uint32_t)(esp_timer_get_time() / 1000) - t0 < 20000) {
-        if (audio_engine_state() == AE_STATE_PLAYING) break;
+    uint32_t max_ms = (player_out() == PLAYER_OUT_LOCAL) ? SPLASH_MAX_MS_LOCAL
+                                                         : SPLASH_MAX_MS_REMOTE;
+    for (;;) {
+        uint32_t el = (uint32_t)(esp_timer_get_time() / 1000) - t0;
+        if (el >= max_ms) break;                            /* ③ 兜底 */
+        if (audio_engine_state() == AE_STATE_PLAYING) break; /* ① 本机出声 */
+        if (player_out() != PLAYER_OUT_LOCAL) {              /* ② 远程模式 */
+            remote_status_t rs;
+            player_remote_status(&rs);
+            if (rs.valid && (strcmp(rs.state, "playing") == 0 || strcmp(rs.state, "paused") == 0)) {
+                break;
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     ESP_LOGI(TAG, "启动完成，用时 %" PRIu32 " ms", (uint32_t)(esp_timer_get_time() / 1000) - t0);
@@ -389,7 +422,12 @@ void app_main(void)
      * ⚠️ 顺序：必须在 player_init 之后（那时 s_recent/s_lock 才分配好）、
      *          player_resume 之前（resume 要读这些列表）。 */
     splash("同步曲库...", 7);
-    player_sync_library();
+    /* ★ 这一步不再阻塞启动：曲库同步改到后台（见下方 web_console_start 之后创建）。
+     *   原因：它内部要发 HTTP 拉服务器收藏，首次连不上还超时重试，实测卡 6.6 秒。 */
+    {
+        /* 只打一条日志占位，真正的任务在网页服务起来后创建 */
+        ESP_LOGI(TAG, "曲库同步转入后台（不阻塞启动）");
+    }
 
     splash("开始播放...", 8);
     /* ---- 有线指令通道（USB 数据线 / 烧录口）----
@@ -400,6 +438,13 @@ void app_main(void)
     }
     /* ---- M5: 网页控制台 ---- */
     web_console_start();
+    /* ★ 曲库同步放这里、并且要放在 web_console_start 之后：
+     *   ⚠️ 千万别在它之前 xTaskCreate —— 那个任务要 4KB 栈，内部 SRAM 本来就只剩
+     *   十几 KB，httpd 也要 8KB 栈，抢在前面会导致 httpd 起不来（网页/OTA 全废，
+     *   这个坑已经踩过一次）。 */
+    if (xTaskCreate(sync_lib_task, "sync_lib", 4096, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "曲库同步后台任务起不来（不影响播放，下次开机会再补）");
+    }
     /* 沿用上次的来源，**并接着上次的位置放**（player_init 从 NVS/cache 恢复了
      * 来源、最近播放、续播位置）。取不到歌会自动退回随机 30 首。 */
     player_resume();

@@ -1990,6 +1990,18 @@ esp_err_t player_init(void)
     player_status_set_volume(s_volume);
     player_status_set_queue(-1, 0, player_mode_name(player_mode()), true);
 
+    /* ★ 2026-11-16 用户反馈："刚启动时播放页没标题、没封面，但歌其实在放"。
+     *   原因是远程模式（服务器/蓝牙）要等服务器第一次状态回来才填歌名/封面，
+     *   实测首次同步可能失败重试，最多要等十几二十秒，这期间播放页是空白的。
+     *   这里先用本地 cache 里的"最近播放第 0 条"做占位，界面立刻有内容；
+     *   服务器状态一到（remote_status 里 set_song）就会覆盖成真实信息。 */
+    if (out_remote() && s_recent_n > 0 && s_recent[0].title[0]) {
+        const sub_song_t *r = &s_recent[0];
+        player_status_set_song(r->id, r->title, r->artist, r->album, r->cover,
+                               r->duration_s * 1000U, r->starred, r->back);
+        ESP_LOGW(TAG, "开机占位显示上次那首：「%.32s」（等服务器状态回来再更正）", r->title);
+    }
+
     /* 远程播放器（设备=服务器/蓝牙音箱时用）：只建锁和 PSRAM 队列，不联网 */
     player_remote_init();
     player_bt_init();          /* 蓝牙列表：PSRAM 快照，同样不联网 */
